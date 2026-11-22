@@ -731,6 +731,11 @@ impl TurnAttempt {
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]);
+            // A turn a log line started neither writes on the host nor sends into Codex threads.
+            config.restricted = crate::runtime::health_turn(&job.trigger);
+            if config.restricted {
+                config.tool_env.remove("VIBEFACE_CODEX_SOCKET");
+            }
         }
         let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) = (
             self.node.clone(),

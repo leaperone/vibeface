@@ -730,9 +730,14 @@ async fn serve_session_with_heartbeat(
                     Message::Binary(bytes) => {
                         if let Some(plaintext) = channel.open_record(&bytes)? {
                             partial_started = None;
-                            let request: WireRequest = serde_json::from_slice(&plaintext).context("invalid client request")?;
-                            let request = request.decode()?;
-                            if let Some(response) = calls.accept(&node, &session, &authority, request)? {
+                            let request = serde_json::from_slice::<WireRequest>(&plaintext)
+                                .context("invalid client request")
+                                .and_then(WireRequest::decode);
+                            let response = match request {
+                                Ok(request) => calls.accept(&node, &session, &authority, request)?,
+                                Err(error) => Some(undecodable_request(&plaintext, &error).ok_or(error)?),
+                            };
+                            if let Some(response) = response {
                                 send_value(&mut socket, &mut channel, &response).await?;
                             }
                         } else { partial_started.get_or_insert_with(Instant::now); }
@@ -2483,6 +2488,28 @@ fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Resul
             .with_context(|| format!("{key} is required"))?,
     )
     .with_context(|| format!("invalid {key}"))
+}
+/// The answer to a request that does not decode, such as params with a lone surrogate, so only
+/// that request fails and the channel stays; `None` when it has no valid ID to answer. A `log`
+/// batch gets `log_rejected`, so the sender drops it instead of sending it again.
+fn undecodable_request(plaintext: &[u8], error: &anyhow::Error) -> Option<Response> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        id: String,
+        #[serde(default)]
+        method: Option<Value>,
+    }
+    let envelope: Envelope = serde_json::from_slice(plaintext).ok()?;
+    valid_business_id(&envelope.id).then(|| Response {
+        id: envelope.id,
+        result: Value::Null,
+        error: Some(format!("{error:#}")),
+        code: Some(if envelope.method == Some(json!("log")) {
+            crate::logging::Refused::REJECTED
+        } else {
+            "invalid_request"
+        }),
+    })
 }
 fn validate_request(request: &WireRequest) -> Result<()> {
     ensure!(valid_business_id(&request.id), "invalid request ID");
@@ -5877,6 +5904,31 @@ mod tests {
             business_params(&unknown).value(),
             &json!({"request":{"action":{"response":{"client_id":"business-data"}}}})
         );
+    }
+
+    #[test]
+    fn an_undecodable_request_is_answered_without_closing_the_channel() {
+        let error = anyhow::anyhow!("invalid client request");
+        // `JSON.stringify` writes a lone surrogate as an escape serde_json refuses.
+        let log = br#"{"id":"r1","method":"log","params":{"records":[{"message":"\ud83d"}]}}"#;
+        assert!(serde_json::from_slice::<WireRequest>(log).is_err());
+        let answer = undecodable_request(log, &error).expect("answered");
+        assert_eq!(
+            (answer.id.as_str(), answer.code),
+            ("r1", Some(crate::logging::Refused::REJECTED))
+        );
+        let other = br#"{"id":"r2","method":"info","params":{"x":"\udc00"}}"#;
+        assert_eq!(
+            undecodable_request(other, &error).unwrap().code,
+            Some("invalid_request")
+        );
+        let invalid = br#"{"id":"r3","method":"info","params":1}"#;
+        assert_eq!(
+            undecodable_request(invalid, &error).unwrap().code,
+            Some("invalid_request")
+        );
+        assert!(undecodable_request(br#"{"id":"","method":"info"}"#, &error).is_none());
+        assert!(undecodable_request(b"not json", &error).is_none());
     }
 
     #[test]

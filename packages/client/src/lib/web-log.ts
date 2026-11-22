@@ -33,14 +33,28 @@ const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)
 /** Characters of a stack an oversized record keeps. */
 const STACK_PREFIX = 2000
 
+/** `JSON.stringify` writes a lone surrogate as an escape the device's JSON parser refuses. */
+const LONE_ESCAPE = /\\ud[89a-f][0-9a-f]{2}/i
+/** `text` with each lone surrogate as U+FFFD; pairs stay. Written out because `toWellFormed` is not on every phone. */
+export const wellFormed = (text: string) =>
+  text.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, unit => unit.length === 2 ? unit : "\uFFFD")
+/** `record` with every string well formed, the same object when it already is. */
+const wellFormedRecord = (record: WebRecord): WebRecord => LONE_ESCAPE.test(JSON.stringify(record))
+  ? JSON.parse(JSON.stringify(record), (_key, value: unknown) => typeof value === "string" ? wellFormed(value) : value) as WebRecord
+  : record
+/** The first `length` UTF-16 units of `text`, one fewer when the cut would split a surrogate pair. */
+const cut = (text: string, length: number) =>
+  text.slice(0, length > 0 && length < text.length && /[\uD800-\uDBFF]/.test(text[length - 1]!) ? length - 1 : length)
+
 /**
  * Shrinks fields first, keeping `fatal` and the start of `stack`, then the longer of the stack and the message; rejects
  * records still over budget once both are exhausted.
  */
-export function fit(record: WebRecord): WebRecord {
+export function fit(input: WebRecord): WebRecord {
+  const record = wellFormedRecord(input)
   if (bytes(record) <= MAX_RECORD_BYTES) return record
   const { fatal, stack } = record.fields ?? {}
-  let kept = typeof stack === "string" ? stack.slice(0, STACK_PREFIX) : ""
+  let kept = typeof stack === "string" ? cut(stack, STACK_PREFIX) : ""
   const fields = () => record.fields && {
     truncated: true, ...(fatal === undefined ? {} : { fatal }), ...(kept ? { stack: `${kept}…` } : {}),
   }
@@ -48,8 +62,8 @@ export function fit(record: WebRecord): WebRecord {
   let message = record.message
   while (bytes(fitted) > MAX_RECORD_BYTES) {
     if (!kept && !message.length) throw new Error("Log record exceeds size limit.")
-    if (kept.length > message.length) kept = kept.slice(0, Math.floor(kept.length * 0.8))
-    else message = message.slice(0, Math.floor(message.length * 0.8))
+    if (kept.length > message.length) kept = cut(kept, Math.floor(kept.length * 0.8))
+    else message = cut(message, Math.floor(message.length * 0.8))
     fitted = { ...record, message: message === record.message ? message : `${message}…`, fields: fields() }
   }
   return fitted
@@ -203,7 +217,8 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
     buffer.next = written + 1
     buffer.acked = buffer.sent_max = written
     buffer.records = buffer.records.map(item => ({ ...item, fields: { ...item.fields, client_seq: buffer.next++ } }))
-    saveSoon()
+    // At once: the new numbers must not go out before the device's numbering is saved.
+    save()
   }
   async function drain(): Promise<SendResult> {
     let sent = 0
@@ -235,6 +250,8 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
         }
       } catch (cause) {
         const { responded, code } = (cause ?? {}) as { responded?: unknown; code?: unknown }
+        // The device answered that it wrote nothing, so this batch was not handed over; only an unknown result counts.
+        if (responded === true && buffer.sent_max !== sentBefore) { buffer.sent_max = sentBefore; saveSoon() }
         if (responded === true && code === "log_rate_limited") limitedUntil = now() + 60_000
         // The device refused the batch itself; sending it again cannot change that.
         else if (responded === true && code === "log_rejected") ack(last)
@@ -273,7 +290,7 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
     /** Sends now instead of waiting out an earlier unknown result; the device's budget still applies. */
     send() { retryAt = 0; return send() },
     pending: () => buffer.records.length,
-    clear() { buffer.records = []; buffer.acked = buffer.next; save() },
+    clear() { buffer.records = []; buffer.acked = buffer.next - 1; save() },
     save,
   }
 }

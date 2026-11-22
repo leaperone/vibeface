@@ -2445,6 +2445,7 @@ mod tests {
             tool_token: None,
             provider_env: BTreeMap::new(),
             process_started: None,
+            restricted: false,
             turn_binding: None,
         };
         session_identity(

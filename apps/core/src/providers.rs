@@ -2584,7 +2584,7 @@ requires_openai_auth = false
             let mut offset = 0;
             let mut names = BTreeSet::new();
             loop {
-                let found = Tool::search(json!({"limit":30,"offset":offset}), kind)?;
+                let found = Tool::search(json!({"limit":30,"offset":offset}), kind, false)?;
                 for row in found["tools"].as_array().unwrap() {
                     let name = row["name"].as_str().unwrap();
                     assert!(
@@ -2608,22 +2608,30 @@ requires_openai_auth = false
             assert!(names.contains("workspace_state"));
             assert_eq!(names.contains("workspace_command"), kind.is_some());
             assert_eq!(
-                Tool::describe(json!({"tool":"update_profile"}), kind).is_ok(),
+                Tool::describe(json!({"tool":"update_profile"}), kind, false).is_ok(),
                 kind == Some(TriggerKind::Human)
             );
         }
-        let dispatch = Tool::search(json!({"query":"DISPATCH_WORK"}), Some(TriggerKind::Human))?;
+        let dispatch = Tool::search(
+            json!({"query":"DISPATCH_WORK"}),
+            Some(TriggerKind::Human),
+            false,
+        )?;
         assert_eq!(dispatch["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(dispatch["tools"][0]["name"], "dispatch_work");
-        let described = Tool::describe(json!({"tool":"dispatch_work"}), Some(TriggerKind::Human))?;
+        let described = Tool::describe(
+            json!({"tool":"dispatch_work"}),
+            Some(TriggerKind::Human),
+            false,
+        )?;
         assert_eq!(described["effect"], "work");
         assert_eq!(described["requires_call_ref"], true);
         assert_eq!(
             described["input_schema"],
             crate::scheduler::tools(TriggerKind::Human)["dispatch_work"].input_schema
         );
-        assert!(Tool::search(json!({"limit":0}), Some(TriggerKind::Human)).is_err());
-        assert!(Tool::describe(json!({"tool":"nodes","unknown":true}), None).is_err());
+        assert!(Tool::search(json!({"limit":0}), Some(TriggerKind::Human), false).is_err());
+        assert!(Tool::describe(json!({"tool":"nodes","unknown":true}), None, false).is_err());
         Ok(())
     }
 
@@ -2670,7 +2678,7 @@ requires_openai_auth = false
             "tool_call",
         ] {
             assert!(Tool::resolve_call("tool_call", json!({"tool":tool,"arguments":{}})).is_err());
-            assert!(Tool::describe(json!({"tool":tool}), Some(TriggerKind::Human)).is_err());
+            assert!(Tool::describe(json!({"tool":tool}), Some(TriggerKind::Human), false).is_err());
         }
         assert_eq!(
             Tool::resolve_call("track_work", json!({}))?.0,

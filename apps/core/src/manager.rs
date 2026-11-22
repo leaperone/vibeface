@@ -196,6 +196,9 @@ pub struct ManagerConfig {
     pub provider_env: BTreeMap<String, String>,
     pub process_started: Option<agent::ProcessStarted>,
     pub turn_binding: Option<TurnBinding>,
+    /// A health reminder's turn. Codex runs it read-only with no web search; the other
+    /// providers get no such per-turn switch and keep their host tools.
+    pub restricted: bool,
 }
 
 impl ManagerConfig {
@@ -652,8 +655,23 @@ where
         )
     })?;
     report.enter(ProviderStage::SessionStart);
+    // A health reminder's turn writes nothing on the host and searches nothing. Its Shell keeps
+    // the network, which the Node tools' loopback calls need.
+    let (sandbox, sandbox_policy, web_search) = if config.restricted {
+        (
+            "read-only",
+            json!({"type":"readOnly","networkAccess":true}),
+            "disabled",
+        )
+    } else {
+        (
+            "danger-full-access",
+            json!({"type":"dangerFullAccess"}),
+            "live",
+        )
+    };
     let mut thread_params = json!({"cwd":config.workspace,"approvalPolicy":"never",
-        "sandbox":"danger-full-access","config":{"shell_environment_policy.set":context.tool_env(),"web_search":"live"}});
+        "sandbox":sandbox,"config":{"shell_environment_policy.set":context.tool_env(),"web_search":web_search}});
     if !config.model.is_empty() {
         thread_params["model"] = json!(config.model);
     }
@@ -718,8 +736,10 @@ where
             _ => uuid::Uuid::new_v4().to_string(),
         },
     };
+    // Every turn names its sandbox: Codex keeps a turn's sandbox for the turns after it, and a
+    // thread it already has loaded may keep the sandbox it resumed with.
     let mut turn_params = json!({"threadId":thread,"clientUserMessageId":client_id,
-        "input":[{"type":"text","text":prompt,"text_elements":[]}]});
+        "input":[{"type":"text","text":prompt,"text_elements":[]}],"sandboxPolicy":sandbox_policy});
     if !config.model.is_empty() {
         turn_params["model"] = json!(config.model);
     }
@@ -1074,6 +1094,7 @@ pub(crate) mod tests {
             tool_token: None,
             provider_env: BTreeMap::new(),
             process_started: None,
+            restricted: false,
             turn_binding: None,
         }
     }
@@ -1693,6 +1714,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_restricted_turn_runs_read_only_without_web_search() -> Result<()> {
+        let fake = fake_app_server(Turn::Answers).await;
+        let config = ManagerConfig {
+            restricted: true,
+            ..codex(workspace(&fake.directory), fake.socket.clone())
+        };
+        run_manager(
+            &config,
+            "fixture",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await?;
+        let started = &fake.calls("thread/start")[0];
+        assert_eq!(started["sandbox"], "read-only");
+        assert_eq!(started["config"]["web_search"], "disabled");
+        assert_eq!(
+            fake.calls("turn/start")[0]["sandboxPolicy"],
+            json!({"type":"readOnly","networkAccess":true}),
+            "the Node tools' loopback calls still reach the Node"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
         let fake = fake_app_server(Turn::Answers).await;
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1762,7 +1810,10 @@ pub(crate) mod tests {
         let guide = started[0]["developerInstructions"].as_str().unwrap();
         assert!(guide.contains("'/opt/vibeface' tool TOOL_NAME"));
         assert!(guide.ends_with("fixed-thread-guide"));
+        assert_eq!(started[0]["sandbox"], "danger-full-access");
+        assert_eq!(started[0]["config"]["web_search"], "live");
         let turn = &fake.calls("turn/start")[0];
+        assert_eq!(turn["sandboxPolicy"], json!({"type":"dangerFullAccess"}));
         assert_eq!(turn["clientUserMessageId"], "attempt-1");
         assert_eq!(turn["model"], "gpt-fixture");
         assert_eq!(turn["effort"], "high");

@@ -1090,6 +1090,7 @@ mod tests {
             tool_token: None,
             provider_env: variables,
             process_started: None,
+            restricted: false,
             turn_binding: Some(crate::manager::TurnBinding {
                 client_id: "bot-attempt".into(),
                 record: Arc::new(move |agent, run| {
