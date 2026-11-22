@@ -991,8 +991,10 @@ impl std::error::Error for Refused {}
 
 /// Accepts a batch from `sender` whole or not at all, and answers `{"accepted":n}`. A record whose
 /// `fields.client_seq` is not above the sender's last written one is a resend and is skipped
-/// without counting against the budget; when the whole batch is skipped the answer also carries
-/// that last number as `max_seq`, so a sender whose numbering went back can start above it.
+/// without counting against the budget. When any record is skipped the answer also carries how
+/// many as `skipped` and the last number written after this batch as `max_seq`, so a sender whose
+/// numbering went back can tell and start above it. Records come in ascending `client_seq`, so the
+/// skipped ones are the first `skipped`.
 pub fn submit(
     limit: &RateLimit,
     sender: &str,
@@ -1014,6 +1016,7 @@ pub fn submit(
     .map_err(|error| Refused::rejected(format!("{error:#}")))?;
     let mut seqs = limit.seqs.lock().expect("log sequence");
     let mut last = seqs.get(sender).copied();
+    let submitted = records.len();
     let records: Vec<_> = records
         .into_iter()
         .filter(
@@ -1027,14 +1030,21 @@ pub fn submit(
             },
         )
         .collect();
+    let skipped = submitted - records.len();
+    // Only a record numbered at or below `last` is skipped, so `last` is set.
+    let answer = |accepted: usize| match last {
+        Some(max_seq) if skipped > 0 => {
+            serde_json::json!({"accepted":accepted,"skipped":skipped,"max_seq":max_seq})
+        }
+        _ => serde_json::json!({"accepted":accepted}),
+    };
     if records.is_empty() {
-        let max_seq = last.context("a batch without client_seq is never skipped")?;
         tracing::debug!(
             sender,
-            max_seq,
+            max_seq = last,
             "log batch skipped: every client_seq was already written"
         );
-        return Ok(serde_json::json!({"accepted":0,"max_seq":max_seq}));
+        return Ok(answer(0));
     }
     if !limit.take(sender, records.len() as u32, now_ms) {
         return Err(Refused {
@@ -1050,7 +1060,7 @@ pub fn submit(
     for record in &records {
         write(record);
     }
-    Ok(serde_json::json!({"accepted":records.len()}))
+    Ok(answer(records.len()))
 }
 
 /// Copies a child's stderr into the log line by line, through `emit`, until it closes. More than
@@ -1601,12 +1611,12 @@ mod tests {
         );
         assert_eq!(
             send("phone-1", json!([seq(1), seq(2), seq(3)])),
-            json!({"accepted":1}),
-            "only the new one"
+            json!({"accepted":1,"skipped":2,"max_seq":3}),
+            "only the new one, and how many were skipped below which number"
         );
         assert_eq!(
             send("phone-1", json!([seq(1), seq(3)])),
-            json!({"accepted":0,"max_seq":3}),
+            json!({"accepted":0,"skipped":2,"max_seq":3}),
             "a wholly skipped batch names the last written number"
         );
         assert_eq!(send("phone-1", json!([seq(4)])), json!({"accepted":1}));

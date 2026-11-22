@@ -3531,7 +3531,7 @@ mod tests {
         );
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "log", declared).await?,
-            json!({"accepted":0,"max_seq":1}),
+            json!({"accepted":0,"skipped":1,"max_seq":1}),
             "a resent sequence number is skipped"
         );
         assert!(

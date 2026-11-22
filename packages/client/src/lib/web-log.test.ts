@@ -8,8 +8,10 @@ const size = (record: WebRecord) => new TextEncoder().encode(JSON.stringify(reco
 test('records shrink to what the device accepts', () => {
   const huge = fit({ level: 'error', event: 'web.uncaught', message: '错'.repeat(5000), fields: { stack: 'x'.repeat(9000) } })
   assert.ok(size(huge) <= MAX_RECORD_BYTES)
-  assert.equal(size(huge), 6228, 'UTF-8 bytes retain the existing message reduction')
-  assert.deepEqual(huge.fields, { truncated: true })
+  assert.ok(size(huge) > MAX_RECORD_BYTES * 0.8, 'UTF-8 bytes shrink only as far as needed')
+  assert.deepEqual(Object.keys(huge.fields ?? {}), ['truncated', 'stack'], 'the start of the stack stays')
+  assert.match(String(huge.fields?.stack), /^x+…$/)
+  assert.ok(huge.message.endsWith('…'))
   const small = { level: 'info', event: 'web.action', message: 'ok', fields: { label: '导出' } } as const
   assert.deepEqual(fit(small), small)
 })
@@ -217,7 +219,7 @@ test('a skipped batch above the phone numbering is numbered again and resent; on
   reporter.connect(async records => {
     const seqs = records.map(record => record.fields?.client_seq as number)
     sent.push(seqs)
-    if (seqs[0]! <= written) return { accepted: 0, max_seq: written }
+    if (seqs[0]! <= written) return { accepted: 0, skipped: seqs.length, max_seq: written }
     written = seqs[seqs.length - 1]!
     return { accepted: seqs.length }
   })
@@ -228,9 +230,58 @@ test('a skipped batch above the phone numbering is numbered again and resent; on
   reporter.report({ level: 'info', event: 'mobile.action', message: 'c' })
   assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true })
   assert.deepEqual(sent, [[503], [601]], 'the next number continues above the last renumbering')
-  reporter.connect(async records => ({ accepted: 0, max_seq: records[records.length - 1]!.fields?.client_seq }))
+  let lost = true
+  reporter.connect(async records => {
+    const seq = records[records.length - 1]!.fields?.client_seq
+    // The device wrote it, but the answer was lost.
+    if (lost) { lost = false; throw new Error('连接超时。') }
+    return { accepted: 0, skipped: records.length, max_seq: seq }
+  })
   reporter.report({ level: 'info', event: 'mobile.action', message: 'd' })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
   assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true }, 'a resend the device already wrote leaves')
+})
+
+test('a partly skipped batch numbered below the device is renumbered; what the device wrote is not sent again', async () => {
+  const reporter = createBufferedReporter(memory(), { now: () => 10, later: () => {} })
+  for (const message of ['a', 'b', 'c', 'd', 'e']) reporter.report({ level: 'info', event: 'mobile.action', message })
+  // The device already wrote up to 12 from this phone, before its numbering went back.
+  let last = 12
+  const written: string[] = []
+  const batches: number[][] = []
+  reporter.connect(async records => {
+    const seqs = records.map(record => record.fields?.client_seq as number)
+    batches.push(seqs)
+    const fresh = records.filter(record => (record.fields?.client_seq as number) > last)
+    written.push(...fresh.map(record => record.message))
+    last = Math.max(last, ...seqs)
+    const skipped = records.length - fresh.length
+    return skipped ? { accepted: fresh.length, skipped, max_seq: last } : { accepted: fresh.length }
+  })
+  assert.deepEqual(await reporter.send(), { sent: 5, left: 0, connected: true })
+  assert.deepEqual(batches, [[10, 11, 12, 13, 14], [15, 16, 17]])
+  assert.deepEqual(written, ['d', 'e', 'a', 'b', 'c'], 'every record is written once')
+})
+
+test('a fatal record with a long stack is saved at once and keeps fatal', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'error', event: 'mobile.uncaught', message: 'TypeError: boom', fields: { fatal: true, stack: 'at f\n'.repeat(3000) } })
+  const saved = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  assert.equal(saved.pending(), 1)
+  const stored = JSON.parse(storage.getItem('vibeface.log-buffer')!).records[0].fields
+  assert.equal(stored.fatal, true)
+  assert.equal(stored.truncated, true)
+  assert.ok(String(stored.stack).startsWith('at f\nat f'))
+})
+
+test('saving now writes what the save delay would', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'tap' })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 0)
+  reporter.save()
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 1)
 })
 
 test('a fatal error is saved at once; other records wait for the short save delay', () => {

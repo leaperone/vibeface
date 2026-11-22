@@ -340,12 +340,13 @@ pub(crate) fn health_turn(trigger: &str) -> bool {
             if id.starts_with(crate::store::bot_settings::HEALTH_SCHEDULE_PREFIX))
 }
 
-/// The tools a health reminder's turn is offered: no work tool and no wake (a reminder or a
-/// message to a bot could dispatch work a turn later), but the provider-config card, which
-/// changes nothing until the user allows it.
+/// The tools a health reminder's turn is offered: the tools that only read this network's
+/// sessions, nodes, logs and health, and the provider-config card, which changes nothing until
+/// the user allows it. No work, wake or settings tool, and no `fetch_url`: a turn a log line
+/// started does not reach outside the network.
 pub(crate) fn health_turn_tool(tool: crate::tools::Tool) -> bool {
     use crate::tools::{Effect, Tool};
-    !matches!(tool.effect(), Effect::Work | Effect::Wake) || tool == Tool::ProposeProviderConfig
+    (tool.effect() == Effect::Read && tool != Tool::FetchUrl) || tool == Tool::ProposeProviderConfig
 }
 
 /// Warnings and errors since `since_ms` by event, repeats included.
@@ -387,16 +388,24 @@ struct LogQuery {
     event: Option<String>,
     conversation_id: Option<String>,
     grep: Option<String>,
+    until_ms: Option<i64>,
     limit: Option<usize>,
 }
 
-/// `read_logs`: the newest matching records of `node.log`, redacted, at most `MAX_LOG_READ`.
+/// Characters of one record's message, and bytes of its fields as JSON, a `read_logs` page keeps.
+const LOG_MESSAGE_CHARS: usize = 2_000;
+const LOG_FIELDS_BYTES: usize = 2_000;
+
+/// `read_logs`: the newest matching records of `node.log`, redacted, at most `MAX_LOG_READ` and
+/// `PAGE_BYTES` of JSON. When older records did not fit, the page says `truncated` and names the
+/// `until_ms` that reads on from where it stopped.
 pub(crate) fn read_logs(dir: &Path, args: &Value) -> Result<Value> {
     let query: LogQuery =
         serde_json::from_value(args.clone()).context("invalid read_logs arguments")?;
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_LOG_READ);
     let filter = Filter {
         since_ms: query.since_ms,
+        until_ms: query.until_ms,
         level: query.level,
         sources: query.source.into_iter().collect(),
         event: query.event,
@@ -405,7 +414,54 @@ pub(crate) fn read_logs(dir: &Path, args: &Value) -> Result<Value> {
         limit: Some(limit),
         ..Default::default()
     };
-    Ok(json!({"records":crate::logging::read(dir, &filter)?}))
+    let mut records = crate::logging::read(dir, &filter)?;
+    // Room for the envelope, `truncated` and `until_ms`.
+    let mut room = super::agent_tools::PAGE_BYTES - 64;
+    let mut page: Vec<crate::logging::Record> = Vec::new();
+    while let Some(record) = records.pop() {
+        let record = shortened(record);
+        let size = serde_json::to_string(&record)?.len() + 1;
+        if size > room {
+            let newest = page.first().map_or(i64::MAX, |kept| kept.ts_ms);
+            // Records sharing the cut's millisecond come again, unless the whole page shares it.
+            let until_ms = if record.ts_ms < newest {
+                record.ts_ms
+            } else {
+                record.ts_ms - 1
+            };
+            page.reverse();
+            return Ok(json!({"records":page,"truncated":true,"until_ms":until_ms}));
+        }
+        room -= size;
+        page.push(record);
+    }
+    page.reverse();
+    Ok(json!({"records":page}))
+}
+
+/// `record` with its message and its fields cut to a fixed prefix.
+fn shortened(mut record: crate::logging::Record) -> crate::logging::Record {
+    if record.message.chars().count() > LOG_MESSAGE_CHARS {
+        record.message = record
+            .message
+            .chars()
+            .take(LOG_MESSAGE_CHARS)
+            .collect::<String>()
+            + "…";
+    }
+    let fields = serde_json::to_string(&record.fields).expect("JSON fields");
+    if fields.len() > LOG_FIELDS_BYTES {
+        let prefix: String = fields
+            .char_indices()
+            .take_while(|(at, _)| *at < LOG_FIELDS_BYTES)
+            .map(|(_, char)| char)
+            .collect();
+        record.fields = serde_json::Map::from_iter([
+            ("truncated".to_owned(), json!(true)),
+            ("prefix".to_owned(), json!(prefix)),
+        ]);
+    }
+    record
 }
 
 impl Runtime {
@@ -782,7 +838,13 @@ mod tests {
         assert!(!health_turn_tool(Tool::InterruptWork));
         assert!(!health_turn_tool(Tool::Remind));
         assert!(!health_turn_tool(Tool::MessageBot));
+        assert!(!health_turn_tool(Tool::FetchUrl));
+        assert!(!health_turn_tool(Tool::SaveSchedule));
+        assert!(!health_turn_tool(Tool::ApplyProviderConfig));
         assert!(health_turn_tool(Tool::ReadLogs));
+        assert!(health_turn_tool(Tool::ReadHealth));
+        assert!(health_turn_tool(Tool::Context));
+        assert!(health_turn_tool(Tool::Nodes));
         assert!(health_turn_tool(Tool::ProposeProviderConfig));
     }
 
@@ -838,6 +900,59 @@ mod tests {
             1
         );
         assert!(read_logs(&dir, &json!({"unknown":1})).is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_logs_pages_large_records_by_bytes() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("health-log-pages-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let mut lines = String::new();
+        for index in 0..100 {
+            let record = crate::logging::Record {
+                ts_ms: index,
+                level: Level::Error,
+                source: Source::Mobile,
+                event: "mobile.uncaught".into(),
+                message: format!("{index} {}", "x".repeat(5_000)),
+                conversation_id: None,
+                work_id: None,
+                thread_id: None,
+                fields: serde_json::Map::from_iter([(
+                    "stack".to_owned(),
+                    json!("y".repeat(5_000)),
+                )]),
+            };
+            lines.push_str(&serde_json::to_string(&record)?);
+            lines.push('\n');
+        }
+        std::fs::write(dir.join(crate::logging::FILE), lines)?;
+        let (mut seen, mut until_ms, mut pages) = (Vec::new(), None, 0);
+        loop {
+            let page = read_logs(&dir, &json!({"limit":200,"until_ms":until_ms}))?;
+            assert!(page.to_string().len() <= super::super::agent_tools::PAGE_BYTES);
+            pages += 1;
+            let records = page["records"].as_array().unwrap();
+            assert!(records.iter().all(|record| {
+                record["message"].as_str().unwrap().chars().count() <= LOG_MESSAGE_CHARS + 1
+                    && record["fields"]["truncated"] == true
+            }));
+            let mut ts: Vec<i64> = records
+                .iter()
+                .map(|r| r["ts_ms"].as_i64().unwrap())
+                .collect();
+            ts.append(&mut seen);
+            seen = ts;
+            if page["truncated"] != true {
+                break;
+            }
+            until_ms = Some(page["until_ms"].as_i64().unwrap());
+        }
+        assert!(pages > 1, "a page of 100 large records is split");
+        assert_eq!(seen, (0..100).collect::<Vec<_>>());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

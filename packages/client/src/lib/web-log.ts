@@ -30,15 +30,27 @@ const MAX_QUEUED = 100
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length
 
-/** Shrinks fields first, then the message; rejects records still over budget after the message is exhausted. */
+/** Characters of a stack an oversized record keeps. */
+const STACK_PREFIX = 2000
+
+/**
+ * Shrinks fields first, keeping `fatal` and the start of `stack`, then the longer of the stack and the message; rejects
+ * records still over budget once both are exhausted.
+ */
 export function fit(record: WebRecord): WebRecord {
   if (bytes(record) <= MAX_RECORD_BYTES) return record
-  let fitted: WebRecord = { ...record, fields: record.fields && { truncated: true } }
+  const { fatal, stack } = record.fields ?? {}
+  let kept = typeof stack === "string" ? stack.slice(0, STACK_PREFIX) : ""
+  const fields = () => record.fields && {
+    truncated: true, ...(fatal === undefined ? {} : { fatal }), ...(kept ? { stack: `${kept}…` } : {}),
+  }
+  let fitted: WebRecord = { ...record, fields: fields() }
   let message = record.message
   while (bytes(fitted) > MAX_RECORD_BYTES) {
-    if (!message.length) throw new Error("Log record exceeds size limit.")
-    message = message.slice(0, Math.floor(message.length * 0.8))
-    fitted = { ...fitted, message: `${message}…` }
+    if (!kept && !message.length) throw new Error("Log record exceeds size limit.")
+    if (kept.length > message.length) kept = kept.slice(0, Math.floor(kept.length * 0.8))
+    else message = message.slice(0, Math.floor(message.length * 0.8))
+    fitted = { ...record, message: message === record.message ? message : `${message}…`, fields: fields() }
   }
   return fitted
 }
@@ -106,6 +118,8 @@ export function createReporter(): Reporter {
     },
     pending: () => queue.length,
     clear() { queue.length = 0 },
+    /** Records here live in memory only. */
+    save() {},
   }
 }
 
@@ -117,9 +131,12 @@ type Reporter = {
   send(): Promise<SendResult>
   pending(): number
   clear(): void
+  /** Writes what a later save would, at once. */
+  save(): void
 }
 type Kept = WebRecord & { fields: Record<string, unknown> & { client_seq: number; client_ts_ms: number } }
-type Buffer = { next: number; acked: number; records: Kept[] }
+/** `sent_max` is the highest number ever handed to the device; a skipped record above it was never sent. */
+type Buffer = { next: number; acked: number; sent_max: number; records: Kept[] }
 
 const BUFFER_KEY = "vibeface.log-buffer"
 const BUFFERED = 300
@@ -133,20 +150,24 @@ const SAVE_MS = 500
  * The phone's reporter: records survive restarts and crashes in `storage`, the newest 300 kept, each numbered with
  * `client_seq` and stamped with `client_ts_ms`. A batch leaves the buffer once the device accepts it or refuses it as
  * invalid (`log_rejected`); any other answer or an unknown result keeps it, and the device skips numbers it already
- * wrote, so sending it again is harmless. When the device skips a whole batch and names a `max_seq` at or above the
- * next number here, the numbering went back: the kept records get new numbers above it and go again.
+ * wrote, so sending it again is harmless. When the device skips records it names how many (`skipped`, the batch's
+ * first ones) and its last written number (`max_seq`). Skipped records numbered at most `sent_max` were resends; a
+ * skipped record above it, or a `max_seq` at or above the next number here, means the numbering went back: the records
+ * the device wrote leave the buffer, and the rest get new numbers above `max_seq` and go again.
  */
 export function createBufferedReporter(storage: KeyValue, { now = Date.now, later = (run: () => void, ms: number) => { setTimeout(run, ms) } } = {}): Reporter {
   const read = (): Buffer => {
     try {
       const saved = JSON.parse(storage.getItem(BUFFER_KEY) ?? "null") as Partial<Buffer> | null
-      if (saved && Number.isSafeInteger(saved.next) && Number.isSafeInteger(saved.acked) && Array.isArray(saved.records)) {
+      if (saved && Number.isSafeInteger(saved.next) && Number.isSafeInteger(saved.acked) && Number.isSafeInteger(saved.sent_max)
+        && Array.isArray(saved.records)) {
         const acked = saved.acked as number
-        return { next: saved.next as number, acked, records: saved.records.filter(item => Number(item?.fields?.client_seq) > acked) }
+        return { next: saved.next as number, acked, sent_max: saved.sent_max as number,
+          records: saved.records.filter(item => Number(item?.fields?.client_seq) > acked) }
       }
     } catch { /* a damaged buffer starts over */ }
     // Numbering from the clock keeps it above what the device saw before a reinstall.
-    return { next: now(), acked: 0, records: [] }
+    return { next: now(), acked: 0, sent_max: 0, records: [] }
   }
   const buffer = read()
   const save = () => { try { storage.setItem(BUFFER_KEY, JSON.stringify(buffer)) } catch { /* memory still holds them */ } }
@@ -177,9 +198,10 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
     buffer.records = buffer.records.filter(item => item.fields.client_seq > buffer.acked)
     saveSoon()
   }
-  /** Numbers every kept record again, from just above what the device has written. */
+  /** Numbers every kept record again, from just above what the device has written; none of the new numbers was sent. */
   const renumber = (written: number) => {
     buffer.next = written + 1
+    buffer.acked = buffer.sent_max = written
     buffer.records = buffer.records.map(item => ({ ...item, fields: { ...item.fields, client_seq: buffer.next++ } }))
     saveSoon()
   }
@@ -191,13 +213,24 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
       if (pause > 0 || free <= 0) { wake(pause > 0 ? pause : 60_000 - (now() - spent[0]!.at)); break }
       const batch = buffer.records.slice(0, Math.min(MAX_BATCH, free))
       const last = batch[batch.length - 1]!.fields.client_seq
+      const sentBefore = buffer.sent_max
+      // Saved before it goes: a resend after a crash must not look like numbering that went back.
+      if (last > sentBefore) { buffer.sent_max = last; save() }
       spent.push({ at: now(), count: batch.length })
       try {
-        const written = (await sink(batch, "mobile") as { max_seq?: unknown } | null)?.max_seq
-        if (Number.isSafeInteger(written) && (written as number) >= buffer.next) renumber(written as number)
-        else {
-          // A wholly skipped batch was written before, as was everything up to `max_seq`.
-          ack(Number.isSafeInteger(written) ? Math.max(last, written as number) : last)
+        const answer = await sink(batch, "mobile") as { skipped?: unknown; max_seq?: unknown } | null
+        const skipped = Number.isSafeInteger(answer?.skipped) ? Math.min(answer!.skipped as number, batch.length) : 0
+        const written = answer?.max_seq
+        const back = skipped > 0 && Number.isSafeInteger(written)
+          && ((written as number) >= buffer.next || batch.slice(0, skipped).some(item => item.fields.client_seq > sentBefore))
+        if (back) {
+          const accepted = new Set(batch.slice(skipped))
+          buffer.records = buffer.records.filter(item => !accepted.has(item))
+          renumber(written as number)
+          sent += accepted.size
+        } else {
+          // Skipped records were sent before and written then.
+          ack(last)
           sent += batch.length
         }
       } catch (cause) {
@@ -227,7 +260,7 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
       buffer.records.push(kept)
       if (buffer.records.length > BUFFERED) buffer.records.splice(0, buffer.records.length - BUFFERED)
       // A fatal error may end the app before a later save runs.
-      if (kept.fields.fatal === true) save()
+      if (record.fields?.fatal === true) save()
       else saveSoon()
       schedule()
     },
@@ -241,6 +274,7 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
     send() { retryAt = 0; return send() },
     pending: () => buffer.records.length,
     clear() { buffer.records = []; buffer.acked = buffer.next; save() },
+    save,
   }
 }
 
@@ -259,6 +293,8 @@ export const connectLogSink = (next: Sink) => reporter.connect(next)
 export const logSource = () => reporter.source
 /** Sends every kept record the device has not accepted yet. */
 export const sendLogs = () => reporter.send()
+/** Writes the kept records to storage now, for an app about to be suspended or closed. */
+export const saveLogs = () => reporter.save()
 /** Drops the kept records, as erasing the device does. */
 export const clearLogs = () => reporter.clear()
 

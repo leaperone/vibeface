@@ -1666,7 +1666,7 @@ fn tool_bot(bot: &crate::model::Bot) -> Value {
 }
 
 /// Bytes one tool result carries, and one event within it; the rest is read page by page.
-const PAGE_BYTES: usize = 32_000;
+pub(super) const PAGE_BYTES: usize = 32_000;
 const EVENT_BYTES: usize = 8_000;
 
 /// An `{author, seq}` position within the turn's history.
