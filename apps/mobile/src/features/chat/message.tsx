@@ -1,6 +1,6 @@
 import { Bot, CirclePause, CircleX, Clock, RotateCcw } from 'lucide-react-native'
 import { memo, type ReactNode } from 'react'
-import { Pressable, View, type AccessibilityActionEvent } from 'react-native'
+import { Pressable, View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { failureText, replyFailure } from '@vibeface/client/lib/errors.ts'
@@ -23,16 +23,16 @@ const ended: Record<string, string> = { stopped: '已中断', interrupted: '已�
 
 /**
  * Long-pressing the text opens the copy, share and quote sheet. The press area is not an accessibility element, so links
- * and code copy buttons inside stay focusable; assistive tech reaches the sheet through `holdActions` on the row instead.
+ * and code copy buttons inside stay focusable; assistive tech reaches the sheet through `MessageActionsButton` instead.
  */
 function Hold({ choose, children }: { choose: (() => void) | null; children: ReactNode }) {
   return <Pressable accessible={false} onLongPress={choose ?? undefined}>{children}</Pressable>
 }
 
-const holdActions = (choose: (() => void) | null) => choose ? {
-  accessibilityActions: [{ name: 'longpress', label: '复制、分享或引用' }],
-  onAccessibilityAction: (event: AccessibilityActionEvent) => { if (event.nativeEvent.actionName === 'longpress') choose() },
-} : {}
+/** A screen-reader-only button after the message, since VoiceOver exposes actions only on elements it can focus. */
+function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
+  return choose ? <Pressable accessibilityRole="button" accessibilityLabel="消息操作" accessibilityHint="复制、分享或引用" onPress={choose} className="absolute size-px overflow-hidden opacity-0" /> : null
+}
 
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
@@ -49,7 +49,8 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
   const { choose, feedback } = useMessageActions({ message, onCopy, onShare, onQuote })
   const time = shown ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
   const attachments = message.attachments?.length ? <MessageAttachments files={message.attachments} scope={attachmentScope} read={readAttachment} /> : null
-  if (user) return <Rise entering={entering} {...holdActions(message.text ? choose : null)} className="max-w-[85%] items-end gap-1 self-end">
+  if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
+    <MessageActionsButton choose={message.text ? choose : null} />
     <MessageBubble>
       {message.text ? <Hold choose={choose}><Text className="text-foreground">{message.text}</Text></Hold> : null}
       {attachments}
@@ -57,7 +58,8 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
     {feedback}
     {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted" /> : time}
   </Rise>
-  if (message.role === 'bot') return <Rise entering={entering} {...holdActions(choose)} className="max-w-[85%] items-start gap-1">
+  if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">
+    <MessageActionsButton choose={choose} />
     <View className="flex-row items-center gap-1.5">
       <Icon as={Bot} className="text-muted" />
       <Text numberOfLines={1} className="shrink text-sm text-muted">{message.sender?.name ?? '另一个 Bot'}</Text>
@@ -69,7 +71,8 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
     {feedback}
     {time}
   </Rise>
-  return <Rise entering={entering} {...holdActions(message.text && message.state !== 'streaming' ? choose : null)} className="gap-1">
+  return <Rise entering={entering} className="gap-1">
+    <MessageActionsButton choose={message.text && message.state !== 'streaming' ? choose : null} />
     {message.text ? <Hold choose={message.state !== 'streaming' ? choose : null}><Markdown text={message.text} /></Hold> : null}
     {attachments}
     {feedback}
