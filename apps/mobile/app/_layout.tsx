@@ -1,4 +1,5 @@
 import '@/platform/polyfills'
+import '@/lib/log-buffer'
 import '@/lib/error-reporting'
 import '../global.css'
 

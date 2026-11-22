@@ -4,6 +4,7 @@ import { useState, useSyncExternalStore } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { lastFailure, problemReport, subscribeFailures } from '@vibeface/client/lib/error-ref.ts'
+import { sendLogs } from '@vibeface/client/lib/web-log.ts'
 import { ErrorText, useAction } from '@/components/action'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
@@ -33,6 +34,8 @@ export default function Report() {
   const conversationName = shared.bots.find((bot) => bot.conversation_id === conversation)?.name
   const send = () => run('send', async () => {
     if (!primary) throw new Error(noPrimary)
+    // The bot reads the device's log, so the phone's kept records go first, waiting at most a few seconds.
+    await Promise.race([sendLogs(), new Promise(resolve => setTimeout(resolve, 3000))])
     const message = problemReport({ description: text, conversation_id: withConversation ? conversation : undefined, ref: withRef ? failure?.ref : undefined })
     await shared.sendMessage(message, [], [], { conversation_id: primary.conversation_id, target: { kind: 'bot_main', bot_id: primary.bot_id } })
     router.replace(`/b/${primary.bot_id}`)

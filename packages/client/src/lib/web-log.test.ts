@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Worker } from 'node:worker_threads'
-import { MAX_BATCH, MAX_RECORD_BYTES, createReporter, failureFields, fit, pageIds, type WebRecord } from './web-log.ts'
+import { MAX_BATCH, MAX_RECORD_BYTES, createBufferedReporter, createReporter, failureFields, fit, pageIds, type WebRecord } from './web-log.ts'
 
 const size = (record: WebRecord) => new TextEncoder().encode(JSON.stringify(record)).length
 
@@ -135,4 +135,53 @@ test('page ids come from the conversation query and the task path', () => {
   assert.deepEqual(pageIds({ pathname: '/b/bot-1/work/w-9', search: '?conversation=c-1' }), { conversation_id: 'c-1', work_id: 'w-9' })
   assert.deepEqual(pageIds({ pathname: '/settings', search: '?conversation=../x' }), { conversation_id: undefined, work_id: undefined })
   assert.deepEqual(pageIds({ pathname: '/b/bot-1/work/%zz', search: '' }), { conversation_id: undefined, work_id: undefined })
+})
+
+const memory = () => {
+  const saved = new Map<string, string>()
+  return { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
+}
+
+test('the phone keeps numbered records until the device accepts them, across restarts and unknown results', async () => {
+  const storage = memory()
+  let clock = 1_000
+  const timers: Array<() => void> = []
+  const options = { now: () => clock, later: (run: () => void) => { timers.push(run) } }
+  const first = createBufferedReporter(storage, options)
+  for (let index = 0; index < 3; index++) first.report({ level: 'info', event: 'mobile.connection', message: `${index}` })
+  const reopened = createBufferedReporter(storage, options)
+  assert.equal(reopened.pending(), 3, 'a restart keeps unsent records')
+  const sent: unknown[][] = []
+  let answer: 'unknown' | 'limited' | 'ok' = 'unknown'
+  reopened.connect(async (records, source) => {
+    assert.equal(source, 'mobile')
+    sent.push(records.map(record => [record.fields?.client_seq, record.fields?.client_ts_ms]))
+    if (answer === 'unknown') throw new Error('连接超时。')
+    if (answer === 'limited') throw Object.assign(new Error('too many log records; try again in a minute'), { responded: true })
+  })
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true }, 'an unknown result keeps them')
+  answer = 'limited'
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true })
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true }, 'a refused budget waits a minute')
+  answer = 'ok'
+  clock += 60_000
+  assert.deepEqual(await reopened.send(), { sent: 3, left: 0, connected: true })
+  const numbered = [[1000, 1000], [1001, 1000], [1002, 1000]]
+  assert.deepEqual(sent, [numbered, numbered, numbered], 'the same numbers go again')
+  assert.equal(createBufferedReporter(storage, options).pending(), 0, 'accepted records leave storage')
+  assert.ok(timers.length > 0, 'a wait is scheduled')
+})
+
+test('the phone keeps the newest 300 and stays within 120 records a minute', async () => {
+  let clock = 0
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: () => {} })
+  for (let index = 0; index < 310; index++) reporter.report({ level: 'info', event: 'mobile.action', message: `${index}` })
+  assert.equal(reporter.pending(), 300)
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 300, connected: false })
+  let count = 0
+  reporter.connect(async records => { count += records.length })
+  assert.deepEqual(await reporter.send(), { sent: 120, left: 180, connected: true })
+  clock += 60_000
+  assert.deepEqual(await reporter.send(), { sent: 120, left: 60, connected: true })
+  assert.equal(count, 240)
 })

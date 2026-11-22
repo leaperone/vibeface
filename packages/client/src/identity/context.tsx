@@ -22,7 +22,7 @@ import type { Link, LinkEvent } from '../lib/link.ts'
 import { candidates, defaultGateway, gatewaysOf, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
-import { connectLogSink, failureFields, reportLog } from '../lib/web-log.ts'
+import { connectLogSink, failureFields, logSource, reportLog } from '../lib/web-log.ts'
 import { recordFailure, requestConversation } from '../lib/error-ref.ts'
 import { storageOf } from '../workspace/storage.ts'
 
@@ -1638,7 +1638,18 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const fresh = seen.filter(item => !before.has(key(item)))
     if (fresh.length) void goDirect(fresh)
   }), [])
-  useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
+  useEffect(() => ready ? connectLogSink((records, source) => ready.request('log', { records, source })) : undefined, [ready])
+  // The phone records each change of connection stage, with the way it was trying, to explain transport trouble later.
+  const loggedPhase = useRef<Phase | null>(null)
+  useEffect(() => {
+    const from = loggedPhase.current
+    if (from === phase || logSource() !== 'mobile') return
+    loggedPhase.current = phase
+    const way = entry && (entry.kind === 'lan' ? { addrs: entry.addrs } : { address: entry.address })
+    reportLog({ level: 'info', event: 'mobile.connection', message: `${from ?? 'start'} → ${phase}`, fields: {
+      from, to: phase, ...(entry ? { path: entry.kind, node: entry.device_id, ...way } : {}), ...(error && phase !== 'ready' ? { reason: error.slice(0, 300) } : {}),
+    } })
+  }, [phase, entry, error])
   useEffect(() => {
     let mounted = true
     let version = generation.current

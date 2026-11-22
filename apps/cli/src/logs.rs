@@ -33,6 +33,7 @@ enum LogSource {
     Cli,
     Codex,
     Desktop,
+    Mobile,
 }
 
 #[derive(Args)]
