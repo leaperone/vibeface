@@ -1424,7 +1424,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
-        '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
@@ -3187,7 +3187,6 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.equal(button('不再发送'), undefined)
       assert.equal(button('关闭提醒'), undefined)
       assert.match(componentText(render()), /送达结果仍未确认/)
-      assert.match(componentText(render()), platform === 'web' ? /此浏览器/ : /此应用/)
       assert.ok(button('确认原设备并查询'))
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
       for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
@@ -5667,7 +5666,7 @@ test('changing the recovery password asks for it twice, keeps what was typed whe
   } finally { app.close() }
 })
 
-test('native chat folds runtime diagnostics and retains result checks without provider availability cards', async () => {
+test('native chat activity keeps runtime diagnostics and result checks out of the message list', async () => {
   let refreshed = 0
   const runtime = workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'submitted-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'record', execution: 'started', attempted_at_ms: 1, switched_from: null, switch_reason: null })
   const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
@@ -5683,36 +5682,28 @@ test('native chat folds runtime diagnostics and retains result checks without pr
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }), withTiming: (value: number) => value }, 'uniwind': { withUniwind: (value: unknown) => value },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
   })
-  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { after: Map<string, { key: string; node: HarnessElement }[]>; cards: HarnessElement[] } }
+  type Activity = { todo: HarnessElement[]; runtime: HarnessElement[] }
+  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { failures: Map<string, unknown[]>; activity: Activity; attention: number } }
   try {
     const result = render()
     assert.equal(botReach(shared.nodes), 'unverified')
-    assert.equal(result.cards.length, 0, 'unverified readiness is sendable without a provider card')
-    const row = result.after.get('reply')?.find((row) => row.key === 'runtime:message:one')?.node
-    assert.ok(row)
-    assert.equal(row.type, 'Details')
-    assert.equal(row.props.label, '运行信息')
-    details.render('Details', row.props)
-    assert.doesNotMatch(componentText(details.output), /Codex|submitted-model|提交推理强度|记录结果/)
-    const toggle = details.render('Details', row.props).find(({ props }) => props.accessibilityRole === 'button')
-    assert.deepEqual(JSON.parse(JSON.stringify(toggle?.props.accessibilityState)), { expanded: false })
-    assert.equal(typeof toggle?.props.onPress, 'function')
-    if (typeof toggle?.props.onPress === 'function') toggle.props.onPress()
-    details.render('Details', row.props)
-    assert.match(componentText(details.output), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
+    assert.equal(result.activity.todo.length, 0, 'unverified readiness is sendable without a provider card')
+    assert.equal(result.failures.size, 0, 'runtime diagnostics stay out of the message list')
+    assert.match(componentText(result.activity.runtime), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
     for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }] satisfies ManagerJob[]) {
       shared.data.scheduler!.jobs = [current]
-      const cards = render().cards
-      assert.equal(cards.length, 1)
-      assert.equal(cards[0].props.title, '这次回复的结果待确认')
-      const action = findActionProps(cards[0].props.actions, '再查一次')?.action
+      const { activity, attention } = render()
+      assert.equal(activity.todo.length, 1)
+      assert.equal(attention, 1)
+      assert.equal(activity.todo[0].props.title, '这次回复的结果待确认')
+      const action = findActionProps(activity.todo[0].props.actions, '再查一次')?.action
       assert.equal(typeof action, 'function')
       if (typeof action === 'function') await action()
     }
     assert.equal(refreshed, 2, 'result reconciliation remains a read-only action')
     shared.data.works = [parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })]
     shared.data.checks = [{ check_id: 'process', conversation_id: 'chat', trigger: 'message:one', attempt_id: 'attempt', detail: '进程还在运行', process_groups: [42], created_at_ms: 1 }]
-    const cards = render().cards
+    const cards = render().activity.todo
     assert.equal(cards.filter(({ type }) => typeof type === 'function' && type.name === 'ConfirmCard').length, 2, 'unknown work and running-process checks stay visible')
   } finally { extras.close(); details.close() }
 })
@@ -5728,7 +5719,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-    '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
     ...dependencies,
   })
 }

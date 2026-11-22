@@ -187,7 +187,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>} />),
     ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
-  const attention = cards.length
+  const attention = cards.length + (requery && !reconciling.length ? 1 : 0)
   const sending = pendingMessages.filter((pending) => !undecided(pending))
   const changeGroups = [...placedChanges.first, ...[...placedChanges.after.values()].flat()]
   const runtime = jobs.filter((job) => job.runtime).at(-1)?.runtime
