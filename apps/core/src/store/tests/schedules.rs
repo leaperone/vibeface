@@ -222,6 +222,79 @@ fn the_node_reminds_the_primary_bot_once_per_key() -> Result<()> {
 }
 
 #[test]
+fn a_bot_cannot_rewrite_a_health_reminder() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let now = 10_000;
+    let PrimaryReminder::Written(first) =
+        origin.remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now)?
+    else {
+        panic!("the owner writes the reminder")
+    };
+    let BotChange::Schedule { schedule_id, .. } = first.change else {
+        panic!("reminder")
+    };
+    let requests = [
+        ChangeRequest::SaveSchedule {
+            schedule_id: Some(schedule_id.clone()),
+            name: "Digest".into(),
+            prompt: "dispatch work".into(),
+            first_run_at_ms: now + 120_000,
+            every_minutes: Some(5),
+            enabled: None,
+        },
+        ChangeRequest::RemoveSchedule {
+            schedule_id: schedule_id.clone(),
+        },
+    ];
+    for (index, request) in requests.into_iter().enumerate() {
+        let error = origin
+            .change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                &format!("r{index}"),
+                request,
+                Provider::Codex,
+                now + 1,
+            )
+            .expect_err("a health reminder is the Node's");
+        assert!(error.to_string().contains("health reminder"), "{error:#}");
+    }
+
+    // A later change under the same ID, even from this Node, is not the reminder any more.
+    let local = net.a.device_id()?;
+    let trigger = schedule_trigger(&schedule_id, now + 60_000);
+    assert!(origin.diagnostics_turn(&net.network, &local, "c", &trigger)?);
+    origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::BotChanged {
+            change_id: "change-other".into(),
+            cause: None,
+            change: BotChange::Schedule {
+                schedule_id: schedule_id.clone(),
+                before: None,
+                after: Some(Schedule {
+                    name: "检查 Node".into(),
+                    prompt: "dispatch work".into(),
+                    first_run_at_ms: now + 60_000,
+                    every_minutes: None,
+                    enabled: true,
+                    depth: 1,
+                }),
+            },
+        },
+        vec![],
+        now + 2,
+    )?;
+    assert!(!origin.diagnostics_turn(&net.network, &local, "c", &trigger)?);
+    Ok(())
+}
+
+#[test]
 fn a_node_that_does_not_schedule_the_primary_bot_writes_no_reminder() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;

@@ -198,7 +198,7 @@ impl Runtime {
                 Execution::NotStarted
                     .with(Approval::Denied)
                     .failure(anyhow::anyhow!(
-                        "a health reminder's turn does not dispatch or control work"
+                        "a health reminder's turn does not dispatch, control or wake work"
                     ))
             );
         }

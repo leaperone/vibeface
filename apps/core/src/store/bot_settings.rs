@@ -839,6 +839,15 @@ pub(crate) fn find_bot(connection: &Connection, network: &str, wanted: &str) -> 
     }
 }
 
+/// The Node's health reminders are its own: no bot edits or removes one.
+fn not_health_schedule(id: &str) -> Result<()> {
+    ensure!(
+        !id.starts_with(HEALTH_SCHEDULE_PREFIX),
+        "schedule {id} is the Node's health reminder; a bot cannot change it"
+    );
+    Ok(())
+}
+
 /// A schedule belongs to the bot that created it; others cannot change it.
 fn own_schedule(connection: &Connection, network: &str, scope: &str, id: &str) -> Result<Schedule> {
     Ok(schedule_from(connection, network, id)?
@@ -1074,6 +1083,7 @@ fn resolve(
         } => {
             let (schedule_id, before) = match schedule_id {
                 Some(id) => {
+                    not_health_schedule(&id)?;
                     let before = own_schedule(connection, network, scope, &id)?;
                     (id, Some(before))
                 }
@@ -1109,6 +1119,7 @@ fn resolve(
             }
         }
         ChangeRequest::RemoveSchedule { schedule_id } => {
+            not_health_schedule(&schedule_id)?;
             let before = own_schedule(connection, network, scope, &schedule_id)?;
             BotChange::Schedule {
                 schedule_id,
@@ -1471,7 +1482,27 @@ impl Store {
                 let Some(digest) = id.strip_prefix(HEALTH_SCHEDULE_PREFIX) else {
                     return Ok(false);
                 };
-                match change_from(connection, network, &format!("change-{digest}"))? {
+                let change_id = format!("change-{digest}");
+                // The Node's own change must still be the schedule's last, edit and pause alike,
+                // and still a one-time reminder.
+                let schedule: Option<Option<String>> = connection
+                    .query_row(
+                        "SELECT s.schedule FROM schedules s JOIN bot_changes c
+                           ON c.network_id=s.network_id AND c.change_id=?3 AND c.rank=s.rank
+                         WHERE s.network_id=?1 AND s.schedule_id=?2 AND s.conversation_id=?4
+                           AND s.removed=0 AND s.enabled_rank=s.rank",
+                        params![network, id, change_id, scope],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(Some(schedule)) = schedule else {
+                    return Ok(false);
+                };
+                let schedule: Schedule = serde_json::from_str(&schedule)?;
+                if schedule.every_minutes.is_some() || schedule.depth != 1 {
+                    return Ok(false);
+                }
+                match change_from(connection, network, &change_id)? {
                     Some(change) if change.conversation_id == scope => {
                         log::event_from(connection, network, &change.event_hash)?
                             .is_some_and(|event| event.author == local)

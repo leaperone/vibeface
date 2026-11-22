@@ -36,6 +36,14 @@ enum LogSource {
     Mobile,
 }
 
+/// Who writes a record with `vibeface log`: the local Node takes only these two from the CLI.
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WriteSource {
+    Agent,
+    Cli,
+}
+
 #[derive(Args)]
 pub(super) struct LogRecord {
     /// Log severity.
@@ -54,9 +62,9 @@ pub(super) struct LogRecord {
     /// Structured event name.
     #[arg(long)]
     event: Option<String>,
-    /// Log source.
+    /// Who writes the record; agent when VIBEFACE_TRIAGE_URL is set, otherwise cli.
     #[arg(long)]
-    source: Option<LogSource>,
+    source: Option<WriteSource>,
     #[command(flatten)]
     local: LocalNode,
 }
@@ -99,14 +107,10 @@ pub(super) async fn log_record(options: LogRecord) -> Result<()> {
     let source = options
         .source
         .unwrap_or(if std::env::var_os("VIBEFACE_TRIAGE_URL").is_some() {
-            LogSource::Agent
+            WriteSource::Agent
         } else {
-            LogSource::Cli
+            WriteSource::Cli
         });
-    ensure!(
-        matches!(source, LogSource::Agent | LogSource::Cli),
-        "--source is agent or cli"
-    );
     let body = json!({"source":source,"records":[{"level":options.level,"message":options.message,"event":options.event,"conversation_id":options.conversation,"work_id":options.work,"thread_id":options.thread}]});
     post_local(&options.local, "/api/log", &body, Duration::from_secs(10)).await?;
     Ok(())

@@ -1204,15 +1204,15 @@ async fn log(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json
         .ok()
         .filter(|source| matches!(source, Source::Agent | Source::Cli | Source::Desktop))
         .ok_or_else(|| ApiError::bad("source must be agent, cli or desktop"))?;
-    let accepted = crate::logging::submit(
+    crate::logging::submit(
         &app.node.log_intake,
         &format!("local-{source:?}"),
         source,
         &input["records"],
         crate::clock::now_ms(),
     )
-    .map_err(ApiError::bad)?;
-    Ok(Json(json!({"accepted":accepted})))
+    .map(Json)
+    .map_err(ApiError::bad)
 }
 
 async fn decision(

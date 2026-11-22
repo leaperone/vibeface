@@ -149,6 +149,8 @@ test('the phone keeps numbered records until the device accepts them, across res
   const options = { now: () => clock, later: (run: () => void) => { timers.push(run) } }
   const first = createBufferedReporter(storage, options)
   for (let index = 0; index < 3; index++) first.report({ level: 'info', event: 'mobile.connection', message: `${index}` })
+  assert.equal(createBufferedReporter(storage, options).pending(), 0, 'a burst is saved once, a moment later')
+  timers.splice(0).forEach(run => run())
   const reopened = createBufferedReporter(storage, options)
   assert.equal(reopened.pending(), 3, 'a restart keeps unsent records')
   const sent: unknown[][] = []
@@ -157,7 +159,7 @@ test('the phone keeps numbered records until the device accepts them, across res
     assert.equal(source, 'mobile')
     sent.push(records.map(record => [record.fields?.client_seq, record.fields?.client_ts_ms]))
     if (answer === 'unknown') throw new Error('连接超时。')
-    if (answer === 'limited') throw Object.assign(new Error('too many log records; try again in a minute'), { responded: true })
+    if (answer === 'limited') throw Object.assign(new Error('too many log records; try again in a minute'), { responded: true, code: 'log_rate_limited' })
   })
   assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true }, 'an unknown result keeps them')
   answer = 'limited'
@@ -168,8 +170,76 @@ test('the phone keeps numbered records until the device accepts them, across res
   assert.deepEqual(await reopened.send(), { sent: 3, left: 0, connected: true })
   const numbered = [[1000, 1000], [1001, 1000], [1002, 1000]]
   assert.deepEqual(sent, [numbered, numbered, numbered], 'the same numbers go again')
+  timers.splice(0).forEach(run => run())
   assert.equal(createBufferedReporter(storage, options).pending(), 0, 'accepted records leave storage')
-  assert.ok(timers.length > 0, 'a wait is scheduled')
+})
+
+test('the phone keeps a batch the device answered with anything but an invalid record', async () => {
+  let clock = 0
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.connection', message: 'a' })
+  let refusal: { message: string; code?: string } = { message: 'the Node is updating; try again shortly' }
+  reporter.connect(async () => { throw Object.assign(new Error(refusal.message), { responded: true, code: refusal.code }) })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'maintenance keeps it')
+  refusal = { message: 'this device is not a member' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'a lost permission keeps it')
+  refusal = { message: 'too many log records; try again in a minute' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'the words alone are not a rate limit')
+  refusal = { message: 'send between 1 and 20 log records at a time', code: 'log_rejected' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 0, connected: true }, 'an invalid batch is dropped')
+})
+
+test('a rate-limited batch waits a minute before it goes again', async () => {
+  let clock = 0
+  const waits: number[] = []
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: (_run, ms) => { waits.push(ms) } })
+  reporter.report({ level: 'info', event: 'mobile.connection', message: 'a' })
+  let calls = 0
+  reporter.connect(async () => {
+    calls++
+    if (clock < 60_000) throw Object.assign(new Error('slow down'), { responded: true, code: 'log_rate_limited' })
+  })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
+  assert.ok(waits.includes(60_000), 'the next try is a minute away')
+  clock = 59_999
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'not sent again within the minute')
+  assert.equal(calls, 1)
+  clock = 60_000
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true })
+})
+
+test('a skipped batch above the phone numbering is numbered again and resent; one below it was written', async () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 10, later: () => {} })
+  for (const message of ['a', 'b']) reporter.report({ level: 'info', event: 'mobile.action', message })
+  const sent: unknown[] = []
+  let written = 500
+  reporter.connect(async records => {
+    const seqs = records.map(record => record.fields?.client_seq as number)
+    sent.push(seqs)
+    if (seqs[0]! <= written) return { accepted: 0, max_seq: written }
+    written = seqs[seqs.length - 1]!
+    return { accepted: seqs.length }
+  })
+  assert.deepEqual(await reporter.send(), { sent: 2, left: 0, connected: true })
+  assert.deepEqual(sent, [[10, 11], [501, 502]], 'new numbers above what the device wrote')
+  written = 600
+  sent.length = 0
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'c' })
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true })
+  assert.deepEqual(sent, [[503], [601]], 'the next number continues above the last renumbering')
+  reporter.connect(async records => ({ accepted: 0, max_seq: records[records.length - 1]!.fields?.client_seq }))
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'd' })
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true }, 'a resend the device already wrote leaves')
+})
+
+test('a fatal error is saved at once; other records wait for the short save delay', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'tap' })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 0)
+  reporter.report({ level: 'error', event: 'mobile.uncaught', message: 'boom', fields: { fatal: true } })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 2)
 })
 
 test('the phone keeps the newest 300 and stays within 120 records a minute', async () => {

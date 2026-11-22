@@ -616,13 +616,21 @@ impl Calls {
                     id: completed.id,
                     result: Value::Null,
                     error: Some(crate::logging::scrub(&error.to_string())),
-                    code: error
-                        .downcast_ref::<crate::discovery::CodexMissing>()
-                        .map(|_| crate::discovery::CodexMissing::CODE),
+                    code: error_code(&error),
                 }
             }
         })
     }
+}
+
+/// The code a refused request answers with, for errors a client acts on by kind.
+pub(super) fn error_code(error: &anyhow::Error) -> Option<&'static str> {
+    if error.is::<crate::discovery::CodexMissing>() {
+        return Some(crate::discovery::CodexMissing::CODE);
+    }
+    error
+        .downcast_ref::<crate::logging::Refused>()
+        .map(|refused| refused.code)
 }
 
 #[cfg(all(test, unix))]

@@ -313,7 +313,7 @@ fn handoff_note(problem: &Problem, device: &str) -> String {
         .map(|id| format!("，会话 {id}"))
         .unwrap_or_default();
     format!(
-        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。这两个工具只读取执行这一轮的设备自己的日志和健康状态，这一轮不在设备 {device} 上执行时不可用。这一轮不能派发或控制工作；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
+        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。这两个工具只读取执行这一轮的设备自己的日志和健康状态，这一轮不在设备 {device} 上执行时不可用。这一轮不能派发或控制工作，也不能设提醒或给其他 bot 发消息；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
         problem.check.title(),
         problem.check.began(),
         problem.subject,
@@ -340,10 +340,12 @@ pub(crate) fn health_turn(trigger: &str) -> bool {
             if id.starts_with(crate::store::bot_settings::HEALTH_SCHEDULE_PREFIX))
 }
 
-/// The tools a health reminder's turn is offered: no work tool but the provider-config card,
-/// which changes nothing until the user allows it.
+/// The tools a health reminder's turn is offered: no work tool and no wake (a reminder or a
+/// message to a bot could dispatch work a turn later), but the provider-config card, which
+/// changes nothing until the user allows it.
 pub(crate) fn health_turn_tool(tool: crate::tools::Tool) -> bool {
-    tool.effect() != crate::tools::Effect::Work || tool == crate::tools::Tool::ProposeProviderConfig
+    use crate::tools::{Effect, Tool};
+    !matches!(tool.effect(), Effect::Work | Effect::Wake) || tool == Tool::ProposeProviderConfig
 }
 
 /// Warnings and errors since `since_ms` by event, repeats included.
@@ -778,6 +780,8 @@ mod tests {
         assert!(!health_turn("message:health-abc"));
         assert!(!health_turn_tool(Tool::DispatchWork));
         assert!(!health_turn_tool(Tool::InterruptWork));
+        assert!(!health_turn_tool(Tool::Remind));
+        assert!(!health_turn_tool(Tool::MessageBot));
         assert!(health_turn_tool(Tool::ReadLogs));
         assert!(health_turn_tool(Tool::ProposeProviderConfig));
     }

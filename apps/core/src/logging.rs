@@ -960,25 +960,58 @@ impl RateLimit {
     }
 }
 
-/// Accepts a batch from `sender` whole or not at all, and returns how many records it wrote. A
-/// record whose `fields.client_seq` is not above the sender's last written one is a resend and is
-/// skipped without counting against the budget.
+/// Why the Node refused a batch of log records. `code` tells a client whether to drop the batch
+/// (`log_rejected`: sending it again cannot change that) or wait a minute (`log_rate_limited`).
+#[derive(Debug)]
+pub struct Refused {
+    pub code: &'static str,
+    message: String,
+}
+
+impl Refused {
+    pub const REJECTED: &str = "log_rejected";
+    pub const RATE_LIMITED: &str = "log_rate_limited";
+
+    pub fn rejected(error: impl std::fmt::Display) -> anyhow::Error {
+        Self {
+            code: Self::REJECTED,
+            message: error.to_string(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Accepts a batch from `sender` whole or not at all, and answers `{"accepted":n}`. A record whose
+/// `fields.client_seq` is not above the sender's last written one is a resend and is skipped
+/// without counting against the budget; when the whole batch is skipped the answer also carries
+/// that last number as `max_seq`, so a sender whose numbering went back can start above it.
 pub fn submit(
     limit: &RateLimit,
     sender: &str,
     source: Source,
     records: &Value,
     now_ms: i64,
-) -> Result<usize> {
-    let records = records.as_array().context("records must be a list")?;
-    ensure!(
-        !records.is_empty() && records.len() <= MAX_BATCH,
-        "send between 1 and {MAX_BATCH} log records at a time"
-    );
-    let records = records
-        .iter()
-        .map(|record| submitted(source, sender, record, now_ms))
-        .collect::<Result<Vec<_>>>()?;
+) -> Result<Value> {
+    let records = (|| {
+        let records = records.as_array().context("records must be a list")?;
+        ensure!(
+            !records.is_empty() && records.len() <= MAX_BATCH,
+            "send between 1 and {MAX_BATCH} log records at a time"
+        );
+        records
+            .iter()
+            .map(|record| submitted(source, sender, record, now_ms))
+            .collect::<Result<Vec<_>>>()
+    })()
+    .map_err(|error| Refused::rejected(format!("{error:#}")))?;
     let mut seqs = limit.seqs.lock().expect("log sequence");
     let mut last = seqs.get(sender).copied();
     let records: Vec<_> = records
@@ -995,12 +1028,21 @@ pub fn submit(
         )
         .collect();
     if records.is_empty() {
-        return Ok(0);
+        let max_seq = last.context("a batch without client_seq is never skipped")?;
+        tracing::debug!(
+            sender,
+            max_seq,
+            "log batch skipped: every client_seq was already written"
+        );
+        return Ok(serde_json::json!({"accepted":0,"max_seq":max_seq}));
     }
-    ensure!(
-        limit.take(sender, records.len() as u32, now_ms),
-        "too many log records; try again in a minute"
-    );
+    if !limit.take(sender, records.len() as u32, now_ms) {
+        return Err(Refused {
+            code: Refused::RATE_LIMITED,
+            message: "too many log records; try again in a minute".into(),
+        }
+        .into());
+    }
     if let Some(last) = last {
         seqs.insert(sender.to_owned(), last);
     }
@@ -1008,7 +1050,7 @@ pub fn submit(
     for record in &records {
         write(record);
     }
-    Ok(records.len())
+    Ok(serde_json::json!({"accepted":records.len()}))
 }
 
 /// Copies a child's stderr into the log line by line, through `emit`, until it closes. More than
@@ -1494,8 +1536,10 @@ mod tests {
         let ok = json!({"level":"error","event":"web.uncaught","message":"boom","conversation_id":"c-1"});
         assert_eq!(
             submit(&limit, "a", Source::Web, &json!([ok]), 0).unwrap(),
-            1
+            json!({"accepted":1})
         );
+        let code =
+            |error: anyhow::Error| error.downcast_ref::<Refused>().map(|refused| refused.code);
         let big = json!({"level":"info","message":"x".repeat(MAX_RECORD_BYTES)});
         for rejected in [
             json!([big]),
@@ -1506,8 +1550,11 @@ mod tests {
             json!([{"level":"info","message":"x","conversation_id":"../etc"}]),
             json!([{"level":"info","message":"x","source":"node"}]),
         ] {
-            assert!(
-                submit(&limit, "a", Source::Web, &rejected, 0).is_err(),
+            assert_eq!(
+                submit(&limit, "a", Source::Web, &rejected, 0)
+                    .err()
+                    .and_then(code),
+                Some(Refused::REJECTED),
                 "{rejected}"
             );
         }
@@ -1518,6 +1565,12 @@ mod tests {
         assert_eq!(
             1 + accepted * MAX_BATCH,
             1 + (RATE_PER_MINUTE as usize - 1) / MAX_BATCH * MAX_BATCH
+        );
+        assert_eq!(
+            submit(&limit, "a", Source::Web, &batch, 1)
+                .err()
+                .and_then(code),
+            Some(Refused::RATE_LIMITED)
         );
         assert!(
             submit(&limit, "b", Source::Web, &json!([ok]), 1).is_ok(),
@@ -1542,14 +1595,26 @@ mod tests {
         );
         let send =
             |sender, batch: Value| submit(&limit, sender, Source::Mobile, &batch, 0).unwrap();
-        assert_eq!(send("phone-1", json!([seq(1), seq(2)])), 2);
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(2)])),
+            json!({"accepted":2})
+        );
         assert_eq!(
             send("phone-1", json!([seq(1), seq(2), seq(3)])),
-            1,
+            json!({"accepted":1}),
             "only the new one"
         );
-        assert_eq!(send("phone-1", json!([seq(3)])), 0);
-        assert_eq!(send("phone-2", json!([seq(1)])), 1, "per sender");
+        assert_eq!(
+            send("phone-1", json!([seq(1), seq(3)])),
+            json!({"accepted":0,"max_seq":3}),
+            "a wholly skipped batch names the last written number"
+        );
+        assert_eq!(send("phone-1", json!([seq(4)])), json!({"accepted":1}));
+        assert_eq!(
+            send("phone-2", json!([seq(1)])),
+            json!({"accepted":1}),
+            "per sender"
+        );
         for bad in [json!(-1), json!("7"), json!(1.5)] {
             let record = json!({"level":"info","message":"m","fields":{"client_seq":bad}});
             assert!(submit(&limit, "phone-1", Source::Mobile, &json!([record]), 0).is_err());

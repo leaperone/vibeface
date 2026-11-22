@@ -906,16 +906,19 @@ async fn dispatch_inner(
             let source = match params.get("source").map(|source| source.as_str()) {
                 None | Some(Some("web")) => crate::logging::Source::Web,
                 Some(Some("mobile")) => crate::logging::Source::Mobile,
-                _ => anyhow::bail!("log source is web or mobile"),
+                _ => {
+                    return Err(crate::logging::Refused::rejected(
+                        "log source is web or mobile",
+                    ));
+                }
             };
-            let accepted = crate::logging::submit(
+            crate::logging::submit(
                 &node.log_intake,
                 &session.device_id,
                 source,
                 &params["records"],
                 crate::clock::now_ms(),
-            )?;
-            Ok(json!({"accepted":accepted}))
+            )
         }
         ClientCommand::Logs(params) => {
             let params = params.into_value();
@@ -3493,10 +3496,13 @@ mod tests {
         let mut browser = test_session(member.device_id()?);
         let oversized =
             json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
-        assert!(
+        let refused =
             dispatch_wire_fixture(&node, &mut browser, "log", json!({"records":[oversized]}))
                 .await
-                .is_err()
+                .expect_err("an oversized record is refused");
+        assert_eq!(
+            concurrency::error_code(&refused),
+            Some(crate::logging::Refused::REJECTED)
         );
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "log", json!({"records":[record]})).await?,
@@ -3504,15 +3510,17 @@ mod tests {
         );
         let phone = json!({"level":"info","event":"mobile.connection","message":"ready","fields":{"client_seq":1}});
         for source in [json!("node"), json!("desktop"), json!(1)] {
-            assert!(
-                dispatch_wire_fixture(
-                    &node,
-                    &mut browser,
-                    "log",
-                    json!({"records":[phone],"source":source})
-                )
-                .await
-                .is_err(),
+            let refused = dispatch_wire_fixture(
+                &node,
+                &mut browser,
+                "log",
+                json!({"records":[phone],"source":source}),
+            )
+            .await
+            .expect_err("only web and mobile");
+            assert_eq!(
+                concurrency::error_code(&refused),
+                Some(crate::logging::Refused::REJECTED),
                 "{source}"
             );
         }
@@ -3523,7 +3531,7 @@ mod tests {
         );
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "log", declared).await?,
-            json!({"accepted":0}),
+            json!({"accepted":0,"max_seq":1}),
             "a resent sequence number is skipped"
         );
         assert!(

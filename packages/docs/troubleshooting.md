@@ -63,11 +63,11 @@ Node 每分钟检查三件事。连续两轮都发现才算问题出现，只在
 
 输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
 
-新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮不能派发或控制工作。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
+新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮不能派发或控制工作，也不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息；Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
 
 其他设备的 Node 只能为主 Bot 写本人消息引出的设置改动，没有不冒充本人就能让主 Bot 开始一轮的路径，所以它们发现的问题只记 `health.not_owner`，不占上限名额。要处理这类问题，在那台设备上看 `vibeface health`，或连接它导出诊断包。
 
-`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
+`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次，且这条提醒最后一次变更仍是 Node 写的那次、仍是一次性提醒；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
 
 Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
 
@@ -79,7 +79,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 |---|---|
 | `ts_ms` | 毫秒时间戳 |
 | `level` | `trace`、`debug`、`info`、`warn` 或 `error` |
-| `source` | `node`、`web`（浏览器）、`agent`（协调 Agent）、`cli`（命令行）、`codex` 或 `desktop`（原生桌面 App） |
+| `source` | `node`、`web`（浏览器）、`mobile`（手机 App）、`desktop`（原生桌面 App）、`agent`（协调 Agent）、`cli`（命令行）或 `codex`。外来记录的来源由发送方自报，只能取它那条通道允许的值；`fields.device_id` 由 Node 按认证结果填写，发送方写的会被替换 |
 | `event` | 事件名，例如 `work.dispatched` |
 | `message` | 说明 |
 | `conversation_id`、`work_id`、`thread_id` | 知道时才有 |
@@ -99,13 +99,13 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 同一个日志还收这些来源的记录：
 
 - 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话。失败的请求（`web.rpc_failed`）的 `message` 是页面显示给人看的文案，`fields.code` 是 Node 返回的错误码，`fields.cause` 是 Node 或连接层的原始错误文本（最多 500 字符），没有或与文案相同时省略；
-- 手机 App 上报同样的记录（`mobile.uncaught`、`mobile.unhandled_rejection` 等），另记连接阶段的每次变化（`mobile.connection`，`fields` 有 `from`、`to`、连接方式 `path`、目标 `node`、访问地址和断开原因，不含凭证），来源是 `mobile`，`fields.device_id` 同样取认证这条通道的设备。手机先把记录写进本机存储，最多保留最新 300 条，App 重启或崩溃后仍在；每条带 `fields.client_seq`（递增编号）和 `fields.client_ts_ms`（手机上产生的时间），`ts_ms` 仍是 Node 收到的时间。连上 Node 后自动按批补发，Node 确认收下才从手机删去；结果未知（如超时）时保留，稍后重发，Node 跳过编号不大于该设备已写入最大编号的记录，所以不会重复。补发遵守下面的额度，被拒时等一分钟再续传。**设置**的**问题排查**里点**发送日志到节点**立即补发，显示已发送的条数；没连上时连上后自动发送。**报告问题**发出前也先补发，最多等 3 秒。Node 只在内存里记编号，重启时正在发送的那一批可能重复一次；
+- 手机 App 上报同样的记录（`mobile.uncaught`、`mobile.unhandled_rejection` 等），另记连接阶段的每次变化（`mobile.connection`，`fields` 有 `from`、`to`、连接方式 `path`、目标 `node`、访问地址和断开原因，不含凭证），来源是 `mobile`，`fields.device_id` 同样取认证这条通道的设备。手机先把记录写进本机存储，最多保留最新 300 条，App 重启或崩溃后仍在；每条带 `fields.client_seq`（递增编号）和 `fields.client_ts_ms`（手机上产生的时间），`ts_ms` 仍是 Node 收到的时间。连上 Node 后自动按批补发，Node 确认收下才从手机删去；结果未知（如超时），或 Node 因维护、权限等与这批记录无关的原因拒绝时保留，稍后重发，Node 跳过编号不大于该设备已写入最大编号的记录，所以不会重复。只有 Node 说记录本身无效（`log_rejected`）时这一批才丢弃。整批都被跳过而 Node 回的已写入最大编号 `max_seq` 不小于手机的下一个编号时，说明手机编号倒退了（如本机存储损坏后重来），手机把保留的记录从 `max_seq + 1` 起重新编号再发。补发遵守下面的额度，超出额度（`log_rate_limited`）时等一分钟再续传。新记录约半秒后写入本机存储，致命崩溃的记录立即写入。**设置**的**问题排查**里点**发送日志到节点**立即补发，显示已发送的条数；没连上时连上后自动发送。**报告问题**发出前也先补发，最多等 3 秒；补发的记录在手机当前连接的那台 Node 上，主 Bot 的 `read_logs` 只读它执行那一轮所在 Node 的日志，且要那一轮由管理设备上本人发的消息开启，所以手机连的不是那台 Node 时，主 Bot 读不到这些记录，要在那台 Node 上看。Node 只在内存里记编号，重启时正在发送的那一批可能重复一次；
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
 - `vibeface update check` 和 `update apply`（含自动更新）像 `vibeface log` 一样经运行中的 Node 记下检查和应用的结果，来源是 `cli`；连不上 Node 时这条结果只在更新器自己的输出里；
 - 原生桌面 App 连着本机 Node 时，把自己显示的错误（`desktop.error`）和崩溃（`desktop.panic`）经同一个本机通道写入，来源是 `desktop`；
 - Codex App Server 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
 
-每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝，Node 跳过的重发记录不计入。`log` 命令可带 `source`，只能是 `web`（默认）或 `mobile`。浏览器和手机按设备身份分别计数，本机 Agent、CLI 和桌面 App 各自共享额度。
+每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝，Node 跳过的重发记录不计入。`log` 命令可带 `source`，只能是 `web`（默认）或 `mobile`；`vibeface log --source` 只能是 `agent` 或 `cli`，桌面 App 经同一本机通道写 `desktop`。浏览器和手机按设备身份分别计数，本机 Agent、CLI 和桌面 App 各自共享额度。
 
 查看日志：
 
