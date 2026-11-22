@@ -159,6 +159,16 @@ class ReleaseTrains(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertEqual(result['runs'], [run['html_url']])
 
+        with (patch.object(hourly, 'release_runs', side_effect=[[], [run]]),
+              patch.object(hourly.time, 'sleep') as sleep):
+            self.assertEqual(hourly.release_run_after_tag('core', run['head_branch'], source), [run])
+        sleep.assert_called_once_with(5)
+
+        with (patch.object(hourly, 'release_runs', return_value=[]),
+              patch.object(hourly.time, 'sleep') as sleep):
+            self.assertEqual(hourly.release_run_after_tag('core', run['head_branch'], source), [])
+        self.assertEqual(sleep.call_count, 18)
+
         with (patch.object(release_source, 'hourly_version', return_value='0.0.1-hourly.' + batch),
               patch.object(hourly, 'tag_commit', side_effect=[None, source]),
               patch.object(hourly, 'pending_attempt', return_value=None),
