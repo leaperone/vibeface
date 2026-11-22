@@ -1585,6 +1585,11 @@ impl Runtime {
             })
             .map(|member| {
                 let state = states.get(&member.device_id);
+                let net = self.net.get();
+                let (path, rtt_ms) = net.map_or((None, None), |net| net.link(&member.device_id));
+                let counts = net
+                    .map(|net| net.link_counts(&member.device_id))
+                    .unwrap_or_default();
                 crate::maintenance::PeerHealth {
                     device_id: member.device_id.clone(),
                     name: member.name.clone(),
@@ -1592,10 +1597,10 @@ impl Runtime {
                         .filter(|state| state.failures > 0 || state.synced_ms.is_some())
                         .map(|state| state.failures == 0),
                     synced_ms: state.and_then(|state| state.synced_ms),
-                    path: self
-                        .net
-                        .get()
-                        .and_then(|net| net.path_kind(&member.device_id)),
+                    path,
+                    rtt_ms,
+                    path_changes: counts.path_changes,
+                    disconnects: counts.disconnects,
                 }
             })
             .collect()
@@ -1640,7 +1645,9 @@ impl Runtime {
             .collect();
         let settings = self.settings_snapshot();
         let peers: Vec<Value> = self.peer_health().await.into_iter().map(|peer| {
-            json!({"device_id":peer.device_id,"reachable":peer.reachable,"synced_ms":peer.synced_ms})
+            json!({"device_id":peer.device_id,"reachable":peer.reachable,"synced_ms":peer.synced_ms,
+                "path":peer.path,"rtt_ms":peer.rtt_ms,"path_changes":peer.path_changes,
+                "disconnects":peer.disconnects})
         }).collect();
         Ok(json!({
             "generated_at_ms":now_ms(), "version":env!("CARGO_PKG_VERSION"),
@@ -1652,6 +1659,7 @@ impl Runtime {
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
             "triage":self.triage_status().await?,
             "peers":peers,
+            "health":self.health_status().await,
             "range":{"since_ms":since_ms,"until_ms":until_ms},
             "logs":{"node.log":records,"service.stderr.log":stderr},
         }))

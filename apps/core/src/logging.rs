@@ -37,6 +37,12 @@ const STATE_EVENTS: &[&str] = &[
     "mesh.neighbor_down",
     "sync.write_state",
     "work.state",
+    "work.stalled",
+    "work.recovered",
+    "app_server.unresponsive",
+    "app_server.recovered",
+    "sync.stalled",
+    "sync.recovered",
 ];
 static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
@@ -94,7 +100,8 @@ pub enum Source {
     Agent,
     Cli,
     Codex,
-    Cursor,
+    /// The native desktop app, through `/api/log`.
+    Desktop,
 }
 
 impl std::str::FromStr for Level {
@@ -109,7 +116,7 @@ impl std::str::FromStr for Source {
     type Err = anyhow::Error;
     fn from_str(text: &str) -> Result<Self> {
         serde_json::from_value(Value::String(text.to_ascii_lowercase()))
-            .context("source is one of node, web, agent, cli, codex, cursor")
+            .context("source is one of node, web, agent, cli, codex, desktop")
     }
 }
 
@@ -562,6 +569,28 @@ pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
         .with(sink.map(|sink| Layer { sink }))
         .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
         .init();
+    if data_dir.is_some() {
+        record_panics();
+    }
+}
+
+/// Logs every panic as `node.panic` before the default report, so `node.log` names its place.
+fn record_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic without a message".into());
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        tracing::error!(event = "node.panic", location, "{message}");
+        previous(info);
+    }));
 }
 
 /// Turns `tracing` events into records. The ids and `source` come from the event's fields or
@@ -736,6 +765,7 @@ pub struct Filter {
     pub sources: Vec<Source>,
     pub conversation_id: Option<String>,
     pub work_id: Option<String>,
+    pub event: Option<String>,
     /// Case-insensitive, in the message, event, ids or fields.
     pub text: Option<String>,
     /// The newest this many; defaults to 1000, at most [`MAX_READ`].
@@ -755,6 +785,10 @@ impl Filter {
             && (self.sources.is_empty() || self.sources.contains(&record.source))
             && same(&self.conversation_id, &record.conversation_id)
             && same(&self.work_id, &record.work_id)
+            && self
+                .event
+                .as_ref()
+                .is_none_or(|event| *event == record.event)
             && self.text.as_deref().is_none_or(|text| {
                 let text = text.to_lowercase();
                 [
@@ -961,7 +995,6 @@ pub async fn forward_lines(
 pub fn child_line(source: Source, event: &str, line: &str, thread_id: Option<&str>) {
     let source = match source {
         Source::Codex => "codex",
-        Source::Cursor => "cursor",
         _ => "node",
     };
     let words = || line.split(|c: char| !c.is_ascii_alphabetic());

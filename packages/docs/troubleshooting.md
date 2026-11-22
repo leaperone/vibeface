@@ -39,11 +39,29 @@ Listen: 127.0.0.1:4790
 Data: /path/to/node-data
 Version: 0.0.1
 Writes: writable
-Peer: device-a (9c41…) reachable, synced 4s ago
-Peer: device-b (51be…) unreachable, synced 1830s ago
+Peer: device-a (9c41…) reachable, direct, RTT 18 ms, synced 4s ago
+Peer: device-b (51be…) unreachable, unknown path, RTT unknown, synced 1830s ago
 ```
 
-`Writes` 是这台 Node 能否写入，取值见下文“写入状态”。每台其他成员 Node 一行 `Peer`：`reachable` 表示最近一次同步连上了，`unreachable` 表示最近一次失败，`not tried yet` 表示启动后还没试过；`synced Ns ago` 是最近一次同步完成的时间，`never synced` 表示本次启动后没有成功过。`--json` 输出同样的内容，`write_state` 和 `peers` 是对应字段。
+`Writes` 是这台 Node 能否写入，取值见下文“写入状态”。每台其他成员 Node 一行 `Peer`：`reachable` 表示最近一次同步连上了，`unreachable` 表示最近一次失败，`not tried yet` 表示启动后还没试过；`direct` 是直连，`relay` 经中继，`unknown path` 表示当前没有本机拨出的连接；RTT 是所选路径的往返时间；`synced Ns ago` 是最近一次同步完成的时间，`never synced` 表示本次启动后没有成功过。`--json` 输出同样的内容，`write_state` 和 `peers` 是对应字段，每个对端带 `path` 和 `rtt_ms`。
+
+## 看健康检查
+
+```sh
+vibeface health
+```
+
+Node 每分钟检查三件事，只在问题出现和消失时各记一条日志：
+
+| 检查 | 出现 | 消失 | 条件 |
+|---|---|---|---|
+| `work_stalled` | `work.stalled`（warn） | `work.recovered` | 运行中的工作超过 10 分钟没有任何进展事件，带 `work_id`、`conversation_id` |
+| `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 连续 2 次 10 秒内没有回应只读探测；不重启、不重发 |
+| `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 对端可连通但最近一次同步完成已超过 10 分钟，带 `peer` |
+
+输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
+
+新问题出现时，Node 给主 Bot 设一个一分钟后到期的提醒，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。同一问题每小时最多一次，全部问题每小时最多 6 次；没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
 
 Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
 
@@ -55,7 +73,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 |---|---|
 | `ts_ms` | 毫秒时间戳 |
 | `level` | `trace`、`debug`、`info`、`warn` 或 `error` |
-| `source` | `node`、`web`（浏览器）、`agent`（协调 Agent）、`cli`（命令行）、`codex` 或 `cursor` |
+| `source` | `node`、`web`（浏览器）、`agent`（协调 Agent）、`cli`（命令行）、`codex` 或 `desktop`（原生桌面 App） |
 | `event` | 事件名，例如 `work.dispatched` |
 | `message` | 说明 |
 | `conversation_id`、`work_id`、`thread_id` | 知道时才有 |
@@ -63,7 +81,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 默认级别是 Vibeface 的 info 和依赖库的 warn；启动 Node 和 `update` 之外的命令不显示依赖库日志。iroh 的连接处理（`iroh::protocol`）和 gossip 网络层（`iroh_gossip::net`，含拨号、发送队列满和解码失败，`iroh_gossip::net::util` 除外）只记 error：陌生设备握手失败、对端不在线都属常态，对端和邻居的上下线看 `peer.*` 与 `mesh.*`，Vibeface 自己处理连入连接时出的错记为 `net.accept_failed`。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`；要看回这两类握手告警，用 `RUST_LOG=warn,vibeface=info,vibeface_bridge=info`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
 
-重复的记录会合并。来源、级别、事件、说明、三个 ID 和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；只在状态变化时记的 `peer.online`、`peer.offline`、`mesh.neighbor_up`、`mesh.neighbor_down`、`sync.write_state` 和 `work.state` 不合并，每次变化都立即写入。窗口结束时补一条同样的记录，`fields` 多出三项：
+重复的记录会合并。来源、级别、事件、说明、三个 ID 和 `fields` 都相同的记录，60 秒内再次出现时不再逐条写入；只在状态变化时记的 `peer.online`、`peer.offline`、`mesh.neighbor_up`、`mesh.neighbor_down`、`sync.write_state`、`work.state` 和健康检查的 `*.stalled`、`*.unresponsive`、`*.recovered` 不合并，每次变化都立即写入。窗口结束时补一条同样的记录，`fields` 多出三项：
 
 | 字段 | 含义 |
 |---|---|
@@ -77,9 +95,10 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 - 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话。失败的请求（`web.rpc_failed`）的 `message` 是页面显示给人看的文案，`fields.code` 是 Node 返回的错误码，`fields.cause` 是 Node 或连接层的原始错误文本（最多 500 字符），没有或与文案相同时省略；
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
 - `vibeface update check` 和 `update apply`（含自动更新）像 `vibeface log` 一样经运行中的 Node 记下检查和应用的结果，来源是 `cli`；连不上 Node 时这条结果只在更新器自己的输出里；
+- 原生桌面 App 连着本机 Node 时，把自己显示的错误（`desktop.error`）和崩溃（`desktop.panic`）经同一个本机通道写入，来源是 `desktop`；
 - Codex App Server 的标准错误逐行记录，能看出 thread 时带上 `thread_id`。Cursor ACP 不记录原始标准错误，只返回受控的失败类别。
 
-每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝。浏览器按设备身份分别计数，本机 Agent 和 CLI 各自共享额度。
+每条外来记录不超过 8 KiB，一次最多 20 条，每个发送方每分钟最多 120 条，超出整批拒绝。浏览器按设备身份分别计数，本机 Agent、CLI 和桌面 App 各自共享额度。
 
 查看日志：
 
@@ -93,6 +112,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | 日志 | 含义 |
 |---|---|
 | `node.started` | Node 启动完成，带 `version`、`data_epoch`、`os`、`arch` 和是否开启网页 |
+| `node.panic` | Node 进程崩溃，`message` 是原因，`location` 是源码位置；之后照常输出原有崩溃报告 |
 | `node.start_failed` | Node 打开数据或启动服务时失败，`error` 是原因 |
 | `node.stopping`、`node.stopped` | Node 开始停止和停止完成。`reason` 是 `stop_requested`（收到停止信号）、`parent_closed`（桌面 App 退出）、`rejoin`、`api` 或 `maintenance`，出错停止时为 error 级并带 `error`。有 `node.started` 却没有 `node.stopped`，说明进程被强制结束或崩溃 |
 | `input.accepted`、`input.rejected` | 收下或拒收一条发来的消息，带 `conversation_id`、`message_id`；收下时 `state` 是排队结果，拒收时 `code` 和 `error` 是原因 |
@@ -119,6 +139,8 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `agent.tool`、`agent.tool_failed` | 协调 Agent 调用的工具 |
 | `codex.call`、`codex.call_failed` | Agent 经命令行向 Codex App Server 发的请求 |
 | `codex.app_server.stderr` | Codex App Server 的标准错误 |
+| `work.stalled`、`app_server.unresponsive`、`sync.stalled` 及对应 `*.recovered` | 健康检查发现和解除的问题，见上文“看健康检查” |
+| `health.handed`、`health.handoff_limited`、`health.no_primary_bot`、`health.handoff_failed` | 新问题已交给主 Bot、被每小时上限挡下、没有主 Bot，或提醒没写成 |
 
 写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、relay 令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
@@ -128,7 +150,8 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 - 版本、操作系统、CPU 架构和设备编号；
 - 本机配置摘要，包括项目目录数量、已启用的 Agent 和会话扫描状态，不导出配置文件全文；
-- 写入状态、冲突数量和每台对端的连通情况；
+- 写入状态、冲突数量和每台对端的连通情况：`reachable`、`synced_ms`、`path`（`direct` 或 `relay`）、`rtt_ms`，以及本次启动以来的 `path_changes`（直连和中继间切换次数）、`disconnects`（非本机关闭的断线次数）；
+- `health`：与 `vibeface health --json` 相同的健康检查结果；
 - 分诊预算的已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数；
 - 时间范围内的 `node.log` 记录（最多 20000 条，已脱敏）和 `service.stderr.log` 最后 50 行。
 

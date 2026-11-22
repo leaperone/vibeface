@@ -6,6 +6,7 @@ extern crate gpui_kit as gpui;
 mod app;
 mod application;
 pub mod host;
+mod node_log;
 mod theme;
 pub mod ui;
 mod update;

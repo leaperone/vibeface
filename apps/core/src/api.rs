@@ -1196,13 +1196,14 @@ async fn triage(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<J
     ))
 }
 
-/// Records from `vibeface log` on this device: the coordination Agent or a script.
+/// Records from this device: `vibeface log` for the coordination Agent or a script, and the
+/// desktop app's own errors.
 async fn log(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json<Value>> {
     use crate::logging::Source;
     let source: Source = serde_json::from_value(input["source"].clone())
         .ok()
-        .filter(|source| matches!(source, Source::Agent | Source::Cli))
-        .ok_or_else(|| ApiError::bad("source must be agent or cli"))?;
+        .filter(|source| matches!(source, Source::Agent | Source::Cli | Source::Desktop))
+        .ok_or_else(|| ApiError::bad("source must be agent, cli or desktop"))?;
     let accepted = crate::logging::submit(
         &app.node.log_intake,
         &format!("local-{source:?}"),
