@@ -126,11 +126,15 @@ const BUFFERED = 300
 /** The device's budget for each sender. */
 const PER_MINUTE = 120
 const RETRY_MS = 15_000
+/** Writes to storage wait this long so a burst is saved once; a fatal error is saved at once. */
+const SAVE_MS = 500
 
 /**
  * The phone's reporter: records survive restarts and crashes in `storage`, the newest 300 kept, each numbered with
- * `client_seq` and stamped with `client_ts_ms`. A batch leaves the buffer only once the device answers. A send whose
- * result is unknown stays, and the device skips numbers it already wrote, so sending it again is harmless.
+ * `client_seq` and stamped with `client_ts_ms`. A batch leaves the buffer once the device accepts it or refuses it as
+ * invalid (`log_rejected`); any other answer or an unknown result keeps it, and the device skips numbers it already
+ * wrote, so sending it again is harmless. When the device skips a whole batch and names a `max_seq` at or above the
+ * next number here, the numbering went back: the kept records get new numbers above it and go again.
  */
 export function createBufferedReporter(storage: KeyValue, { now = Date.now, later = (run: () => void, ms: number) => { setTimeout(run, ms) } } = {}): Reporter {
   const read = (): Buffer => {
@@ -146,6 +150,12 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
   }
   const buffer = read()
   const save = () => { try { storage.setItem(BUFFER_KEY, JSON.stringify(buffer)) } catch { /* memory still holds them */ } }
+  let saving = false
+  const saveSoon = () => {
+    if (saving) return
+    saving = true
+    later(() => { saving = false; save() }, SAVE_MS)
+  }
   const spent: { at: number; count: number }[] = []
   let sink: Sink | null = null
   let sending: Promise<SendResult> | null = null
@@ -165,7 +175,13 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
   const ack = (seq: number) => {
     buffer.acked = Math.max(buffer.acked, seq)
     buffer.records = buffer.records.filter(item => item.fields.client_seq > buffer.acked)
-    save()
+    saveSoon()
+  }
+  /** Numbers every kept record again, from just above what the device has written. */
+  const renumber = (written: number) => {
+    buffer.next = written + 1
+    buffer.records = buffer.records.map(item => ({ ...item, fields: { ...item.fields, client_seq: buffer.next++ } }))
+    saveSoon()
   }
   async function drain(): Promise<SendResult> {
     let sent = 0
@@ -177,14 +193,19 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
       const last = batch[batch.length - 1]!.fields.client_seq
       spent.push({ at: now(), count: batch.length })
       try {
-        await sink(batch, "mobile")
-        ack(last)
-        sent += batch.length
+        const written = (await sink(batch, "mobile") as { max_seq?: unknown } | null)?.max_seq
+        if (Number.isSafeInteger(written) && (written as number) >= buffer.next) renumber(written as number)
+        else {
+          // A wholly skipped batch was written before, as was everything up to `max_seq`.
+          ack(Number.isSafeInteger(written) ? Math.max(last, written as number) : last)
+          sent += batch.length
+        }
       } catch (cause) {
-        const answered = (cause as { responded?: unknown } | null)?.responded === true
-        if (answered && String((cause as Error).message).includes("too many log records")) limitedUntil = now() + 60_000
+        const { responded, code } = (cause ?? {}) as { responded?: unknown; code?: unknown }
+        if (responded === true && code === "log_rate_limited") limitedUntil = now() + 60_000
         // The device refused the batch itself; sending it again cannot change that.
-        else if (answered) ack(last)
+        else if (responded === true && code === "log_rejected") ack(last)
+        // Maintenance, a lost permission or any other answer may pass; the batch waits like an unknown result.
         else retryAt = now() + RETRY_MS
       }
     }
@@ -205,7 +226,9 @@ export function createBufferedReporter(storage: KeyValue, { now = Date.now, late
       buffer.next++
       buffer.records.push(kept)
       if (buffer.records.length > BUFFERED) buffer.records.splice(0, buffer.records.length - BUFFERED)
-      save()
+      // A fatal error may end the app before a later save runs.
+      if (kept.fields.fatal === true) save()
+      else saveSoon()
       schedule()
     },
     connect(next: Sink) {
