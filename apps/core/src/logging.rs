@@ -575,9 +575,17 @@ pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
 }
 
 /// Logs every panic as `node.panic` before the default report, so `node.log` names its place.
+/// A panic while logging one skips the log and goes straight to the default report.
 fn record_panics() {
+    thread_local! {
+        static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if RECORDING.replace(true) {
+            previous(info);
+            return;
+        }
         let payload = info.payload();
         let message = payload
             .downcast_ref::<&str>()
@@ -589,6 +597,7 @@ fn record_panics() {
             .map(|at| format!("{}:{}", at.file(), at.line()))
             .unwrap_or_default();
         tracing::error!(event = "node.panic", location, "{message}");
+        RECORDING.set(false);
         previous(info);
     }));
 }

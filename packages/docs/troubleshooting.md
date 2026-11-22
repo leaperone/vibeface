@@ -51,17 +51,23 @@ Peer: device-b (51be…) unreachable, unknown path, RTT unknown, synced 1830s ag
 vibeface health
 ```
 
-Node 每分钟检查三件事，只在问题出现和消失时各记一条日志：
+Node 每分钟检查三件事。连续两轮都发现才算问题出现，只在问题出现和消失时各记一条日志：
 
 | 检查 | 出现 | 消失 | 条件 |
 |---|---|---|---|
 | `work_stalled` | `work.stalled`（warn） | `work.recovered` | 运行中的工作超过 10 分钟没有任何进展事件，带 `work_id`、`conversation_id` |
-| `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 连续 2 次 10 秒内没有回应只读探测；不重启、不重发 |
+| `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 在 10 秒内没有回应只读探测；不重启、不重发。App Server 未连接时这一轮不检查，保持上一轮的结论 |
 | `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 对端可连通但最近一次同步完成已超过 10 分钟，带 `peer` |
+
+两轮之间隔了 3 分钟以上（例如电脑睡眠后醒来）时，这一轮不下结论：工作进展和同步的计时都从此刻重新开始，上一轮的发现不再算数。
 
 输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
 
-新问题出现时，Node 给主 Bot 设一个一分钟后到期的提醒，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。同一问题每小时最多一次，全部问题每小时最多 6 次；没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
+新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮不能派发或控制工作。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
+
+其他设备的 Node 只能为主 Bot 写本人消息引出的设置改动，没有不冒充本人就能让主 Bot 开始一轮的路径，所以它们发现的问题只记 `health.not_owner`，不占上限名额。要处理这类问题，在那台设备上看 `vibeface health`，或连接它导出诊断包。
+
+`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
 
 Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
 
@@ -112,7 +118,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | 日志 | 含义 |
 |---|---|
 | `node.started` | Node 启动完成，带 `version`、`data_epoch`、`os`、`arch` 和是否开启网页 |
-| `node.panic` | Node 进程崩溃，`message` 是原因，`location` 是源码位置；之后照常输出原有崩溃报告 |
+| `node.panic` | Node 进程里任何一次 panic，`message` 是原因，`location` 是源码位置；之后照常输出原有崩溃报告。被 tokio 接住的后台任务 panic 也记，这时进程不一定退出 |
 | `node.start_failed` | Node 打开数据或启动服务时失败，`error` 是原因 |
 | `node.stopping`、`node.stopped` | Node 开始停止和停止完成。`reason` 是 `stop_requested`（收到停止信号）、`parent_closed`（桌面 App 退出）、`rejoin`、`api` 或 `maintenance`，出错停止时为 error 级并带 `error`。有 `node.started` 却没有 `node.stopped`，说明进程被强制结束或崩溃 |
 | `input.accepted`、`input.rejected` | 收下或拒收一条发来的消息，带 `conversation_id`、`message_id`；收下时 `state` 是排队结果，拒收时 `code` 和 `error` 是原因 |
@@ -140,7 +146,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `codex.call`、`codex.call_failed` | Agent 经命令行向 Codex App Server 发的请求 |
 | `codex.app_server.stderr` | Codex App Server 的标准错误 |
 | `work.stalled`、`app_server.unresponsive`、`sync.stalled` 及对应 `*.recovered` | 健康检查发现和解除的问题，见上文“看健康检查” |
-| `health.handed`、`health.handoff_limited`、`health.no_primary_bot`、`health.handoff_failed` | 新问题已交给主 Bot、被每小时上限挡下、没有主 Bot，或提醒没写成 |
+| `health.handed`、`health.handoff_limited`、`health.no_primary_bot`、`health.not_owner`、`health.handoff_failed` | 新问题已交给主 Bot、被每小时或每天的上限挡下、没有主 Bot、主 Bot 由其他 Node 调度（带 `owner`），或提醒没写成 |
 
 写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、relay 令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
@@ -150,7 +156,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 - 版本、操作系统、CPU 架构和设备编号；
 - 本机配置摘要，包括项目目录数量、已启用的 Agent 和会话扫描状态，不导出配置文件全文；
-- 写入状态、冲突数量和每台对端的连通情况：`reachable`、`synced_ms`、`path`（`direct` 或 `relay`）、`rtt_ms`，以及本次启动以来的 `path_changes`（直连和中继间切换次数）、`disconnects`（非本机关闭的断线次数）；
+- 写入状态、冲突数量和每台对端的连通情况：`reachable`、`synced_ms`、`path`（`direct` 或 `relay`）、`rtt_ms`，以及本次启动以来的 `path_changes` 和 `disconnects`。这两项只统计本机拨给该对端的同步（SYNC）连接，一次断网只计一次：`path_changes` 是这些连接所选路径在直连和中继之间切换的次数；`disconnects` 是这些连接因对端关闭、空闲超时或网络中断而结束的次数，本机主动关闭或丢弃的不计，对端拨进来的连接也不计；
 - `health`：与 `vibeface health --json` 相同的健康检查结果；
 - 分诊预算的已用额度、上限、下次尝试时间，以及待审阅、处理中和结果未知的事件数；
 - 时间范围内的 `node.log` 记录（最多 20000 条，已脱敏）和 `service.stderr.log` 最后 50 行。

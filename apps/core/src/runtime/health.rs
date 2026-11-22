@@ -1,22 +1,27 @@
 //! Health checks a Node runs on itself every minute: a running work with no progress, an App
-//! Server that stops answering, a reachable peer whose sync stalls. A problem is logged when it
-//! begins and when it ends, never in between, and a new one goes to the primary bot once.
-//! Nothing here restarts a process or sends a write again.
+//! Server that stops answering, a reachable peer whose sync stalls. A problem begins once two
+//! rounds in a row find it; it is logged when it begins and when it ends, never in between, and
+//! a new one goes to the primary bot once when this Node schedules that bot. Nothing here
+//! restarts a process or sends a write again.
 use super::*;
 use crate::logging::{Filter, Level, Source};
+use crate::store::bot_settings::PrimaryReminder;
 use crate::work::WorkState;
 
 const INTERVAL: Duration = Duration::from_secs(60);
+/// A longer gap between rounds means the computer slept: that round only resets the baseline.
+const ASLEEP_MS: i64 = 3 * INTERVAL.as_millis() as i64;
 /// ponytail: one fixed limit; per-provider limits if long silent turns trip it.
 const WORK_STALL_MS: i64 = 10 * 60_000;
 /// Ten hello rounds (`peers::HELLO_INTERVAL`) without a finished sync.
 const SYNC_STALL_MS: i64 = 10 * 60_000;
 /// ponytail: at most 10 s per probe, so one round stays under its minute.
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-const APP_SERVER_MISSES: u32 = 2;
 const HOUR_MS: i64 = 3_600_000;
-/// New problems handed to the primary bot in any hour; each key at most once an hour.
+const DAY_MS: i64 = 24 * HOUR_MS;
+/// New problems handed to the primary bot in any hour and any day; each key at most once an hour.
 const HANDOFFS_PER_HOUR: usize = 6;
+const HANDOFFS_PER_DAY: usize = 24;
 pub(crate) const MAX_LOG_READ: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
@@ -88,25 +93,29 @@ impl Problem {
 }
 
 pub(crate) struct HealthState {
-    started_ms: i64,
+    /// When this Node started or last woke from sleep; nothing stalls from before it.
+    baseline_ms: i64,
     checked_ms: Option<i64>,
     problems: BTreeMap<ProblemKey, Problem>,
+    /// Found in the last round only; a second round in a row opens them.
+    pending: BTreeSet<ProblemKey>,
     /// The last progress event of each running work.
     progress: HashMap<String, i64>,
-    /// Probes the App Server missed in a row, and when the first of them was.
-    app_server_misses: (u32, i64),
-    /// Problems handed to the primary bot within the last hour.
+    /// When the App Server's current run of missed probes began.
+    app_server_missed: Option<i64>,
+    /// Problems handed to the primary bot within the last day.
     handed: Vec<(ProblemKey, i64)>,
 }
 
 impl HealthState {
     pub(crate) fn new(started_ms: i64) -> Self {
         Self {
-            started_ms,
+            baseline_ms: started_ms,
             checked_ms: None,
             problems: BTreeMap::new(),
+            pending: BTreeSet::new(),
             progress: HashMap::new(),
-            app_server_misses: (0, 0),
+            app_server_missed: None,
             handed: Vec::new(),
         }
     }
@@ -115,8 +124,22 @@ impl HealthState {
         self.progress.insert(work_id.to_owned(), at_ms);
     }
 
+    /// After a gap of over `ASLEEP_MS` since the last round, as when the computer slept, moves
+    /// the baseline to `now` and forgets what the last round found; that round judges nothing.
+    fn woke(&mut self, now: i64) -> bool {
+        let asleep = self.checked_ms.is_some_and(|last| now - last > ASLEEP_MS);
+        if asleep {
+            self.checked_ms = Some(now);
+            self.baseline_ms = now;
+            self.pending.clear();
+            self.app_server_missed = None;
+        }
+        asleep
+    }
+
     /// Takes what the checks in `ran` found now; those that did not run keep their problems.
-    /// Returns the problems that began and those that ended. An open problem keeps its start.
+    /// A problem begins when two rounds in a row find it. Returns the problems that began and
+    /// those that ended. An open problem keeps its start.
     fn update(
         &mut self,
         ran: &[Check],
@@ -126,6 +149,13 @@ impl HealthState {
         self.checked_ms = Some(now);
         let mut began = Vec::new();
         let mut open = BTreeMap::new();
+        let last_round = std::mem::take(&mut self.pending);
+        // What a check that did not run found waits for its next round.
+        let mut pending: BTreeSet<_> = last_round
+            .iter()
+            .filter(|key| !ran.contains(&key.check))
+            .cloned()
+            .collect();
         for problem in found {
             let key = problem.key();
             let problem = match self.problems.remove(&key) {
@@ -133,13 +163,18 @@ impl HealthState {
                     since_ms: known.since_ms,
                     ..problem
                 },
-                None => {
+                None if last_round.contains(&key) => {
                     began.push(problem.clone());
                     problem
+                }
+                None => {
+                    pending.insert(key);
+                    continue;
                 }
             };
             open.insert(key, problem);
         }
+        self.pending = pending;
         let (ended, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.problems)
             .into_iter()
             .partition(|(key, _)| ran.contains(&key.check));
@@ -151,29 +186,28 @@ impl HealthState {
         )
     }
 
-    /// Whether a new problem may go to the primary bot now, and counts it if so.
+    /// Whether a new problem may go to the primary bot now: each key once an hour, at most
+    /// `HANDOFFS_PER_HOUR` an hour and `HANDOFFS_PER_DAY` a day.
     fn may_hand(&mut self, key: &ProblemKey, now: i64) -> bool {
-        self.handed.retain(|(_, at)| now - at < HOUR_MS);
-        if self.handed.len() >= HANDOFFS_PER_HOUR || self.handed.iter().any(|(k, _)| k == key) {
-            return false;
-        }
-        self.handed.push((key.clone(), now));
-        true
+        self.handed.retain(|(_, at)| now - at < DAY_MS);
+        let hour = || self.handed.iter().filter(|(_, at)| now - at < HOUR_MS);
+        self.handed.len() < HANDOFFS_PER_DAY
+            && hour().count() < HANDOFFS_PER_HOUR
+            && !hour().any(|(k, _)| k == key)
     }
 
-    /// Records one App Server probe, `None` when it is not connected; returns when it began
-    /// missing once it missed `APP_SERVER_MISSES` in a row.
-    fn app_server_probe(&mut self, answered: Option<bool>, now: i64) -> Option<i64> {
-        let (misses, since) = &mut self.app_server_misses;
-        if answered != Some(false) {
-            *misses = 0;
+    /// Counts a problem the primary bot got.
+    fn handed(&mut self, key: &ProblemKey, now: i64) {
+        self.handed.push((key.clone(), now));
+    }
+
+    /// Records one answered (`true`) or missed probe; returns when the run of misses began.
+    fn app_server_probe(&mut self, answered: bool, now: i64) -> Option<i64> {
+        if answered {
+            self.app_server_missed = None;
             return None;
         }
-        if *misses == 0 {
-            *since = now;
-        }
-        *misses += 1;
-        (*misses >= APP_SERVER_MISSES).then_some(*since)
+        Some(*self.app_server_missed.get_or_insert(now))
     }
 }
 
@@ -199,7 +233,7 @@ fn stalled_works(
                 .copied()
                 .unwrap_or(0)
                 .max(record.progress_at_ms)
-                .max(state.started_ms);
+                .max(state.baseline_ms);
             (now - last > WORK_STALL_MS).then(|| Problem {
                 check: Check::WorkStalled,
                 detail: format!(
@@ -215,18 +249,26 @@ fn stalled_works(
         .collect()
 }
 
-fn stalled_peers(peers: &[crate::maintenance::PeerHealth], now: i64) -> Vec<Problem> {
+/// Peers that answer but finished no sync for `SYNC_STALL_MS`, counted from `baseline_ms` at
+/// the earliest.
+fn stalled_peers(
+    peers: &[crate::maintenance::PeerHealth],
+    baseline_ms: i64,
+    now: i64,
+) -> Vec<Problem> {
     peers
         .iter()
         .filter_map(|peer| {
             let synced = peer.synced_ms?;
-            (peer.reachable == Some(true) && now - synced > SYNC_STALL_MS).then(|| Problem {
-                check: Check::SyncStalled,
-                subject: peer.device_id.clone(),
-                since_ms: synced,
-                detail: format!("{} answers, but no sync has finished since", peer.name),
-                conversation_id: None,
-            })
+            (peer.reachable == Some(true) && now - synced.max(baseline_ms) > SYNC_STALL_MS).then(
+                || Problem {
+                    check: Check::SyncStalled,
+                    subject: peer.device_id.clone(),
+                    since_ms: synced,
+                    detail: format!("{} answers, but no sync has finished since", peer.name),
+                    conversation_id: None,
+                },
+            )
         })
         .collect()
 }
@@ -271,7 +313,7 @@ fn handoff_note(problem: &Problem, device: &str) -> String {
         .map(|id| format!("，会话 {id}"))
         .unwrap_or_default();
     format!(
-        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
+        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。这两个工具只读取执行这一轮的设备自己的日志和健康状态，这一轮不在设备 {device} 上执行时不可用。这一轮不能派发或控制工作；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
         problem.check.title(),
         problem.check.began(),
         problem.subject,
@@ -280,14 +322,28 @@ fn handoff_note(problem: &Problem, device: &str) -> String {
     )
 }
 
-/// The same problem in the same hour gets the same key, so a retried write finds the first.
-fn handoff_key(problem: &Problem, now: i64) -> String {
+/// The same problem on the same device in the same hour gets the same key, so a retried write
+/// finds the first.
+fn handoff_key(problem: &Problem, device: &str, now: i64) -> String {
     let subject = crate::crypto::digest(
-        serde_json::to_string(&(problem.check, &problem.subject))
+        serde_json::to_string(&(problem.check, &problem.subject, device))
             .expect("strings")
             .as_bytes(),
     );
     format!("health-{}-{}", &subject[..16], now / HOUR_MS)
+}
+
+/// Whether a health reminder started the turn of `trigger`; such a turn dispatches no work.
+pub(crate) fn health_turn(trigger: &str) -> bool {
+    matches!(crate::scheduling::Trigger::decode(trigger),
+        Ok(crate::scheduling::Trigger::Schedule { id, .. })
+            if id.starts_with(crate::store::bot_settings::HEALTH_SCHEDULE_PREFIX))
+}
+
+/// The tools a health reminder's turn is offered: no work tool but the provider-config card,
+/// which changes nothing until the user allows it.
+pub(crate) fn health_turn_tool(tool: crate::tools::Tool) -> bool {
+    tool.effect() != crate::tools::Effect::Work || tool == crate::tools::Tool::ProposeProviderConfig
 }
 
 /// Warnings and errors since `since_ms` by event, repeats included.
@@ -374,7 +430,11 @@ impl Runtime {
 
     async fn check_health(self: &Arc<Self>) {
         let now = now_ms();
-        let mut ran = vec![Check::AppServerUnresponsive, Check::SyncStalled];
+        if self.health.lock().expect("health").woke(now) {
+            tracing::debug!("the health checks start over after a gap, as after sleep");
+            return;
+        }
+        let mut ran = vec![Check::SyncStalled];
         let mut found = Vec::new();
         match self
             .store
@@ -391,25 +451,29 @@ impl Runtime {
             }
             Err(error) => tracing::debug!(%error, "the work check waits for the next round"),
         }
-        let answered = self.probe_app_server().await;
-        if let Some(since_ms) = self
-            .health
-            .lock()
-            .expect("health")
-            .app_server_probe(answered, now)
-        {
-            found.push(Problem {
-                check: Check::AppServerUnresponsive,
-                subject: "codex".into(),
-                since_ms,
-                detail: format!(
-                    "{APP_SERVER_MISSES} probes in a row got no answer within {} s",
-                    APP_SERVER_TIMEOUT.as_secs()
-                ),
-                conversation_id: None,
-            });
+        // Not connected is no probe: the check keeps what it had.
+        if let Some(answered) = self.probe_app_server().await {
+            ran.push(Check::AppServerUnresponsive);
+            if let Some(since_ms) = self
+                .health
+                .lock()
+                .expect("health")
+                .app_server_probe(answered, now)
+            {
+                found.push(Problem {
+                    check: Check::AppServerUnresponsive,
+                    subject: "codex".into(),
+                    since_ms,
+                    detail: format!(
+                        "probes since then got no answer within {} s",
+                        APP_SERVER_TIMEOUT.as_secs()
+                    ),
+                    conversation_id: None,
+                });
+            }
         }
-        found.extend(stalled_peers(&self.peer_health().await, now));
+        let baseline = self.health.lock().expect("health").baseline_ms;
+        found.extend(stalled_peers(&self.peer_health().await, baseline, now));
         let (began, ended) = self.health.lock().expect("health").update(&ran, found, now);
         for problem in &ended {
             record(problem, false);
@@ -423,23 +487,25 @@ impl Runtime {
         }
     }
 
-    /// One read the App Server answers at once; `None` while it is not connected. An error
-    /// it returns is an answer.
+    /// One read the App Server answers at once; `None` while it is not connected, or when the
+    /// connection dropped the read before an answer. An error it returns is an answer.
     async fn probe_app_server(&self) -> Option<bool> {
         let client = self.codex.client();
         if client.status().await["connection"]["state"] != "connected" {
             return None;
         }
         let read = client.request("account/read", json!({"refreshToken":false}));
-        Some(match tokio::time::timeout(APP_SERVER_TIMEOUT, read).await {
-            Ok(Ok(_)) => true,
-            Ok(Err(error)) => error.answered,
-            Err(_) => false,
-        })
+        match tokio::time::timeout(APP_SERVER_TIMEOUT, read).await {
+            Ok(Ok(_)) => Some(true),
+            Ok(Err(error)) => error.answered.then_some(true),
+            Err(_) => Some(false),
+        }
     }
 
-    /// Sets the primary bot a one-time reminder about a new problem, within the hourly limits.
-    /// Without a running bot or a primary bot only the log has it.
+    /// Sets the primary bot a one-time reminder about a new problem, within the hourly and
+    /// daily limits. Only the Node that schedules the primary bot may; no Node path lets another
+    /// one start that bot's turn without the user's own message, so there only the log has it,
+    /// as it does without a running bot or a primary bot.
     async fn hand_to_primary_bot(&self, problem: &Problem, now: i64) -> Result<()> {
         if self.manager().is_none() || !self.writable() {
             return Ok(());
@@ -454,11 +520,14 @@ impl Runtime {
             .may_hand(&problem.key(), now)
         {
             tracing::info!(event = "health.handoff_limited", check = ?problem.check,
-                subject = problem.subject, "the hourly limit holds this problem back from the primary bot");
+                subject = problem.subject, "the hourly or daily limit holds this problem back from the primary bot");
             return Ok(());
         }
         let device = self.identity.device_id()?;
-        let (key, note) = (handoff_key(problem, now), handoff_note(problem, &device));
+        let (key, note) = (
+            handoff_key(problem, &device, now),
+            handoff_note(problem, &device),
+        );
         let identity = self.identity.clone();
         let reminded = {
             let network = network.clone();
@@ -468,21 +537,55 @@ impl Runtime {
                 })
                 .await?
         };
-        let Some((change, written)) = reminded else {
-            tracing::info!(event = "health.no_primary_bot", check = ?problem.check,
-                "no primary bot to hand the problem to");
-            return Ok(());
-        };
-        if written {
-            self.publish_changed(
-                &network,
-                &change.conversation_id,
-                Changed::Event(&change.event_hash),
-            );
+        match reminded {
+            PrimaryReminder::NoPrimaryBot => {
+                tracing::info!(event = "health.no_primary_bot", check = ?problem.check,
+                    "no primary bot to hand the problem to");
+            }
+            PrimaryReminder::NotOwner {
+                conversation_id,
+                owner,
+            } => {
+                tracing::info!(event = "health.not_owner", conversation_id, owner,
+                    check = ?problem.check, subject = problem.subject,
+                    "another Node schedules the primary bot, so only this log has the problem");
+            }
+            PrimaryReminder::Existing(change) => {
+                tracing::debug!(conversation_id = change.conversation_id, check = ?problem.check,
+                    "the primary bot already has this problem");
+            }
+            PrimaryReminder::Written(change) => {
+                self.health
+                    .lock()
+                    .expect("health")
+                    .handed(&problem.key(), now);
+                self.publish_changed(
+                    &network,
+                    &change.conversation_id,
+                    Changed::Event(&change.event_hash),
+                );
+                tracing::info!(event = "health.handed", conversation_id = change.conversation_id,
+                    check = ?problem.check, subject = problem.subject, "a new problem went to the primary bot");
+            }
         }
-        tracing::info!(event = "health.handed", conversation_id = change.conversation_id,
-            check = ?problem.check, subject = problem.subject, "a new problem went to the primary bot");
         Ok(())
+    }
+
+    /// Whether this agent turn may call `read_logs` or `read_health`; see
+    /// `Store::diagnostics_turn`.
+    pub(super) async fn diagnostics_turn(
+        &self,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+    ) -> Result<bool> {
+        let (network, scope, trigger) = (network.to_owned(), scope.to_owned(), trigger.to_owned());
+        let local = self.identity.device_id()?;
+        self.store
+            .read("health.diagnostics_turn", move |store| {
+                store.diagnostics_turn(&network, &local, &scope, &trigger)
+            })
+            .await
     }
 
     /// Open problems, when the checks last ran, and the last hour's warnings and errors by event.
@@ -502,12 +605,21 @@ impl Runtime {
         json!({"checked_at_ms":checked,"problems":problems,"last_hour":counts})
     }
 
-    /// `read_health`: the health checks, each peer's link and the triage summary.
+    /// `read_health`: the health checks, each peer's sync state and the triage summary. As the
+    /// `nodes` tool gives an agent no connection observation, the path, round-trip time and
+    /// link counts stay out.
     pub(super) async fn read_health(&self) -> Result<Value> {
-        Ok(
-            json!({"health":self.health_status().await,"peers":self.peer_health().await,
-            "triage":self.triage_status().await?}),
-        )
+        let peers: Vec<Value> = self
+            .peer_health()
+            .await
+            .into_iter()
+            .map(|peer| {
+                json!({"device_id":peer.device_id,"name":peer.name,"reachable":peer.reachable,
+                    "synced_ms":peer.synced_ms})
+            })
+            .collect();
+        Ok(json!({"health":self.health_status().await,"peers":peers,
+            "triage":self.triage_status().await?}))
     }
 }
 
@@ -525,56 +637,149 @@ mod tests {
         }
     }
 
+    const ALL: [Check; 3] = [
+        Check::WorkStalled,
+        Check::AppServerUnresponsive,
+        Check::SyncStalled,
+    ];
+
     #[test]
-    fn a_problem_begins_and_ends_once() {
+    fn a_problem_begins_after_two_rounds_and_ends_once() {
         let mut state = HealthState::new(0);
-        let all = [
-            Check::WorkStalled,
-            Check::AppServerUnresponsive,
-            Check::SyncStalled,
-        ];
-        let (began, ended) = state.update(&all, vec![problem(Check::SyncStalled, "p", 5)], 10);
+        let (began, _) = state.update(&ALL, vec![problem(Check::SyncStalled, "p", 5)], 10);
+        assert!(began.is_empty(), "one round is not enough");
+        let (began, ended) = state.update(&ALL, vec![problem(Check::SyncStalled, "p", 5)], 20);
         assert_eq!((began.len(), ended.len()), (1, 0));
-        let (began, ended) = state.update(&all, vec![problem(Check::SyncStalled, "p", 9)], 20);
+        let (began, ended) = state.update(&ALL, vec![problem(Check::SyncStalled, "p", 9)], 30);
         assert!(began.is_empty() && ended.is_empty());
         assert_eq!(state.problems.values().next().unwrap().since_ms, 5);
         // A check that could not run keeps what it found.
-        let (_, ended) = state.update(&[Check::WorkStalled], vec![], 30);
+        let (_, ended) = state.update(&[Check::WorkStalled], vec![], 40);
         assert!(ended.is_empty());
-        let (began, ended) = state.update(&all, vec![], 40);
+        let (began, ended) = state.update(&ALL, vec![], 50);
         assert_eq!((began.len(), ended.len()), (0, 1));
-        assert!(state.update(&all, vec![], 50).1.is_empty());
+        assert!(state.update(&ALL, vec![], 60).1.is_empty());
+        // A round in between that does not find it starts the count over.
+        state.update(&ALL, vec![problem(Check::WorkStalled, "w", 0)], 70);
+        state.update(&ALL, vec![], 80);
+        assert!(
+            state
+                .update(&ALL, vec![problem(Check::WorkStalled, "w", 0)], 90)
+                .0
+                .is_empty()
+        );
+        // A check that did not run keeps its candidate for its next round.
+        state.update(&[Check::SyncStalled], vec![], 100);
+        assert_eq!(
+            state
+                .update(&ALL, vec![problem(Check::WorkStalled, "w", 0)], 110)
+                .0
+                .len(),
+            1
+        );
     }
 
     #[test]
-    fn handoffs_are_once_an_hour_per_problem_and_six_in_all() {
+    fn a_round_after_sleep_judges_nothing() {
+        let mut state = HealthState::new(0);
+        state.update(&ALL, vec![problem(Check::SyncStalled, "p", 5)], 60_000);
+        assert!(!state.woke(120_000));
+        let after_sleep = 60_000 + ASLEEP_MS + 1;
+        assert!(state.woke(after_sleep));
+        assert_eq!(state.baseline_ms, after_sleep);
+        // What the round before the sleep found does not count toward the next one.
+        assert!(
+            state
+                .update(
+                    &ALL,
+                    vec![problem(Check::SyncStalled, "p", 5)],
+                    after_sleep + 60_000
+                )
+                .0
+                .is_empty()
+        );
+        let peer = crate::maintenance::PeerHealth {
+            device_id: "d".into(),
+            path: None,
+            name: "Mac".into(),
+            reachable: Some(true),
+            synced_ms: Some(1),
+            rtt_ms: None,
+            path_changes: 0,
+            disconnects: 0,
+        };
+        let peers = [peer];
+        assert!(stalled_peers(&peers, after_sleep, after_sleep + SYNC_STALL_MS).is_empty());
+        assert_eq!(
+            stalled_peers(&peers, after_sleep, after_sleep + SYNC_STALL_MS + 1)[0].since_ms,
+            1
+        );
+    }
+
+    #[test]
+    fn handoffs_are_once_an_hour_per_problem_six_an_hour_and_24_a_day() {
         let mut state = HealthState::new(0);
         let key = |subject: &str| problem(Check::WorkStalled, subject, 0).key();
+        // Only a written handoff counts.
         assert!(state.may_hand(&key("a"), 0));
+        assert!(state.may_hand(&key("a"), 0));
+        state.handed(&key("a"), 0);
         assert!(!state.may_hand(&key("a"), HOUR_MS - 1));
         assert!(state.may_hand(&key("a"), HOUR_MS));
-        for subject in ["b", "c", "d", "e", "f"] {
+        for subject in ["a", "b", "c", "d", "e", "f"] {
             assert!(state.may_hand(&key(subject), HOUR_MS));
+            state.handed(&key(subject), HOUR_MS);
         }
         assert!(!state.may_hand(&key("g"), HOUR_MS));
+        let mut at = 2 * HOUR_MS;
+        while state.handed.len() < HANDOFFS_PER_DAY {
+            let subject = format!("s{at}");
+            assert!(state.may_hand(&key(&subject), at));
+            state.handed(&key(&subject), at);
+            at += HOUR_MS / 6;
+        }
+        assert!(at < DAY_MS);
+        assert!(!state.may_hand(&key("late"), at));
+        assert!(state.may_hand(&key("late"), DAY_MS + 1));
+        let device = "device-1";
         assert_eq!(
-            handoff_key(&problem(Check::WorkStalled, "a", 0), 1),
-            handoff_key(&problem(Check::WorkStalled, "a", 9), HOUR_MS - 1)
+            handoff_key(&problem(Check::WorkStalled, "a", 0), device, 1),
+            handoff_key(&problem(Check::WorkStalled, "a", 9), device, HOUR_MS - 1)
         );
         assert_ne!(
-            handoff_key(&problem(Check::WorkStalled, "a", 0), 1),
-            handoff_key(&problem(Check::WorkStalled, "a", 0), HOUR_MS)
+            handoff_key(&problem(Check::WorkStalled, "a", 0), device, 1),
+            handoff_key(&problem(Check::WorkStalled, "a", 0), device, HOUR_MS)
         );
+        assert_ne!(
+            handoff_key(&problem(Check::WorkStalled, "a", 0), device, 1),
+            handoff_key(&problem(Check::WorkStalled, "a", 0), "device-2", 1)
+        );
+        assert!(handoff_note(&problem(Check::WorkStalled, "a", 0), device).contains(device));
     }
 
     #[test]
-    fn the_app_server_is_unresponsive_after_two_misses() {
+    fn the_app_server_misses_since_its_first_miss() {
         let mut state = HealthState::new(0);
-        assert_eq!(state.app_server_probe(Some(false), 1), None);
-        assert_eq!(state.app_server_probe(Some(false), 2), Some(1));
-        assert_eq!(state.app_server_probe(None, 3), None);
-        assert_eq!(state.app_server_probe(Some(false), 4), None);
-        assert_eq!(state.app_server_probe(Some(true), 5), None);
+        assert_eq!(state.app_server_probe(false, 1), Some(1));
+        assert_eq!(state.app_server_probe(false, 2), Some(1));
+        assert_eq!(state.app_server_probe(true, 3), None);
+        assert_eq!(state.app_server_probe(false, 4), Some(4));
+    }
+
+    #[test]
+    fn a_health_turn_dispatches_no_work() {
+        use crate::tools::Tool;
+        let health = crate::scheduling::schedule_trigger("health-abc", 1);
+        assert!(health_turn(&health));
+        assert!(!health_turn(&crate::scheduling::schedule_trigger(
+            "schedule-abc",
+            1
+        )));
+        assert!(!health_turn("message:health-abc"));
+        assert!(!health_turn_tool(Tool::DispatchWork));
+        assert!(!health_turn_tool(Tool::InterruptWork));
+        assert!(health_turn_tool(Tool::ReadLogs));
+        assert!(health_turn_tool(Tool::ProposeProviderConfig));
     }
 
     #[test]
@@ -650,7 +855,7 @@ mod tests {
             json!({"device_id":"d","path":"relay","name":"Mac","reachable":true,"synced_ms":1,
                 "rtt_ms":42,"path_changes":3,"disconnects":1})
         );
-        let stalled = stalled_peers(&[peer], 1 + SYNC_STALL_MS + 1);
+        let stalled = stalled_peers(&[peer], 0, 1 + SYNC_STALL_MS + 1);
         assert_eq!(stalled.len(), 1);
         assert_eq!(
             (stalled[0].check, stalled[0].since_ms),

@@ -13,10 +13,11 @@ type RejectionTracker = {
 const previous = ErrorUtils.getGlobalHandler()
 ErrorUtils.setGlobalHandler((error, isFatal) => {
   const { message, stack } = describeError(error)
+  // The log only sends asynchronously, so a fatal error that ends the app at once may never reach the device.
   reportLog({ level: 'error', event: 'mobile.uncaught', message, fields: { stack, fatal: isFatal === true } })
   previous(error, isFatal)
 })
-;(HermesInternal as RejectionTracker | null)?.enablePromiseRejectionTracker?.({
+;(globalThis as { HermesInternal?: RejectionTracker | null }).HermesInternal?.enablePromiseRejectionTracker?.({
   allRejections: true,
   onUnhandled(id, rejection) {
     const { message, stack } = describeError(rejection)

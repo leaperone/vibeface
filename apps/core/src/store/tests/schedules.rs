@@ -1,4 +1,4 @@
-use super::super::bot_settings::ChangeRequest;
+use super::super::bot_settings::{ChangeRequest, PrimaryReminder};
 use super::super::test_support::{
     Net, all_accepted, bot_conversation, bot_with_message, net, owner, rename, save_schedule,
     scheduled_on_both, store, sync, user,
@@ -190,23 +190,50 @@ fn the_node_reminds_the_primary_bot_once_per_key() -> Result<()> {
     let net = net()?;
     let (mut origin, _) = bot_with_message(&net)?;
     let now = 10_000;
-    let (first, written) = origin
-        .remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now)?
-        .context("primary bot")?;
-    assert!(written && first.cause.is_none());
-    let (again, written) = origin
-        .remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now + 5)?
-        .context("primary bot")?;
-    assert!(!written);
+    let PrimaryReminder::Written(first) =
+        origin.remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now)?
+    else {
+        panic!("the owner writes the reminder")
+    };
+    assert!(first.cause.is_none());
+    let PrimaryReminder::Existing(again) =
+        origin.remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now + 5)?
+    else {
+        panic!("the same key finds the first reminder")
+    };
     assert_eq!(again.change_id, first.change_id);
     let BotChange::Schedule { schedule_id, .. } = first.change else {
         panic!("reminder")
     };
     let at = now + 60_000;
+    let trigger = schedule_trigger(&schedule_id, at);
     assert_eq!(
         origin.admit_due_schedules(&net.a, &net.network, at + 5)?,
-        vec![(first.conversation_id, schedule_trigger(&schedule_id, at))]
+        vec![(first.conversation_id.clone(), trigger.clone())]
     );
+    // Its turn may read the writer's diagnostics; on any other Node it may not.
+    let local = net.a.device_id()?;
+    assert!(origin.diagnostics_turn(&net.network, &local, "c", &trigger)?);
+    assert!(origin.diagnostics_turn(&net.network, &local, "c", "message:m1")?);
+    assert!(!origin.diagnostics_turn(&net.network, &net.b.device_id()?, "c", &trigger)?);
+    let other = schedule_trigger(&format!("schedule-{}", &schedule_id[7..]), at);
+    assert!(!origin.diagnostics_turn(&net.network, &local, "c", &other)?);
+    Ok(())
+}
+
+#[test]
+fn a_node_that_does_not_schedule_the_primary_bot_writes_no_reminder() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let before = origin.version_vector(&net.network)?;
+    assert_eq!(
+        origin.remind_primary_bot(&net.b, &net.network, "health-k-1", "检查 Node", 10_000)?,
+        PrimaryReminder::NotOwner {
+            conversation_id: "c".into(),
+            owner: Some(net.a.device_id()?)
+        }
+    );
+    assert_eq!(origin.version_vector(&net.network)?, before);
     Ok(())
 }
 

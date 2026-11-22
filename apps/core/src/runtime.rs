@@ -57,7 +57,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
-pub(crate) use health::MAX_LOG_READ;
+pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool};
 pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
@@ -1328,19 +1328,16 @@ impl Runtime {
                         None
                     };
                     let live = answer.is_some();
-                    let path = if include_observation {
-                        answer
-                            .as_ref()
-                            .and_then(|(_, connection)| crate::net::selected_path(connection))
-                    } else {
-                        None
-                    };
-                    let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
-                    let net = self.net.get();
-                    let rtt_ms = net
+                    // The path and its round-trip time, both of the connection that answered.
+                    let (path, rtt_ms) = answer
+                        .as_ref()
                         .filter(|_| include_observation)
-                        .and_then(|net| net.link(&member.device_id).1);
-                    let counts = net
+                        .and_then(|(_, connection)| crate::net::selected_link(connection))
+                        .map_or((None, None), |(path, rtt)| (Some(path), Some(rtt)));
+                    let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
+                    let counts = self
+                        .net
+                        .get()
                         .map(|net| net.link_counts(&member.device_id))
                         .unwrap_or_default();
                     let observation = NodeObservation {

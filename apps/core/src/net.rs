@@ -134,20 +134,28 @@ pub(crate) enum SelectedPath {
 
 /// Snapshots the path currently selected for application data on this connection.
 pub(crate) fn selected_path(connection: &Connection) -> Option<SelectedPath> {
+    selected_link(connection).map(|(path, _)| path)
+}
+
+/// The selected path of this connection and its round-trip time in milliseconds.
+pub(crate) fn selected_link(connection: &Connection) -> Option<(SelectedPath, u32)> {
     if connection.close_reason().is_some() {
         return None;
     }
     let paths = connection.paths();
-    match paths.iter().find(|path| path.is_selected())?.remote_addr() {
-        TransportAddr::Ip(_) => Some(SelectedPath::Direct),
+    let selected = paths.iter().find(|path| path.is_selected())?;
+    let path = match selected.remote_addr() {
+        TransportAddr::Ip(_) => SelectedPath::Direct,
         TransportAddr::Relay(url) if matches!(url.scheme(), "http" | "https") => {
             // Iroh uses its fixed relay route at this origin. Do not publish URL credentials.
-            Some(SelectedPath::Relay {
+            SelectedPath::Relay {
                 url: url.origin().ascii_serialization(),
-            })
+            }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    let rtt = u32::try_from(selected.rtt().as_millis()).unwrap_or(u32::MAX);
+    Some((path, rtt))
 }
 
 /// A relay token file holds 64 hex characters.
@@ -710,25 +718,38 @@ impl Net {
             .lock()
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
-        self.count_link(id, connection.clone());
+        if alpn == SYNC {
+            self.count_link(id, &connection);
+        }
         Ok(connection)
     }
 
-    /// Counts the times this dialed connection switches between direct and relay, and its close
-    /// unless this Node closed it.
-    fn count_link(&self, id: EndpointId, connection: Connection) {
+    /// Counts the times this dialed SYNC connection switches between direct and relay, and its
+    /// close unless this Node closed or dropped it. Only SYNC counts, so one outage counts once
+    /// per peer. The task holds no strong reference: the connection still closes when the last
+    /// user drops it.
+    fn count_link(&self, id: EndpointId, connection: &Connection) {
         let links = self.links.clone();
         let bump = move |change: fn(&mut LinkCounts)| {
             change(links.lock().expect("link counts").entry(id).or_default());
         };
+        let weak = connection.weak_handle();
+        // Subscribed while a strong reference exists, so neither misses the close.
+        let mut events = connection.path_events();
+        let closed = weak.closed();
+        let mut last = selected_path(connection).map(|path| matches!(path, SelectedPath::Direct));
         tokio::spawn(async move {
-            let mut paths = connection.paths_stream();
-            let mut last = None;
-            while let Some(list) = paths.next().await {
-                let direct = list
-                    .iter()
-                    .find(|path| path.is_selected())
-                    .map(|path| path.is_ip());
+            while let Some(event) = events.next().await {
+                let direct = match event {
+                    iroh::endpoint::PathEvent::Selected { remote_addr, .. } => {
+                        Some(remote_addr.is_ip())
+                    }
+                    iroh::endpoint::PathEvent::Lagged { .. } => weak
+                        .upgrade()
+                        .and_then(|connection| selected_path(&connection))
+                        .map(|path| matches!(path, SelectedPath::Direct)),
+                    _ => None,
+                };
                 if direct.is_some() {
                     if last.is_some() && direct != last {
                         bump(|counts| counts.path_changes += 1);
@@ -736,10 +757,12 @@ impl Net {
                     last = direct;
                 }
             }
-            if !matches!(
-                connection.closed().await,
-                iroh::endpoint::ConnectionError::LocallyClosed
-            ) {
+            if closed.await.is_some_and(|closed| {
+                !matches!(
+                    closed.reason,
+                    iroh::endpoint::ConnectionError::LocallyClosed
+                )
+            }) {
                 bump(|counts| counts.disconnects += 1);
             }
         });
@@ -749,27 +772,27 @@ impl Net {
         self.link(device_id).0
     }
 
-    /// The selected path to a peer over a dialed connection and its round-trip time.
+    /// The selected path to a peer over the dialed SYNC connection, else any dialed one, and its
+    /// round-trip time on that same connection.
     pub fn link(&self, device_id: &str) -> (Option<PathKind>, Option<u32>) {
         let Ok(id) = endpoint_id(device_id) else {
             return (None, None);
         };
         let connections = self.connections.lock().expect("connection cache");
-        connections
+        let sync = connections.get(&(id, SYNC)).into_iter();
+        let others = connections
             .iter()
-            .filter(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
-            .find_map(|(_, connection)| {
-                let paths = connection.paths();
-                let path = paths.iter().find(|path| path.is_selected())?;
-                let kind = match path.remote_addr() {
-                    TransportAddr::Ip(_) => PathKind::Direct,
-                    TransportAddr::Relay(_) => PathKind::Relay,
-                    _ => return None,
+            .filter(|((peer, alpn), _)| *peer == id && *alpn != SYNC)
+            .map(|(_, connection)| connection);
+        sync.chain(others)
+            .find_map(selected_link)
+            .map_or((None, None), |(path, rtt)| {
+                let kind = match path {
+                    SelectedPath::Direct => PathKind::Direct,
+                    SelectedPath::Relay { .. } => PathKind::Relay,
                 };
-                let rtt = u32::try_from(path.rtt().as_millis()).unwrap_or(u32::MAX);
-                Some((Some(kind), Some(rtt)))
+                (Some(kind), Some(rtt))
             })
-            .unwrap_or((None, None))
     }
 
     pub fn link_counts(&self, device_id: &str) -> LinkCounts {

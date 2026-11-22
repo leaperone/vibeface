@@ -22,6 +22,23 @@ pub fn change_id(conversation: &str, trigger: &str, call_ref: &str) -> String {
     format!("change-{}", change_digest(conversation, trigger, call_ref))
 }
 
+/// The schedule IDs of the Node's health reminders; a bot's own schedules start `schedule-`.
+pub const HEALTH_SCHEDULE_PREFIX: &str = "health-";
+
+/// What `remind_primary_bot` did.
+#[derive(Debug, PartialEq)]
+pub enum PrimaryReminder {
+    NoPrimaryBot,
+    /// Another Node schedules the primary bot; this one wrote nothing.
+    NotOwner {
+        conversation_id: ScopeId,
+        owner: Option<DeviceId>,
+    },
+    Written(ChangeRecord),
+    /// The same key wrote it before.
+    Existing(ChangeRecord),
+}
+
 /// What a settings or reminder tool asked for, tagged by the tool's name; the writer adds the
 /// values it replaces.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -1352,7 +1369,9 @@ impl Store {
     }
 
     /// A one-time reminder the Node sets for the primary bot, as its own `remind` would, a minute
-    /// from `at`. `key` names it, so the same key writes it once. `None` without a primary bot.
+    /// from `at`. Only the Node that schedules the primary bot writes it: no other Node may
+    /// write that bot's `BotChanged` without the user's message. `key` names it, so the same key
+    /// writes it once.
     pub fn remind_primary_bot(
         &mut self,
         identity: &crate::crypto::LocalIdentity,
@@ -1360,18 +1379,25 @@ impl Store {
         key: &str,
         note: &str,
         at: i64,
-    ) -> Result<Option<(ChangeRecord, bool)>> {
+    ) -> Result<PrimaryReminder> {
         vibeface_protocol::validate_id(key).map_err(anyhow::Error::msg)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(scope) = super::bots::primary_bot_from(&tx, network)? else {
-            return Ok(None);
+            return Ok(PrimaryReminder::NoPrimaryBot);
         };
+        let owner = super::conversation_from(&tx, network, &scope)?.and_then(|c| c.owner);
+        if owner.as_deref() != Some(identity.device_id()?.as_str()) {
+            return Ok(PrimaryReminder::NotOwner {
+                conversation_id: scope,
+                owner,
+            });
+        }
         let digest = change_digest(&scope, "node", key);
         let change_id = format!("change-{digest}");
         if let Some(existing) = change_from(&tx, network, &change_id)? {
-            return Ok(Some((existing, false)));
+            return Ok(PrimaryReminder::Existing(existing));
         }
         let name: String = note
             .lines()
@@ -1401,7 +1427,7 @@ impl Store {
                 change_id: change_id.clone(),
                 cause: None,
                 change: BotChange::Schedule {
-                    schedule_id: format!("schedule-{digest}"),
+                    schedule_id: format!("{HEALTH_SCHEDULE_PREFIX}{digest}"),
                     before: None,
                     after: Some(after),
                 },
@@ -1411,7 +1437,50 @@ impl Store {
         )?;
         let record = change_from(&tx, network, &change_id)?.context("change was not projected")?;
         tx.commit()?;
-        Ok(Some((record, true)))
+        Ok(PrimaryReminder::Written(record))
+    }
+
+    /// Whether turn `trigger` of `scope` may read this device's log and health: a turn of the
+    /// primary bot that a managing device's own message started, or that a health reminder
+    /// this Node (`local`) wrote started.
+    pub fn diagnostics_turn(
+        &self,
+        network: &str,
+        local: &str,
+        scope: &str,
+        trigger: &str,
+    ) -> Result<bool> {
+        let connection = &self.connection;
+        if super::bots::primary_bot_from(connection, network)?.as_deref() != Some(scope) {
+            return Ok(false);
+        }
+        Ok(match crate::scheduling::Trigger::decode(trigger) {
+            Ok(crate::scheduling::Trigger::Message(message)) => {
+                let Some(message) = message_from(connection, network, scope, message)? else {
+                    return Ok(false);
+                };
+                if message.role != Role::User || message.answers.is_some() {
+                    return Ok(false);
+                }
+                let signer = log::event_from(connection, network, &message.event_hash)?
+                    .and_then(|event| event.body.attestation().map(|a| a.device_id.clone()));
+                let view = super::membership_from(connection, network)?;
+                signer.is_some_and(|device| view.client(&device).is_ok_and(|member| member.manage))
+            }
+            Ok(crate::scheduling::Trigger::Schedule { id, .. }) => {
+                let Some(digest) = id.strip_prefix(HEALTH_SCHEDULE_PREFIX) else {
+                    return Ok(false);
+                };
+                match change_from(connection, network, &format!("change-{digest}"))? {
+                    Some(change) if change.conversation_id == scope => {
+                        log::event_from(connection, network, &change.event_hash)?
+                            .is_some_and(|event| event.author == local)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
     }
 
     pub fn bot_change(&self, network: &str, change_id: &str) -> Result<Option<ChangeRecord>> {
