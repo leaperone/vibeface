@@ -279,10 +279,12 @@ export const securityCopy = {
   changedOn: (at: number) => `${new Date(at).toLocaleDateString('zh-CN')} 设置`,
 }
 
-/** The strength line under a new recovery password; `weak` ones are refused. */
+/** The strength line under a new recovery password; `weak` ones are refused. `again`/`mismatch`: its retyping, shared by creating and changing it. */
 export const passwordCopy = {
   label: { weak: '太弱', fair: '可用', strong: '较强' },
   short: '至少 8 个字符',
   common: '太常见了，换一个',
   simple: '少于 12 个字符时，要混用字母、数字或符号',
+  again: '再输入一遍恢复密码',
+  mismatch: '和上面的恢复密码不一致，再输入一遍',
 }

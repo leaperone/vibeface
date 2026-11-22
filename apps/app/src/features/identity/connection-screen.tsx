@@ -4,7 +4,7 @@ import { defaultBrowserName,defaultComputerName,lastBrowserName,rememberBrowserN
 import { webPlatform } from '@/lib/platform'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined,removedText,useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy,manualCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
+import { joinCopy,manualCopy,passwordCopy,recoveryCopy,startCopy } from '@vibeface/client/identity/copy.ts'
 import { APP_ORIGIN,PUBLIC_GATEWAY } from '@vibeface/client/lib/entrances.ts'
 import { spentInvite,spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { entryAddress,entryKey,messageOf,parseEntry } from '@vibeface/client/lib/node.ts'
@@ -403,7 +403,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
           <div ><PasswordInput label="恢复密码" name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false); setMismatch(false) }} /></div>
           <PasswordStrength id="password-hint" password={password} tried={tried} />
         </div>
-        <PasswordInput label="再输入一遍恢复密码" name="again" autoComplete="new-password" error={mismatch ? "和上面的恢复密码不一致，再输入一遍" : undefined} onChange={() => setMismatch(false)} />
+        <PasswordInput label={passwordCopy.again} name="again" autoComplete="new-password" error={mismatch ? passwordCopy.mismatch : undefined} onChange={() => setMismatch(false)} />
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>

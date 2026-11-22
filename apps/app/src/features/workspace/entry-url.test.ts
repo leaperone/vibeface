@@ -5638,29 +5638,38 @@ test('recovery restore clears submitted passwords before waiting and keeps the c
   } finally { app.close() }
 })
 
-test('changing the recovery password keeps what was typed when it fails, and clears it once the new file is made', async () => {
-  let work = pendingResult()
-  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
-  const fields = new Map(['bundle', 'password', 'old_password'].map(name => [name, new Input()]))
-  const passwords = ['password', 'old_password'].map(name => fields.get(name))
+test('changing the recovery password asks for it twice, keeps what was typed when it fails, and clears it once the new file is made', async () => {
+  let work = pendingResult(), replaced = 0
+  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false; focused = false; focus() { this.focused = true } }
+  const fields = new Map(['bundle', 'password', 'old_password', 'confirm_password'].map(name => [name, new Input()]))
+  const passwords = ['password', 'old_password', 'confirm_password'].map(name => fields.get(name))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
-  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => work.promise }
+  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => { replaced++; return work.promise } }
   const app = componentHarness('../identity/recovery-controls.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
     '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value, passwordStrength: () => ({ level: 'strong' }) }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
-  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
+  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input }, '', { '@vibeface/client/identity/copy.ts': '../../../../../packages/client/src/identity/copy.ts' })
   const render = () => app.render('RecoveryControls', { only: 'passphrase' })
   const form_ = () => render().find(({ type }) => type === 'form')?.props
   const submit = () => form_()?.onSubmit?.({ preventDefault() {}, currentTarget: form })
   try {
-    render(); submit()
+    render()
+    const again = fields.get('confirm_password'); assert.ok(again)
+    again.value = 'another test-only-value'; submit(); await settleComponent()
+    assert.equal(replaced, 0, 'a retyping that differs seals no file')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '和上面的恢复密码不一致，再输入一遍')
+    assert.ok(again.focused, 'the retyping takes the focus back')
+    form_()?.onChange?.({})
+    assert.equal(render().some(({ props }) => props.error), false, 'a change takes the mismatch away')
+    again.value = 'test-only-value'; submit()
     work.reject(new Error('旧密码不对')); await settleComponent()
-    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps both passwords')
+    assert.equal(replaced, 1)
+    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps every password')
     assert.equal(render().find(({ props }) => props.error)?.props.error, '旧密码不对')
     form_()?.onChange?.({})
     assert.equal(render().some(({ props }) => props.error), false, 'a change takes the old error away')
     work = pendingResult(); submit(); work.resolve(undefined); await settleComponent()
-    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears both passwords')
+    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears every password')
   } finally { app.close() }
 })
 
