@@ -46,7 +46,7 @@ button.row:hover, .disclosure > summary:hover { background: var(--surface-muted)
 .password > :first-child > * { grid-column: 1; }
 .password > button { grid-column: 2; grid-row: 2; }
 .picker { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); min-width: 0; }
-.segmented { --text-muted: var(--text-secondary); min-width: 0; }
+.segmented { min-width: 0; }
 @media(max-width: 48rem), (pointer: coarse) {
   .segmented button { min-width: var(--control-height-md); min-height: var(--control-height-md); }
 }
