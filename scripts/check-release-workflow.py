@@ -286,6 +286,18 @@ def coordinator_job(source, name, group, command):
             and 'GH_TOKEN: ${{ github.token }}' in block and 'fetch-depth: 0' in block
             and 'ref: main' in block and command in (line.strip() for line in block.splitlines()),
             'coordinator source, scope or permissions differ')
+    app_match = re.search(r'^      - id: release-app\n(?P<body>.*?)(?=^      - |\Z)', block, re.M | re.S)
+    require(app_match is not None, 'coordinator must mint the release App token')
+    app_step = app_match.group(0)
+    require(re.search(r'^        uses: actions/create-github-app-token@[0-9a-f]{40}(?:\s+# v[0-9]+\.[0-9]+\.[0-9]+)?$', app_step, re.M)
+            and 'app-id: ${{ vars.VIBEFACE_RELEASE_APP_ID }}' in app_step
+            and 'private-key: ${{ secrets.VIBEFACE_RELEASE_APP_PRIVATE_KEY }}' in app_step
+            and 'permission-contents: write' in app_step
+            and 'permission-workflows: write' in app_step
+            and block.index(app_step) < block.index(command),
+            'coordinator must mint a pinned release App token before publishing')
+    require('RELEASE_TAG_TOKEN: ${{ steps.release-app.outputs.token }}' in block,
+            'coordinator must pass the release App token to the tagger')
     return block
 
 
@@ -478,6 +490,20 @@ def self_test(entries, helpers, hourly, daily, deployment, deployment_entries):
         candidate = hourly.replace(before, after, 1)
         require(candidate != hourly, 'coordinator mutation did not reach its guard')
         rejects(lambda: check_hourly(candidate))
+    for source, checker in ((hourly, check_hourly), (daily, check_daily)):
+        app_step = re.search(r'^      - id: release-app\n.*?(?=^      - |\Z)', source, re.M | re.S)
+        require(app_step is not None, 'coordinator release App mutation did not reach its step')
+        mutations = (
+            (app_step.group(0), ''),
+            ('@fee1f7d63c2ff003460e3d139729b119787bc349', '@v2'),
+            ('permission-workflows: write', 'permission-workflows: read'),
+            ('GH_TOKEN: ${{ github.token }}', 'GH_TOKEN: ${{ steps.release-app.outputs.token }}'),
+            ('RELEASE_TAG_TOKEN: ${{ steps.release-app.outputs.token }}', ''),
+        )
+        for before, after in mutations:
+            candidate = source.replace(before, after, 1)
+            require(candidate != source, 'release App coordinator mutation did not reach its target')
+            rejects(lambda candidate=candidate, checker=checker: checker(candidate))
     for before, after in (
         ("cron: '0 18 * * *'", "cron: '0 * * * *'"),
         ('America/Los_Angeles', 'UTC'),
