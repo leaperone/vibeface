@@ -1738,16 +1738,21 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       const close = () => {
         if (session.current === active && generation.current === active.generation) active.channel.close()
       }
-      const pending = { generation: active.generation, timer: setTimeout(close, 5000) }
+      const pending = { generation: active.generation, timer: undefined as ReturnType<typeof setTimeout> | undefined }
       probe = pending
-      void active.channel.request('info').catch(cause => {
-        if (!isResponseError(cause)) close()
+      const startTimer = () => {
+        if (probe === pending) pending.timer = setTimeout(close, 5000)
+      }
+      void active.channel.request('info', {}, startTimer).catch(cause => {
+        const code = (cause as { code?: unknown } | null)?.code
+        const queued = code === 'client_overloaded' || /等待读取超时|排队的读取/.test(String((cause as Error)?.message ?? cause))
+        if (!isResponseError(cause) && !queued) close()
       }).finally(() => {
-        clearTimeout(pending.timer)
+        if (pending.timer) clearTimeout(pending.timer)
         if (probe === pending) probe = null
       })
     })
-    return () => { stop(); if (probe) clearTimeout(probe.timer) }
+    return () => { stop(); if (probe?.timer) clearTimeout(probe.timer) }
   }, [])
   useEffect(() => {
     // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.

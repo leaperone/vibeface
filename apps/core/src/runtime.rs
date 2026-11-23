@@ -338,6 +338,8 @@ pub struct Runtime {
     removed_sync_limits: peers::RemovedSyncLimits,
     /// Downloads and local uploads of the same attachment share one staging file.
     blob_locks: peers::BlobLocks,
+    /// Serializes staging quota admission without serializing active transfers.
+    staging_room_lock: Mutex<()>,
     /// Changes with every process start, so peers can tell a restart from a quiet link.
     boot: String,
     sync_wakeup: tokio::sync::Notify,
@@ -620,6 +622,7 @@ impl Runtime {
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
             removed_sync_limits: peers::RemovedSyncLimits::default(),
             blob_locks: peers::BlobLocks::default(),
+            staging_room_lock: Mutex::new(()),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),
             have_wakeup,

@@ -2407,10 +2407,13 @@ impl Runtime {
         }
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
-        if !tokio::fs::try_exists(&part).await? {
-            let dir = dir.to_owned();
-            let size = blob.size;
-            tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
+        {
+            let _room = self.staging_room_lock.lock().await;
+            if !tokio::fs::try_exists(&part).await? {
+                let dir = dir.to_owned();
+                let size = blob.size;
+                tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
+            }
         }
         let connection = self.net()?.connect(peer, net::BLOB).await?;
         let (mut send, mut recv) = connection
