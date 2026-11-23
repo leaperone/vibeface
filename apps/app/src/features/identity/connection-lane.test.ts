@@ -130,10 +130,11 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
       options.signal?.addEventListener('abort', close)
       const opening = holds.get(candidate.kind === 'lan' ? 'open' : `open:${candidate.address}`) ?? holds.get('open')
       if (opening) await opening.promise
-      return { deviceId: candidate.device_id, close, async request(method: string, params: Record<string, unknown> = {}) {
+      return { deviceId: candidate.device_id, close, async request(method: string, params: Record<string, unknown> = {}, onSent?: () => void) {
         if (method === 'log') return { accepted: 1 }
         calls.push(method)
         requests.push({ method, params })
+        onSent?.()
         if (holds.has(method)) {
           const result = await holds.get(method)?.promise
           if (method === 'recover') { initialized = true; authorized = true }
