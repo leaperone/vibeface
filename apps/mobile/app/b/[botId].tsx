@@ -37,7 +37,7 @@ import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } f
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
-import { useWide } from '@/lib/layout'
+import { touchRow, useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
 import { mobilePlatform } from '@/platform'
 
@@ -100,13 +100,13 @@ export default function ChatScreen() {
   const ios = Platform.OS === 'ios'
   const barHeight = useHeaderHeight()
   const header = ios ? barHeight : 0
-  // iOS sizes a custom title against the whole bar, back button included, so a long name would run under it; the screen's
-  // width less the sidebar and a back button's room on each side keeps it centred and truncated. Android's title slot
-  // already ends where the bar's buttons begin.
+  // iOS sizes a custom title against the whole bar, so a long name or large text ran under the three header buttons; the
+  // screen's width less the sidebar, the back button and that button group keeps it truncated before them. Android's
+  // title slot already ends where the bar's buttons begin.
   const frame = useSafeAreaFrame().width
   const wide = useWide()
   // Compact iPad windows also need leading room for the system window controls.
-  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 200 : 120) : undefined
+  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 328 : 248) : undefined
   const background = useCSSVariable('--background')
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
@@ -261,7 +261,7 @@ export default function ChatScreen() {
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
-      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-pill px-2.5 active:bg-surface-muted/50' : '-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-control px-2 active:bg-surface-muted'} style={{ maxWidth: titleWidth }}>
+      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-pill px-2.5 active:bg-surface-muted/50' : '-mx-2 min-h-12 shrink flex-row items-center gap-2 self-start rounded-control px-2 active:bg-surface-muted'} style={{ maxWidth: titleWidth }}>
       <BotFace bot={bot} mood={mood} size={ios ? 24 : 28} />
       <Text numberOfLines={1} className="shrink font-medium">{bot.name}</Text>
       {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
@@ -271,7 +271,7 @@ export default function ChatScreen() {
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <View className="flex-row"><Link href={`/b/${bot.bot_id}/activity`} asChild><Button variant="ghost" iconOnly accessibilityLabel={extras.attention ? `动态，${extras.attention} 项要处理` : '动态'}><Icon as={ListChecks} className="size-5" />{extras.attention ? <View pointerEvents="none" className="absolute right-2 top-2 size-2 rounded-pill bg-warning" /> : null}</Button></Link><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
+      headerRight: () => <View className="flex-row"><Link href={`/b/${bot.bot_id}/activity`} asChild><Button variant="ghost" iconOnly accessibilityLabel={extras.attention ? `动态，${extras.attention} 项要处理` : '动态'}><Icon as={ListChecks} className="size-5" />{extras.attention ? <View pointerEvents="none" className="absolute right-2 top-2 size-2 rounded-pill bg-warning" /> : null}</Button></Link><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} className="size-5" /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
@@ -343,12 +343,12 @@ export default function ChatScreen() {
     <RecoveryAlert top={header} />
     </View></ScreenFaces>
     <KeyboardStickyView pointerEvents={ios ? 'box-none' : undefined} style={ios ? { position: 'absolute', bottom: 0, left: 0, right: 0 } : undefined} offset={{ closed: 0, opened: insets.bottom }}>
-      <View pointerEvents={ios ? 'box-none' : undefined} style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
+      <View pointerEvents={ios ? 'box-none' : undefined} className="bg-background" style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
-          <Button variant="secondary" iconOnly className="rounded-pill bg-surface " accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
+          <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
         {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
-          <Pressable accessibilityRole="link" accessibilityHint="打开动态" className="min-h-11 w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted">
+          <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
             <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />
             <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{statusLine}</Text>
             <Icon as={ChevronRight} className="size-4 text-muted" />

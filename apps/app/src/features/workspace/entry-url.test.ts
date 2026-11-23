@@ -4825,7 +4825,7 @@ test("question cards send a choice on tap, send written text from the last line,
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const tap = async (label: string, props: object = {}) => {
-    const button = render(props).find(({ type, props }) => (type === 'Button' || type === 'Button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
+    const button = render(props).find(({ type, props }) => (type === 'Button' || type === 'button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
     assert.ok(button?.props.onClick, `missing button ${label}`)
     button.props.onClick(); await settleComponent()
   }
@@ -4838,7 +4838,7 @@ test("question cards send a choice on tap, send written text from the last line,
   try {
     let elements = render()
     assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
-    assert.deepEqual(elements.filter(({ type, props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
+    assert.deepEqual(elements.filter(({ type }) => type === 'button').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
     const input = elements.find(({ type }) => type === 'Textarea')
     assert.equal(input?.props.rows, 1, 'the last line waits for a written answer')
     assert.equal(input?.props['aria-label'], '你的回答')
@@ -4860,7 +4860,7 @@ test("question cards send a choice on tap, send written text from the last line,
     write('新回答')
     workspace.writable = false
     elements = render()
-    assert.equal(elements.filter(({ type }) => type === 'Button' || type === 'Textarea').every(({ props }) => props.disabled === true), true)
+    assert.equal(elements.filter(({ type }) => type === 'Button' || type === 'button' || type === 'Textarea').every(({ props }) => props.disabled === true), true)
     await tap('停下'); await tap('忽略')
     assert.equal(sent.length, count, 'the send handler also enforces read-only state')
     workspace.writable = true
@@ -4868,7 +4868,7 @@ test("question cards send a choice on tap, send written text from the last line,
     assert.deepEqual(plain(sent.at(-1)), [question, ignoredAnswer], 'ignoring sends the fixed answer')
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
-    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal' || type === 'Textarea'), false, 'a pending answer cannot be replaced')
+    assert.equal(elements.some(({ type }) => type === 'button' || type === 'Textarea'), false, 'a pending answer cannot be replaced')
     assert.match(componentText(elements), /没确认送达/)
     const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
@@ -4883,7 +4883,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
     assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
     workspace.pendingAnswers = []
     elements = render()
     assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
@@ -4895,7 +4895,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
     assert.match(componentText(elements), /已失效/)
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
     await tap('允许', { inbox: true })
     await tap('忽略', { inbox: true })
     assert.deepEqual(toasts.map(({ text }) => text), ['已回答', '已忽略'])
@@ -4920,7 +4920,7 @@ test("a question without choices offers only the answer line and 忽略", () => 
   try {
     const elements = app.render('QuestionCard', { question: { question_id: 'free', text: '需要什么配置？', choices: [], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null } })
     assert.equal(elements.find(({ type }) => type === 'Textarea')?.props.rows, 1)
-    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal'), false)
+    assert.equal(elements.some(({ type }) => type === 'button'), false)
     assert.ok(elements.some(({ type, props }) => type === 'Button' && componentText(props.children).includes('忽略')))
   } finally { app.close() }
 })

@@ -51,7 +51,8 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
     }
   },[entries,newestSend])
   useEffect(() => { setNow(Date.now()) },[])
-  useEffect(() => { const node = content.current; if (!node) return; const resize = new ResizeObserver(place); resize.observe(node); return () => resize.disconnect() },[entries.length === 0])
+  // The composer grows on focus and the status above it comes and goes; the newest message stays in view, or the one being read keeps its place.
+  useEffect(() => { const node = content.current, view = viewport.current; if (!node || !view) return; const resize = new ResizeObserver(place); resize.observe(node); resize.observe(view); return () => resize.disconnect() },[entries.length === 0])
   const times = messageTimes(entries.flatMap(entry => 'message' in entry && entry.message.created_at_ms ? [entry.message] : []),now)
   if (!entries.length) return <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{empty}</div>
   return <div className={styles.thread}><div ref={viewport} onScroll={capture} className={styles.viewport} role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions"><div ref={content} className={styles.messages}>{entries.map(entry => <div key={entry.key} data-history-key={entry.key} className={styles.entry}>{'message' in entry ? <Message message={entry.message} conversationId={entry.conversationId} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} /> : entry.node}</div>)}</div></div>{away ? <Button type="button" variant="secondary" className={styles.latest} aria-label="回到最新消息" title="回到最新" onClick={latest}><ArrowDown aria-hidden="true" /></Button> : null}</div>

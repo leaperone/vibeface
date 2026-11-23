@@ -46,7 +46,7 @@ export default function BotActivity() {
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-8 p-4 pb-10">
     {title}
     {shown.map(([heading, items]) => <View key={heading} className="gap-3">
-      <Text role="heading" className="px-1 text-sm font-medium text-muted">{heading}</Text>
+      <Text role="heading" className="text-sm font-medium text-muted">{heading}</Text>
       {items}
     </View>)}
   </KeyboardAwareScrollView>

@@ -1,3 +1,4 @@
+import { Platform } from 'react-native'
 import { useSafeAreaFrame } from 'react-native-safe-area-context'
 
 /**
@@ -6,3 +7,6 @@ import { useSafeAreaFrame } from 'react-native-safe-area-context'
  * screen widens; the window size lands first and left the sidebar's strip blank for a couple of frames.
  */
 export const useWide = () => useSafeAreaFrame().width >= 768
+
+/** The platform's minimum row height for a custom pressable: 44pt on iOS, 48dp on Android, as Arc buttons size themselves. */
+export const touchRow = Platform.OS === 'android' ? 'min-h-12' : 'min-h-11'
