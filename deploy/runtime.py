@@ -20,6 +20,7 @@ DATA = Path('/data')
 APP_ORIGIN = 'https://app.vibeface.dev'
 TLS_FILES = ('tls-cert.pem', 'tls-key.pem')
 TLS_OWNER = 0
+MAX_RELAY_RATE = 4 * 1024 * 1024
 
 
 def load_component_identity():
@@ -134,7 +135,7 @@ def guard(info):
     mesh = network.get('mesh') or {}
     require(mesh.get('enabled') is True and network.get('relay_listen') is not None and network.get('relay_url')
             and network.get('relay_open') is True and network.get('relay_operator_token') is None
-            and bounded(network.get('relay_rate'), 16384) and bounded(network.get('relay_max_clients'), 128)
+            and bounded(network.get('relay_rate'), MAX_RELAY_RATE) and bounded(network.get('relay_max_clients'), 128)
             and bounded(network.get('relay_max_clients_per_ip'), 8) and forwarding['any'] is True
             and forwarding.get('rate') and forwarding.get('per_ip'),
             'the official node needs the mesh, an open relay and browser forwarding, each within limits')
@@ -219,7 +220,7 @@ def self_test():
                   'forwarding': {'any': True, 'sessions': 32, 'queue': 192, 'rate': 262144, 'per_ip': 8,
                                  'trusted_proxies': []},
                   'network': {'relay_listen': '0.0.0.0:3340', 'relay_url': 'http://203.0.113.7:3340',
-                              'relay_open': True, 'relay_operator_token': None, 'relay_rate': 16384,
+                              'relay_open': True, 'relay_operator_token': None, 'relay_rate': MAX_RELAY_RATE,
                               'relay_max_clients': 128, 'relay_max_clients_per_ip': 8,
                               'mesh': {'enabled': True, 'network': 'vibeface', 'bootstrap': [],
                                        'allow_private': False, 'advertise': ['203.0.113.7:4792']}}}
@@ -270,7 +271,7 @@ def self_test():
                            {'forwarding': dict(forwarding, trusted_proxies=['203.0.113.1'])},
                            {'network': dict(network, mesh=dict(network['mesh'], enabled=False))},
                            {'network': dict(network, relay_listen=None)}, {'network': dict(network, relay_url=None)},
-                           {'network': dict(network, relay_rate=65536)}, {'network': dict(network, relay_max_clients=512)},
+                           {'network': dict(network, relay_rate=MAX_RELAY_RATE + 1)}, {'network': dict(network, relay_max_clients=512)},
                            {'network': dict(network, relay_max_clients_per_ip=16)},
                            {'network': dict(network, relay_open=False)},
                            {'network': dict(network, relay_rate=None)}, {'network': dict(network, relay_max_clients=None)},
