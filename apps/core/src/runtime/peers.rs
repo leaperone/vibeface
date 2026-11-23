@@ -2407,6 +2407,23 @@ impl Runtime {
         }
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
+        let connection = self.net()?.connect(peer, net::BLOB).await?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|error| anyhow::anyhow!("peer connection closed: {error}"))?;
+        net::write_frame(
+            &mut send,
+            &json!({"network_id":network,"hash":blob.hash,"size":blob.size,"offset":committed}),
+        )
+        .await?;
+        send.finish().ok();
+        let header = net::read_frame(&mut recv)
+            .await?
+            .context("source closed the attachment stream")?;
+        if let Some(error) = header["error"].as_str() {
+            bail!("{error}");
+        }
         {
             let _room = self.staging_room_lock.lock().await;
             let existing = tokio::fs::metadata(&part)
@@ -2426,23 +2443,6 @@ impl Runtime {
                 .open(&part)
                 .await?;
             reserved.set_len(blob.size).await?;
-        }
-        let connection = self.net()?.connect(peer, net::BLOB).await?;
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|error| anyhow::anyhow!("peer connection closed: {error}"))?;
-        net::write_frame(
-            &mut send,
-            &json!({"network_id":network,"hash":blob.hash,"size":blob.size,"offset":committed}),
-        )
-        .await?;
-        send.finish().ok();
-        let header = net::read_frame(&mut recv)
-            .await?
-            .context("source closed the attachment stream")?;
-        if let Some(error) = header["error"].as_str() {
-            bail!("{error}");
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
