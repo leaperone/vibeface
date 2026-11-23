@@ -715,7 +715,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (item.method === "dismiss_work") return !parseOpenWorks(await rpc("open_works")).some((work) => work.work_id === item.params.work_id)
     if (item.method === "dismiss_question") {
       const inbox = parseQuestionInbox(await rpc("questions"))
-      return inbox.dismissedQuestions.has(questionInboxKey(item.params.conversation_id, item.params.question_id))
+      return inbox.dismissedQuestions.has(questionInboxKey(item.params.conversation_id, item.params.question_id)) || !inbox.questions.some((q) => q.question_id === item.params.question_id)
     }
     // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "answer") return !parseQuestions(await rpc("questions")).some((question) => question.question_id === item.params.question_id)

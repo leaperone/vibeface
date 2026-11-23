@@ -1402,7 +1402,7 @@ impl Client {
             Action::Memory {conversation_id,memory_id,base,after}=>Some(self.operation_id(conversation_id,&json!({"type":"memory_controlled","memory_id":memory_id,"base":base,"after":after}))?),
             Action::SetOwner {conversation_id,scheduler_node,epoch}=>Some(self.operation_id(conversation_id,&json!({"type":"conversation_owner","scheduler_node":scheduler_node,"epoch":epoch}))?),
             Action::DismissWork {conversation_id,work_id}=>Some(self.operation_id(conversation_id,&json!({"type":"notification_acked","notification_id":work_id,"client_id":"inbox"}))?),
-            Action::DismissQuestion {conversation_id,question_id}=>Some(self.operation_id(conversation_id,&json!({"type":"notification_acked","notification_id":format!("question:{conversation_id}:{question_id}"),"client_id":"inbox"}))?),
+            Action::DismissQuestion {conversation_id,question_id}=>Some(self.operation_id(conversation_id,&json!({"type":"notification_acked","notification_id":question_id,"client_id":"inbox-question"}))?),
             _=>None,
         };
         if let Some(id) = known
@@ -2128,13 +2128,13 @@ impl Client {
                 conversation_id,
                 question_id,
             } => {
-                let body = json!({"type":"notification_acked","notification_id":format!("question:{conversation_id}:{question_id}"),"client_id":"inbox"});
+                let body = json!({"type":"notification_acked","notification_id":question_id,"client_id":"inbox-question"});
                 id = self.operation_id(&conversation_id, &body)?;
                 (
                     true,
                     "dismiss_question",
                     json!({"conversation_id":conversation_id,"question_id":question_id}),
-                    format!("question:{conversation_id}:{question_id}"),
+                    format!("question:{question_id}"),
                     Some((conversation_id, body)),
                 )
             }

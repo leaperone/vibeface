@@ -464,12 +464,13 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
         &net.network,
         "c",
         EventBody::NotificationAcked {
-            notification_id: inbox_question_notification_id("c", "q-1"),
-            client_id: INBOX_CLIENT.into(),
+            notification_id: "q-1".into(),
+            client_id: QUESTION_INBOX_CLIENT.into(),
             attestation: None,
         },
     )?;
     store.append_event(&net.a, &net.network, "c", receipt, vec![], 4)?;
+    assert!(!store.closed_in_inbox(&net.network, "q-1")?);
     assert_eq!(
         unanswered(&store, &net)?,
         vec!["q-1", "q-3"],

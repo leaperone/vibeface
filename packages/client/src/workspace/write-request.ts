@@ -6,7 +6,7 @@ import { record, text } from '../lib/node.ts'
 import { parseCreateBot, parseMessageRequest, parseWorkspaceCommand, avatar } from './model.ts'
 import { parseMemoryRequest } from './memory.ts'
 import { inputEventBody } from '../chat/protocol.ts'
-import { answerBody } from './questions.ts'
+import { answerBody, questionInboxKey } from './questions.ts'
 
 export type Attestation = { device_id: string; signature: string }
 export type StoredWorkspaceCommand = Exclude<WorkspaceCommand, { kind: 'post_channel_message' }> | (Omit<Extract<WorkspaceCommand, { kind: 'post_channel_message' }>, 'attachments'> & { attachments?: Extract<WorkspaceCommand, { kind: 'post_channel_message' }>['attachments'] })
@@ -91,7 +91,7 @@ export function writeBody(operation: WriteOperation, clientId: string): Record<s
     case 'control_schedule': return { type: 'schedule_controlled', schedule_id: operation.params.schedule_id, action: operation.params.action }
     case 'set_owner': return ownerBody(operation.params.scheduler_node, operation.params.epoch)
     case 'dismiss_work': return { type: 'notification_acked', notification_id: operation.params.work_id, client_id: 'inbox' }
-    case 'dismiss_question': return { type: 'notification_acked', notification_id: `question:${operation.params.conversation_id}:${operation.params.question_id}`, client_id: 'inbox' }
+    case 'dismiss_question': return { type: 'notification_acked', notification_id: operation.params.question_id, client_id: 'inbox-question' }
     case 'answer': return answerBody(operation.params.question_id, operation.params.text)
     case 'resolve': return { type: 'work_finished', work_id: operation.params.check_id.slice(5), outcome: operation.params.outcome, result_text: operation.params.note }
   }
@@ -111,7 +111,7 @@ export function writeKeySuffix(operation: WriteOperation): string {
     case 'control_schedule': return `schedule:${operation.params.schedule_id}:${operation.params.action}`
     case 'set_owner': return `owner:${operation.params.conversation_id}:${operation.params.epoch}`
     case 'dismiss_work': return `dismiss:${operation.params.work_id}`
-    case 'dismiss_question': return `dismiss-question:${operation.params.conversation_id}:${operation.params.question_id}`
+    case 'dismiss_question': return `dismiss-question:${questionInboxKey(operation.params.conversation_id, operation.params.question_id)}`
     case 'answer': return `answer:${operation.params.question_id}`
     case 'resolve': return `resolve:${operation.params.check_id}`
   }

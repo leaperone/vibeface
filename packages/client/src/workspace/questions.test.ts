@@ -72,7 +72,6 @@ test("only ordinary questions can receive a private list receipt", () => {
   assert.equal(questionInboxDismissible(parsed({ about: { ...about, request_id: "request" } })), false)
   assert.equal(questionInboxDismissible(parsed({ attention: { kind: "approval", device_id: "worker" } })), false)
   assert.equal(questionInboxDismissible(parsed({ choices: [{ label: "允许", action: "allow_once" }] })), false)
-  assert.equal(questionInboxKey("chat", "q"), questionInboxKey("chat", "q"))
   assert.notEqual(questionInboxKey("chat", "q"), questionInboxKey("other", "q"))
 })
 

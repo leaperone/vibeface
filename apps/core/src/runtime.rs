@@ -1602,13 +1602,17 @@ impl Runtime {
                         && !approval_choice,
                     "挂起的审批不能从待处理中清除"
                 );
-                let notification_id = inbox_question_notification_id(&query_scope, &question_id);
+                let notification_id = question_id;
                 let readback_id = notification_id.clone();
                 let query_network = network.to_owned();
                 let already = self
                     .store
                     .call("dismiss_question_readback", move |store| {
-                        store.notification_acked(&query_network, &readback_id, INBOX_CLIENT)
+                        store.notification_acked(
+                            &query_network,
+                            &readback_id,
+                            QUESTION_INBOX_CLIENT,
+                        )
                     })
                     .await?;
                 if already {
@@ -1619,7 +1623,7 @@ impl Runtime {
                     &query_scope,
                     EventBody::NotificationAcked {
                         notification_id,
-                        client_id: INBOX_CLIENT.into(),
+                        client_id: QUESTION_INBOX_CLIENT.into(),
                         attestation: Some(attestation(input)?),
                     },
                 )
@@ -1630,6 +1634,10 @@ impl Runtime {
                 ensure!(access.is_user(), "only clients acknowledge notifications");
                 let notification = id(input, "notification_id")?;
                 let client = id(input, "client_id")?;
+                ensure!(
+                    client != QUESTION_INBOX_CLIENT,
+                    "reserved question inbox receipt"
+                );
                 let query_network = network.to_owned();
                 let query_client = client.clone();
                 let pending = self
