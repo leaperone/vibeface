@@ -109,10 +109,6 @@ export function joinCommit(joiner: string, joinerNonce: string): string /*throws
     }
     }
 
-/**
- * Opens one client stream to the Node `device_id` at `addrs` (`ip:port`); dialing it, not
- * binding this device's endpoint the first time, must finish within `timeout_ms`.
- */
 export async function lanConnect(deviceId: string, addrs: Array<string>, timeoutMs: number, asyncOpts_?: { signal: AbortSignal }): Promise<LanStreamLike> /*throws*/ {
     const __stack = uniffiIsDebug ? new Error().stack : undefined;
     try {
@@ -144,9 +140,6 @@ export async function lanConnect(deviceId: string, addrs: Array<string>, timeout
     }
     }
 
-/**
- * Binds this device's endpoint ahead of the first dial, which then spends its time dialing.
- */
 export async function lanPrepare(asyncOpts_?: { signal: AbortSignal }): Promise<void> /*throws*/ {
     const __stack = uniffiIsDebug ? new Error().stack : undefined;
     try {
@@ -327,9 +320,6 @@ export function verifyMembership(stateJson: string, expectedNetwork: string, now
     ));
     }
 
-/**
- * A frame from the Node: binary frames carry Noise, a text frame is a refusal.
- */
 export type LanFrame = {
     text: boolean,
     data: ArrayBuffer
@@ -1034,9 +1024,6 @@ const FfiConverterTypeIdentity = new FfiConverterObject(uniffiTypeIdentityObject
 export type LanStreamLike = LanStream;
 
 
-/**
- * One client stream to a Node. Frames go out in call order; the Node's pings are answered here.
- */
 export class LanStream extends UniffiAbstractObject {
 
     readonly [uniffiTypeNameSymbol] = "LanStream";
@@ -1422,10 +1409,10 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_join_commit() !== 48575) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_join_commit");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 2627) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 36822) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_connect");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare() !== 35893) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare() !== 44721) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_prepare");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches() !== 57767) {
