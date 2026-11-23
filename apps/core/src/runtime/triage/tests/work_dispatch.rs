@@ -698,8 +698,7 @@ async fn sends_reach_the_users_own_codex_only_for_threads_found_there() -> Resul
 }
 
 #[tokio::test]
-async fn invalid_dispatch_paths_are_definite_refusals_but_root_io_stays_unknown() -> Result<()>
-{
+async fn invalid_dispatch_paths_are_definite_refusals_but_root_io_stays_unknown() -> Result<()> {
     use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
     with_node(async |node, admin, dir| {
         with_agent(&node);
