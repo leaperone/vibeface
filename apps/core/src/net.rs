@@ -1089,7 +1089,13 @@ pub async fn spawn_relay(
     let mut relay =
         iroh_relay::server::RelayConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     relay.access = access;
-    relay.limits.client_rx = rate.map(iroh_relay::server::ClientRateLimit::new);
+    relay.limits.client_rx = rate.map(|rate| {
+        let mut limit = iroh_relay::server::ClientRateLimit::new(rate);
+        // Keep the burst explicit for the official relay. The iroh default is rate / 10,
+        // which gives a 4 MiB/s connection a bounded burst of about 400 KiB.
+        limit.max_burst_bytes = NonZeroU32::new((rate.get() / 10).max(1));
+        limit
+    });
     let mut config = iroh_relay::server::ServerConfig::default();
     config.relay = Some(relay);
     let server = iroh_relay::server::Server::spawn(config)
