@@ -39,6 +39,8 @@ const STATE_EVENTS: &[&str] = &[
     "work.state",
     "work.stalled",
     "work.recovered",
+    "work.looping",
+    "work.loop_ended",
     "app_server.unresponsive",
     "app_server.recovered",
     "sync.stalled",

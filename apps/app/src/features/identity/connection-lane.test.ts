@@ -68,6 +68,8 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
 } = {}) {
   const hooks = hookHarness(true), { effects, afterRender } = hooks
   const timers = new Map<number, () => void>()
+  const timerDelays = new Map<number, number | undefined>()
+  const foregroundListeners = new Set<() => void>()
   const stored = storage, calls: string[] = [], navigations: string[] = []
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
@@ -128,10 +130,11 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
       options.signal?.addEventListener('abort', close)
       const opening = holds.get(candidate.kind === 'lan' ? 'open' : `open:${candidate.address}`) ?? holds.get('open')
       if (opening) await opening.promise
-      return { deviceId: candidate.device_id, close, idle: () => true, async request(method: string, params: Record<string, unknown> = {}) {
+      return { deviceId: candidate.device_id, close, idle: () => true, async request(method: string, params: Record<string, unknown> = {}, onSent?: () => void) {
         if (method === 'log') return { accepted: 1 }
         calls.push(method)
         requests.push({ method, params })
+        onSent?.()
         if (holds.has(method)) {
           const result = await holds.get(method)?.promise
           if (method === 'recover') { initialized = true; authorized = true }
@@ -168,7 +171,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     sealPackage: () => new Uint8Array([1, 2, 3]),
     verifyState: (state: unknown = directory.state) => ({ free() {}, viewJson: () => JSON.stringify(views.get(state) ?? directory.view), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: (_root: unknown, _next: string, members: string) => JSON.stringify(recoveryCheckpointFixture(JSON.parse(members))), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
-  const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
+  const timer = (run: () => void, delay?: number) => { const id = ++nextTimer; timers.set(id, run); timerDelays.set(id, delay); return id }
   const sandbox = createContext({
     Date,
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
@@ -206,6 +209,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   })
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
+    onForeground(listener: () => void) { foregroundListeners.add(listener); return () => { foregroundListeners.delete(listener) } },
     lan: undefined as Platform['lan'], foreground: () => true,
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: {
@@ -224,7 +228,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, platform, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, platform, foreground() { foregroundListeners.forEach(listener => listener()) }, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, timerDelays, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -2242,6 +2246,83 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.verifications(), 2)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+for (const responseError of [false, true]) test(`foreground events share one probe and keep a responsive connection${responseError ? ' even when the Node returns an error' : ''}`, async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const previous = app.render().ready
+    const before = app.calls.length
+    const reply = deferred(); app.holds.set('info', reply)
+    app.foreground(); app.foreground(); app.foreground()
+    assert.deepEqual(app.calls.slice(before), ['info'])
+    assert.equal(app.timers.size, 1)
+    if (responseError) reply.reject(Object.assign(new Error('read refused'), { responded: true }))
+    else reply.resolve({ device_id: target })
+    await settle()
+    assert.equal(app.render().ready, previous)
+    assert.equal(app.timers.size, 0)
+    assert.equal(app.sockets.length, 1)
+    app.foreground()
+    await settle()
+    assert.deepEqual(app.calls.slice(before), ['info', 'info'], 'a later foreground event probes the same generation again')
+  } finally { app.close() }
+  const calls = app.calls.length
+  app.foreground()
+  assert.equal(app.calls.length, calls, 'unmount removes the foreground listener')
+})
+
+test('a foreground probe closes a half-open channel before the ordinary read deadline and reconnects', async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const previous = app.render().ready?.generation
+    const reply = deferred(); app.holds.set('info', reply)
+    app.foreground(); app.foreground()
+    const [id, expire] = [...app.timers.entries()][0]
+    assert.equal(app.timerDelays.get(id), 5000)
+    app.timers.delete(id); expire()
+    assert.equal(app.render().phase, 'reconnecting')
+    assert.equal(app.render().ready?.isCurrent(), false)
+    assert.match(app.render().error, /先确认结果/)
+    app.holds.delete('info')
+    app.foreground()
+    const [retryId, retry] = [...app.timers.entries()][0]
+    assert.equal(app.timerDelays.get(retryId), 0, 'foreground skips the reconnect backoff')
+    app.timers.delete(retryId); retry(); await settle()
+    assert.notEqual(app.render().ready?.generation, previous)
+    assert.equal(app.render().ready?.isCurrent(), true)
+    assert.equal(app.sockets.length, 2)
+    reply.resolve({ device_id: target }); await settle()
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+for (const result of ['success', 'failure', 'timeout']) test(`a foreground probe's late ${result} cannot close or clear a new generation's probe`, async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const stale = deferred(); app.holds.set('info', stale)
+    app.foreground()
+    const [id, expire] = [...app.timers.entries()][0]
+    app.holds.delete('info')
+    await app.render().connect({ ...entry, device_id: remote })
+    const current = app.render().ready
+    const fresh = deferred(); app.holds.set('info', fresh)
+    app.foreground()
+    const calls = app.calls.length
+    if (result === 'success') stale.resolve({ device_id: target })
+    else if (result === 'failure') stale.reject(new Error('old connection failed'))
+    else { app.timers.delete(id); expire() }
+    await settle()
+    app.foreground()
+    assert.equal(app.calls.length, calls, 'the current generation still has just one probe')
+    assert.equal(app.render().ready, current)
+    assert.equal(current?.isCurrent(), true)
+    fresh.resolve({ device_id: remote }); await settle()
     assert.equal(app.timers.size, 0)
   } finally { app.close() }
 })

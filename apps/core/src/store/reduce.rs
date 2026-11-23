@@ -220,6 +220,9 @@ pub(crate) fn apply(
             )?;
         }
         EventBody::WorkProgress {
+            subagent: Some(_), ..
+        } => {}
+        EventBody::WorkProgress {
             work_id,
             thread_id,
             turn_id,

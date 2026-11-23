@@ -1,18 +1,23 @@
-//! Health checks a Node runs on itself every minute: a running work with no progress, an App
-//! Server that stops answering, a reachable peer whose sync stalls. A problem begins once two
-//! rounds in a row find it; it is logged when it begins and when it ends, never in between, and
+//! Health checks a Node runs on itself every minute: a running work with no progress or repeated
+//! tools, an App Server that stops answering, a reachable peer whose sync stalls. Two rounds in
+//! a row open a problem; it is logged when it begins and when it ends, never in between, and
 //! a new one goes to the primary bot once when this Node schedules that bot. Nothing here
 //! restarts a process or sends a write again.
 use super::*;
 use crate::logging::{Filter, Level, Source};
 use crate::store::bot_settings::PrimaryReminder;
 use crate::work::WorkState;
+use std::collections::VecDeque;
 
 const INTERVAL: Duration = Duration::from_secs(60);
 /// A longer gap between rounds means the computer slept: that round only resets the baseline.
 const ASLEEP_MS: i64 = 3 * INTERVAL.as_millis() as i64;
 /// ponytail: one fixed limit; per-provider limits if long silent turns trip it.
 const WORK_STALL_MS: i64 = 10 * 60_000;
+const TOOL_WINDOW_MS: i64 = 5 * 60_000;
+const TOOL_REPEAT_LIMIT: usize = 6;
+const MAX_TOOL_WORKS: usize = 128;
+const MAX_TOOL_BYTES: usize = 64 * 1024;
 /// Ten hello rounds (`peers::HELLO_INTERVAL`) without a finished sync.
 const SYNC_STALL_MS: i64 = 10 * 60_000;
 /// ponytail: at most 10 s per probe, so one round stays under its minute.
@@ -28,6 +33,7 @@ pub(crate) const MAX_LOG_READ: usize = 200;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Check {
     WorkStalled,
+    WorkLooping,
     AppServerUnresponsive,
     SyncStalled,
 }
@@ -36,6 +42,7 @@ impl Check {
     fn began(self) -> &'static str {
         match self {
             Self::WorkStalled => "work.stalled",
+            Self::WorkLooping => "work.looping",
             Self::AppServerUnresponsive => "app_server.unresponsive",
             Self::SyncStalled => "sync.stalled",
         }
@@ -44,6 +51,7 @@ impl Check {
     fn ended(self) -> &'static str {
         match self {
             Self::WorkStalled => "work.recovered",
+            Self::WorkLooping => "work.loop_ended",
             Self::AppServerUnresponsive => "app_server.recovered",
             Self::SyncStalled => "sync.recovered",
         }
@@ -52,6 +60,7 @@ impl Check {
     fn summary(self) -> &'static str {
         match self {
             Self::WorkStalled => "a running work shows no progress",
+            Self::WorkLooping => "a running work repeats tool results or explicit failures",
             Self::AppServerUnresponsive => "the Codex App Server does not answer",
             Self::SyncStalled => "a reachable peer stopped syncing",
         }
@@ -60,6 +69,7 @@ impl Check {
     fn title(self) -> &'static str {
         match self {
             Self::WorkStalled => "运行中的工作长时间没有进展",
+            Self::WorkLooping => "运行中的工作疑似重复调用工具或连续失败",
             Self::AppServerUnresponsive => "Codex App Server 没有响应",
             Self::SyncStalled => "对端可以连通，但同步停滞",
         }
@@ -92,6 +102,125 @@ impl Problem {
     }
 }
 
+struct ToolCompletion {
+    id: String,
+    fingerprint: Option<String>,
+    failed: bool,
+    at_ms: i64,
+}
+
+impl ToolCompletion {
+    /// Only complete native results count; progress, reasoning and tool labels prove no loop.
+    fn codex(event: &Value, at_ms: i64) -> Option<Self> {
+        if event["method"] != "item/completed" {
+            return None;
+        }
+        let item = &event["params"]["item"];
+        let kind = item["type"].as_str()?;
+        if !matches!(
+            kind,
+            "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange"
+        ) {
+            return None;
+        }
+        let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+        let failed = item["status"] == "failed"
+            || item["exitCode"].as_i64().is_some_and(|code| code != 0)
+            || item["success"] == false
+            || item["result"]["isError"] == true
+            || !item["error"].is_null();
+        let evidence = match kind {
+            "commandExecution"
+                if item["command"].is_string()
+                    && item["aggregatedOutput"].is_string()
+                    && item["exitCode"].is_i64() =>
+            {
+                Some((
+                    &item["command"],
+                    &item["cwd"],
+                    &item["aggregatedOutput"],
+                    &item["exitCode"],
+                ))
+            }
+            "mcpToolCall"
+                if item["tool"].is_string()
+                    && !item["arguments"].is_null()
+                    && !item["result"].is_null() =>
+            {
+                Some((
+                    &item["tool"],
+                    &item["server"],
+                    &item["arguments"],
+                    &item["result"],
+                ))
+            }
+            "dynamicToolCall"
+                if item["tool"].is_string()
+                    && !item["arguments"].is_null()
+                    && item["success"].is_boolean()
+                    && item["contentItems"].is_array() =>
+            {
+                Some((
+                    &item["tool"],
+                    &item["arguments"],
+                    &item["contentItems"],
+                    &item["success"],
+                ))
+            }
+            _ => None,
+        };
+        // Large or incomplete results can prove failure, but never equality by truncation.
+        let fingerprint = evidence
+            .filter(|_| vibeface_bridge::transport::value_bytes(item) <= MAX_TOOL_BYTES)
+            .map(|evidence| {
+                crate::crypto::digest(
+                    &serde_json::to_vec(&(kind, failed, evidence)).expect("tool evidence"),
+                )
+            });
+        Some(Self {
+            id: crate::crypto::digest(id.as_bytes()),
+            fingerprint,
+            failed,
+            at_ms,
+        })
+    }
+}
+
+struct ToolHistory {
+    turn: String,
+    completions: VecDeque<ToolCompletion>,
+}
+
+impl ToolHistory {
+    fn prune(&mut self, now: i64) {
+        self.completions
+            .retain(|completion| now - completion.at_ms <= TOOL_WINDOW_MS);
+    }
+
+    fn repeated(&self) -> Option<(i64, &'static str)> {
+        if self.completions.len() < TOOL_REPEAT_LIMIT {
+            return None;
+        }
+        let last = self.completions.back()?;
+        let repeated = last.fingerprint.as_ref().is_some_and(|fingerprint| {
+            self.completions
+                .iter()
+                .all(|completion| completion.fingerprint.as_ref() == Some(fingerprint))
+        });
+        let failures = self.completions.iter().all(|completion| completion.failed);
+        (repeated || failures).then(|| {
+            (
+                self.completions.front().expect("completions").at_ms,
+                if failures {
+                    "consecutive explicit tool failures"
+                } else {
+                    "identical tool calls and results"
+                },
+            )
+        })
+    }
+}
+
 pub(crate) struct HealthState {
     /// When this Node started or last woke from sleep; nothing stalls from before it.
     baseline_ms: i64,
@@ -101,6 +230,8 @@ pub(crate) struct HealthState {
     pending: BTreeSet<ProblemKey>,
     /// The last progress event of each running work.
     progress: HashMap<String, i64>,
+    /// Private digests only; no arguments or outputs enter health, logs or shared history.
+    tools: HashMap<String, ToolHistory>,
     /// When the App Server's current run of missed probes began.
     app_server_missed: Option<i64>,
     /// Problems handed to the primary bot within the last day.
@@ -115,6 +246,7 @@ impl HealthState {
             problems: BTreeMap::new(),
             pending: BTreeSet::new(),
             progress: HashMap::new(),
+            tools: HashMap::new(),
             app_server_missed: None,
             handed: Vec::new(),
         }
@@ -122,6 +254,48 @@ impl HealthState {
 
     pub(crate) fn progressed(&mut self, work_id: &str, at_ms: i64) {
         self.progress.insert(work_id.to_owned(), at_ms);
+    }
+
+    fn observed_tool(&mut self, work_id: &str, event: &Value, now: i64) {
+        let Some(completion) = ToolCompletion::codex(event, now) else {
+            return;
+        };
+        let Some(turn) = event["params"]["turnId"]
+            .as_str()
+            .filter(|turn| !turn.is_empty())
+        else {
+            return;
+        };
+        self.tools.retain(|_, history| {
+            history.prune(now);
+            !history.completions.is_empty()
+        });
+        if !self.tools.contains_key(work_id) && self.tools.len() >= MAX_TOOL_WORKS {
+            return;
+        }
+        let turn = crate::crypto::digest(turn.as_bytes());
+        let history = self
+            .tools
+            .entry(work_id.to_owned())
+            .or_insert_with(|| ToolHistory {
+                turn: turn.clone(),
+                completions: VecDeque::new(),
+            });
+        if history.turn != turn {
+            history.turn = turn;
+            history.completions.clear();
+        }
+        if history
+            .completions
+            .iter()
+            .any(|known| known.id == completion.id)
+        {
+            return;
+        }
+        history.completions.push_back(completion);
+        if history.completions.len() > TOOL_REPEAT_LIMIT {
+            history.completions.pop_front();
+        }
     }
 
     /// After a gap of over `ASLEEP_MS` since the last round, as when the computer slept, moves
@@ -132,6 +306,7 @@ impl HealthState {
             self.checked_ms = Some(now);
             self.baseline_ms = now;
             self.pending.clear();
+            self.tools.clear();
             self.app_server_missed = None;
         }
         asleep
@@ -214,11 +389,11 @@ impl HealthState {
 /// Runs of works that are past `WORK_STALL_MS` since their last progress.
 fn stalled_works(
     state: &mut HealthState,
-    records: Vec<crate::work::WorkRecord>,
+    records: &[crate::work::WorkRecord],
     now: i64,
 ) -> Vec<Problem> {
     let running: Vec<_> = records
-        .into_iter()
+        .iter()
         .filter(|record| matches!(record.state, WorkState::Running { .. }))
         .collect();
     state
@@ -241,9 +416,43 @@ fn stalled_works(
                     WORK_STALL_MS / 60_000,
                     record.state.thread().unwrap_or_default()
                 ),
-                subject: record.work_id,
+                subject: record.work_id.clone(),
                 since_ms: last,
-                conversation_id: Some(record.conversation),
+                conversation_id: Some(record.conversation.clone()),
+            })
+        })
+        .collect()
+}
+
+fn looping_works(
+    state: &mut HealthState,
+    records: &[crate::work::WorkRecord],
+    now: i64,
+) -> Vec<Problem> {
+    state.tools.retain(|work_id, history| {
+        history.prune(now);
+        !history.completions.is_empty()
+            && records.iter().any(|record| {
+                &record.work_id == work_id
+                    && matches!(record.state, WorkState::Running { .. })
+                    && record.state.handle().is_some_and(|handle| {
+                        crate::crypto::digest(handle.turn_id.as_bytes()) == history.turn
+                    })
+            })
+    });
+    records
+        .iter()
+        .filter_map(|record| {
+            let (since_ms, detail) = state.tools.get(&record.work_id)?.repeated()?;
+            Some(Problem {
+                check: Check::WorkLooping,
+                subject: record.work_id.clone(),
+                since_ms,
+                detail: format!(
+                    "{TOOL_REPEAT_LIMIT} {detail} within {} minutes; native Codex evidence",
+                    TOOL_WINDOW_MS / 60_000
+                ),
+                conversation_id: Some(record.conversation.clone()),
             })
         })
         .collect()
@@ -276,7 +485,7 @@ fn stalled_peers(
 fn record(problem: &Problem, began: bool) {
     let subject = problem.subject.as_str();
     let (work_id, peer) = match problem.check {
-        Check::WorkStalled => (Some(subject), None),
+        Check::WorkStalled | Check::WorkLooping => (Some(subject), None),
         Check::SyncStalled => (None, Some(subject)),
         Check::AppServerUnresponsive => (None, None),
     };
@@ -561,6 +770,13 @@ impl Runtime {
             .progressed(work_id, now_ms());
     }
 
+    pub(super) fn observe_work_tools(&self, work_id: &str, event: &Value) {
+        self.health
+            .lock()
+            .expect("health")
+            .observed_tool(work_id, event, now_ms());
+    }
+
     async fn check_health(self: &Arc<Self>) {
         let now = now_ms();
         if self.health.lock().expect("health").woke(now) {
@@ -575,12 +791,10 @@ impl Runtime {
             .await
         {
             Ok(records) => {
-                ran.push(Check::WorkStalled);
-                found.extend(stalled_works(
-                    &mut self.health.lock().expect("health"),
-                    records,
-                    now,
-                ));
+                ran.extend([Check::WorkStalled, Check::WorkLooping]);
+                let mut state = self.health.lock().expect("health");
+                found.extend(stalled_works(&mut state, &records, now));
+                found.extend(looping_works(&mut state, &records, now));
             }
             Err(error) => tracing::debug!(%error, "the work check waits for the next round"),
         }
@@ -770,11 +984,238 @@ mod tests {
         }
     }
 
-    const ALL: [Check; 3] = [
+    const ALL: [Check; 4] = [
         Check::WorkStalled,
+        Check::WorkLooping,
         Check::AppServerUnresponsive,
         Check::SyncStalled,
     ];
+
+    fn tool_event(id: usize, command: &str, output: &str, exit: i64) -> Value {
+        json!({"method":"item/completed","params":{"turnId":"turn","item":{
+            "id":format!("tool-{id}"),"type":"commandExecution","status":"completed",
+            "command":command,"cwd":"/private/fixture","aggregatedOutput":output,"exitCode":exit
+        }}})
+    }
+
+    fn running_work() -> crate::work::WorkRecord {
+        crate::work::WorkRecord {
+            work_id: "work".into(),
+            conversation: "conversation".into(),
+            kind: WorkKind::Agent(Provider::Codex),
+            state: WorkState::Running {
+                handle: crate::work::Handle {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    epoch: 0,
+                },
+            },
+            text: String::new(),
+            send_by_ms: 0,
+            progress: String::new(),
+            progress_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn repeated_tools_alert_despite_progress_and_reuse_confirmation_recovery_and_cooldown() {
+        let mut state = HealthState::new(0);
+        let records = [running_work()];
+        for index in 0..TOOL_REPEAT_LIMIT {
+            state.observed_tool(
+                "work",
+                &tool_event(index, "secret-command", "private-result", 0),
+                index as i64,
+            );
+            state.progressed("work", index as i64);
+        }
+        let found = looping_works(&mut state, &records, 60_000);
+        assert_eq!(found.len(), 1);
+        assert!(stalled_works(&mut state, &records, 60_000).is_empty());
+        assert!(state.update(&ALL, found, 60_000).0.is_empty());
+        state.progressed("work", 120_000);
+        let found = looping_works(&mut state, &records, 120_000);
+        let (began, ended) = state.update(&ALL, found, 120_000);
+        assert_eq!((began.len(), ended.len()), (1, 0));
+        let problem = &began[0];
+        assert_eq!((problem.check, problem.since_ms), (Check::WorkLooping, 0));
+        assert_eq!(problem.conversation_id.as_deref(), Some("conversation"));
+        let rendered = serde_json::to_string(problem).unwrap();
+        assert!(!rendered.contains("secret-command") && !rendered.contains("private-result"));
+        assert!(state.may_hand(&problem.key(), 120_000));
+        state.handed(&problem.key(), 120_000);
+        assert!(!state.may_hand(&problem.key(), 120_001));
+        state.observed_tool(
+            "work",
+            &tool_event(TOOL_REPEAT_LIMIT, "changed", "new result", 0),
+            120_001,
+        );
+        let found = looping_works(&mut state, &records, 120_001);
+        assert!(found.is_empty());
+        assert_eq!(state.update(&ALL, found, 120_001).1.len(), 1);
+    }
+
+    #[test]
+    fn explicit_tool_failures_count_with_different_or_oversized_results() {
+        let mut state = HealthState::new(0);
+        for index in 0..TOOL_REPEAT_LIMIT {
+            let event = tool_event(
+                index,
+                &format!("call-{index}"),
+                &"x".repeat(MAX_TOOL_BYTES),
+                1,
+            );
+            assert!(
+                ToolCompletion::codex(&event, 0)
+                    .unwrap()
+                    .fingerprint
+                    .is_none()
+            );
+            state.observed_tool("work", &event, 0);
+        }
+        let found = looping_works(&mut state, &[running_work()], 60_000);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].detail.contains("explicit tool failures"));
+        state.observed_tool(
+            "work",
+            &tool_event(TOOL_REPEAT_LIMIT, "next", "unknown", 0),
+            60_001,
+        );
+        assert!(looping_works(&mut state, &[running_work()], 60_001).is_empty());
+    }
+
+    #[test]
+    fn tool_labels_missing_evidence_duplicates_and_changing_results_do_not_prove_a_loop() {
+        for mode in [
+            "duplicate",
+            "changed output",
+            "changed call",
+            "incomplete",
+            "progress",
+        ] {
+            let mut state = HealthState::new(0);
+            for index in 0..TOOL_REPEAT_LIMIT {
+                let mut event = tool_event(
+                    if mode == "duplicate" { 0 } else { index },
+                    "call",
+                    "result",
+                    0,
+                );
+                match mode {
+                    "changed output" => {
+                        event["params"]["item"]["aggregatedOutput"] =
+                            json!(format!("result-{index}"))
+                    }
+                    "changed call" => {
+                        event["params"]["item"]["command"] = json!(format!("call-{index}"))
+                    }
+                    "incomplete" => {
+                        event["params"]["item"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("aggregatedOutput");
+                    }
+                    "progress" => event["method"] = json!("item/started"),
+                    _ => {}
+                }
+                state.observed_tool("work", &event, index as i64);
+            }
+            assert!(
+                looping_works(&mut state, &[running_work()], 60_000).is_empty(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_observations_are_bounded_and_reset_after_sleep_expiry_turn_change_or_work_end() {
+        let mut state = HealthState::new(0);
+        for work in 0..MAX_TOOL_WORKS + 1 {
+            for index in 0..TOOL_REPEAT_LIMIT + 1 {
+                state.observed_tool(
+                    &format!("work-{work}"),
+                    &tool_event(index, "call", "result", 0),
+                    0,
+                );
+            }
+        }
+        assert_eq!(state.tools.len(), MAX_TOOL_WORKS);
+        assert!(
+            state
+                .tools
+                .values()
+                .all(|history| history.completions.len() == TOOL_REPEAT_LIMIT)
+        );
+        state.observed_tool(
+            "work",
+            &tool_event(0, "call", "result", 0),
+            TOOL_WINDOW_MS + 1,
+        );
+        assert_eq!(state.tools.len(), 1);
+        for index in 1..TOOL_REPEAT_LIMIT {
+            state.observed_tool(
+                "work",
+                &tool_event(index, "call", "result", 0),
+                TOOL_WINDOW_MS + 1,
+            );
+        }
+        let mut next = tool_event(TOOL_REPEAT_LIMIT, "call", "result", 0);
+        next["params"]["turnId"] = json!("next-turn");
+        state.observed_tool("work", &next, TOOL_WINDOW_MS + 2);
+        assert_eq!(state.tools["work"].completions.len(), 1);
+        assert!(looping_works(&mut state, &[running_work()], TOOL_WINDOW_MS + 2).is_empty());
+        assert!(state.tools.is_empty(), "a previous turn is removed");
+        state.observed_tool(
+            "work",
+            &tool_event(0, "call", "result", 0),
+            TOOL_WINDOW_MS + 2,
+        );
+        assert!(looping_works(&mut state, &[], TOOL_WINDOW_MS + 2).is_empty());
+        assert!(state.tools.is_empty(), "an ended work is removed");
+        state.observed_tool(
+            "work",
+            &tool_event(0, "call", "result", 0),
+            TOOL_WINDOW_MS + 2,
+        );
+        state.checked_ms = Some(TOOL_WINDOW_MS + 2);
+        assert!(state.woke(TOOL_WINDOW_MS + 3 + ASLEEP_MS));
+        assert!(state.tools.is_empty());
+    }
+
+    #[test]
+    fn native_tool_evidence_ignores_identity_and_timing_but_keeps_inputs_and_results() {
+        for item in [
+            json!({"type":"mcpToolCall","id":"first","server":"fixture","tool":"lookup",
+                "arguments":{"q":"private"},"result":{"content":[{"text":"result"}]}}),
+            json!({"type":"dynamicToolCall","id":"first","tool":"lookup",
+                "arguments":{"q":"private"},"success":true,"contentItems":[{"text":"result"}]}),
+        ] {
+            let mut event =
+                json!({"method":"item/completed","params":{"turnId":"turn","item":item}});
+            let first = ToolCompletion::codex(&event, 0).unwrap();
+            assert!(first.fingerprint.is_some());
+            event["params"]["item"]["id"] = json!("second");
+            event["params"]["item"]["durationMs"] = json!(500);
+            let next = ToolCompletion::codex(&event, 1).unwrap();
+            assert_eq!(first.fingerprint, next.fingerprint);
+            assert_ne!(first.id, next.id);
+            event["params"]["item"]["arguments"]["q"] = json!("changed");
+            assert_ne!(
+                first.fingerprint,
+                ToolCompletion::codex(&event, 1).unwrap().fingerprint
+            );
+        }
+        for item in [
+            json!({"type":"fileChange","status":"failed"}),
+            json!({"type":"dynamicToolCall","success":false}),
+            json!({"type":"mcpToolCall","result":{"isError":true}}),
+            json!({"type":"mcpToolCall","error":{"message":"private error"}}),
+        ] {
+            let mut event = json!({"method":"item/completed","params":{"item":item}});
+            event["params"]["item"]["id"] = json!("tool");
+            assert!(ToolCompletion::codex(&event, 0).unwrap().failed);
+        }
+    }
 
     #[test]
     fn a_problem_begins_after_two_rounds_and_ends_once() {

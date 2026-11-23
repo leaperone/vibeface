@@ -51,13 +51,16 @@ Peer: device-b (51be…) unreachable, unknown path, RTT unknown, synced 1830s ag
 vibeface health
 ```
 
-Node 每分钟检查三件事。连续两轮都发现才算问题出现，只在问题出现和消失时各记一条日志：
+Node 每分钟检查以下问题。连续两轮都发现才算问题出现，只在问题出现和消失时各记一条日志：
 
 | 检查 | 出现 | 消失 | 条件 |
 |---|---|---|---|
 | `work_stalled` | `work.stalled`（warn） | `work.recovered` | 运行中的工作超过 10 分钟没有任何进展事件，带 `work_id`、`conversation_id` |
+| `work_looping` | `work.looping`（warn） | `work.loop_ended` | 运行中的 Codex 工作在最近 5 分钟连续完成 6 次相同调用和相同结果，或连续 6 次明确工具失败；普通进度不会清除证据。重复通知不计数，换轮或窗口过期后重置。只保存有界摘要，参数和原始结果不进入健康状态或日志；不自动中断或重试 |
 | `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 在 10 秒内没有回应只读探测；不重启、不重发。App Server 未连接时这一轮不检查，保持上一轮的结论 |
 | `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 对端可连通但最近一次同步完成已超过 10 分钟，带 `peer` |
+
+循环检测比较 Codex 命令、MCP 和动态工具的完整调用与结果；文件变更只统计明确失败。缺少完整结果或本机证据超过 64 KiB 时不比较相等，仍可统计明确失败。其他 Provider 保留原有停滞检查。
 
 两轮之间隔了 3 分钟以上（例如电脑睡眠后醒来）时，这一轮不下结论：工作进展和同步的计时都从此刻重新开始，上一轮的发现不再算数。
 
@@ -146,7 +149,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `agent.tool`、`agent.tool_failed` | 协调 Agent 调用的工具 |
 | `codex.call`、`codex.call_failed` | Agent 经命令行向 Codex App Server 发的请求 |
 | `codex.app_server.stderr` | Codex App Server 的标准错误 |
-| `work.stalled`、`app_server.unresponsive`、`sync.stalled` 及对应 `*.recovered` | 健康检查发现和解除的问题，见上文“看健康检查” |
+| `work.stalled`、`work.looping`、`app_server.unresponsive`、`sync.stalled` 及对应恢复事件 | 健康检查发现和解除的问题，见上文“看健康检查” |
 | `health.handed`、`health.handoff_limited`、`health.no_primary_bot`、`health.not_owner`、`health.handoff_failed` | 新问题已交给主 Bot、被每小时或每天的上限挡下、没有主 Bot、主 Bot 由其他 Node 调度（带 `owner`），或提醒没写成 |
 
 写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、relay 令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。

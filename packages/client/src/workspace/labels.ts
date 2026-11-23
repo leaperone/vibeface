@@ -1,8 +1,13 @@
 import { type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { AgentLane, ContextProjection, MemoryEntry, NodeInfo, OverviewCoverage, OverviewTask, QueueHoldReason, ResolvedModel, SessionHandoff, WorkCard, WorkRecord } from "./types.ts"
+import type { AgentLane, ContextProjection, MemoryEntry, NodeInfo, OverviewCoverage, OverviewTask, QueueHoldReason, ResolvedModel, SessionHandoff, SubagentTool, SubagentUsage, WorkCard, WorkRecord } from "./types.ts"
 import { isJobState, type JobState } from "./types.ts"
+
+export const subagentToolLabels = { command: '执行命令', file_change: '修改文件', web_search: '检索网页', tool: '调用工具' } satisfies Record<SubagentTool['kind'], string>
+export function subagentUsageLabel(usage: SubagentUsage | null): string {
+  return `输入 ${usage?.input_tokens ?? '未知'} · 输出 ${usage?.output_tokens ?? '未知'} · 缓存写入 ${usage?.cache_creation_input_tokens ?? '未知'} · 缓存读取 ${usage?.cache_read_input_tokens ?? '未知'} token`
+}
 
 export const contextStages = {
   compiled: { label: '已编译', detail: '内容已准备，尚未确认 AI 开始执行。', tone: 'info' },

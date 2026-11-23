@@ -4,7 +4,7 @@ import { parseHttpOrigin } from './origin.ts'
 
 export type DeviceChannel = {
   deviceId: string
-  request(method: string, params?: Record<string, unknown>): Promise<unknown>
+  request(method: string, params?: Record<string, unknown>, onSent?: () => void): Promise<unknown>
   /** No request is waiting for its answer, so closing now leaves no outcome unknown. */
   idle(): boolean
   close(): void
@@ -340,7 +340,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     if (signal?.aborted) throw cancelled()
     requireSigningIdentity(me)
     const target = validTarget(entry.device_id)
-    type Reply = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
+    type Reply = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; onSent?: () => void }
     const pending = new Map<string, Reply & { read: boolean }>()
     const waitingReads: (Reply & { id: string; plaintext: Uint8Array })[] = []
     let activeReads = 0
@@ -379,7 +379,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       throw reason
     } finally { handshake?.free() }
     const open = channel, wire = carrier
-    function send(id: string, plaintext: Uint8Array, read: boolean, resolve: Reply['resolve'], reject: Reply['reject']) {
+    function send(id: string, plaintext: Uint8Array, read: boolean, resolve: Reply['resolve'], reject: Reply['reject'], onSent?: () => void) {
       if (read) activeReads++
       const timer = setTimeout(() => {
         pending.delete(id)
@@ -389,7 +389,8 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
         // connection instead of releasing its slot and exceeding the remote budget.
         if (read) wire.close(error)
       }, requestTimeoutMs)
-      pending.set(id, { resolve, reject, timer, read })
+      pending.set(id, { resolve, reject, timer, read, onSent })
+      onSent?.()
       try { for (const record of open.sealMessage(plaintext)) wire.send(record) }
       catch (error) { wire.close(error as Error) }
     }
@@ -397,7 +398,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
       while (!closed && activeReads < readCalls && waitingReads.length) {
         const item = waitingReads.shift()!
         clearTimeout(item.timer)
-        send(item.id, item.plaintext, true, item.resolve, item.reject)
+        send(item.id, item.plaintext, true, item.resolve, item.reject, item.onSent)
       }
     }
     void (async () => {
@@ -423,7 +424,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     })()
     return {
       deviceId: target,
-      request(method, params = {}) {
+      request(method, params = {}, onSent) {
         if (closed) return Promise.reject(disconnected())
         const read = isRead(method, params)
         if (read && activeReads >= readCalls && waitingReads.length >= queuedReads) return Promise.reject(Object.assign(new Error('等待读取的请求过多。稍后再读取。'), { code: 'client_overloaded' }))
@@ -431,13 +432,13 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
         return new Promise((resolve, reject) => {
           // Snapshot params now; seal only when sent to preserve Noise frame order.
           const plaintext = encoder.encode(JSON.stringify({ id, method, params }))
-          if (!read || activeReads < readCalls) { send(id, plaintext, read, resolve, reject); return }
+          if (!read || activeReads < readCalls) { send(id, plaintext, read, resolve, reject, onSent); return }
           const timer = setTimeout(() => {
             const index = waitingReads.findIndex(item => item.id === id)
             if (index !== -1) waitingReads.splice(index, 1)
             reject(new Error('等待读取超时，这次读取尚未发出。稍后再读取。'))
           }, requestTimeoutMs)
-          waitingReads.push({ id, plaintext, resolve, reject, timer })
+          waitingReads.push({ id, plaintext, resolve, reject, timer, onSent })
         })
       },
       idle: () => pending.size === 0 && waitingReads.length === 0,

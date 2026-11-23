@@ -291,7 +291,9 @@ pub(crate) fn task_work_signal<'a>(
     let signal = match change {
         TaskJobChange::Ended { outcome, text } => {
             let (outcome, reason, failure) = match outcome {
-                JobOutcome::Completed => (WorkOutcome::Completed, None, None),
+                JobOutcome::Completed | JobOutcome::NoChange => {
+                    (WorkOutcome::Completed, None, None)
+                }
                 JobOutcome::Failed(failure) => (
                     WorkOutcome::Failed,
                     Some(failure.detail.clone()),
@@ -813,6 +815,9 @@ pub struct StagedMemory {
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum JobOutcome {
     Completed,
+    /// A routine completed without a user-visible result. The scheduler records completion but
+    /// deliberately does not publish an empty chat reply.
+    NoChange,
     Failed(ExecFailure),
     Cancelled(String),
     /// `process_unconfirmed` records a pending check for the SDK process in the same transaction.
@@ -820,6 +825,16 @@ pub enum JobOutcome {
         failure: ExecFailure,
         process_unconfirmed: bool,
     },
+}
+
+impl JobOutcome {
+    pub(crate) fn completed_for(job: &SchedulerJob, text: &str) -> Self {
+        if matches!(job.scope, SessionScope::Routine { .. }) && text.trim().is_empty() {
+            Self::NoChange
+        } else {
+            Self::Completed
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

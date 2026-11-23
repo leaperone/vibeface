@@ -17,6 +17,7 @@ import { agentLaneLabels,fixOnDevice,fixOnDeviceLabel,followUp,followUpCopy,node
 import { workChecks,type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { projectName,workApproval } from "@vibeface/client/workspace/questions.ts"
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { subagentToolLabels, subagentUsageLabel } from '@vibeface/client/workspace/labels.ts'
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Bot,ChevronLeft,Circle,CircleCheck,CircleDot,CircleQuestionMark,CircleStop,FolderOpen,Laptop,Link2,ListChecks,Play,RotateCw,SearchCheck,Settings,X } from "lucide-react"
@@ -175,6 +176,12 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details> : null}
       {plan ? <Details label={`最近步骤摘要 · ${plan.length}`} open={taskActive(state)}><SummarySteps steps={plan} /></Details> : null}
       {taskActive(state) && (progressText || !plan && work.summary) ? <Details label="详细进展"><p className="max-h-[50dvh] overflow-auto whitespace-pre-wrap break-words text-sm">{progressText || work.summary || ""}</p></Details> : null}
+      {loaded?.subagents.length ? <Details label={`Claude 子代理 · ${loaded.subagents.length}`}><div className="grid gap-4">{loaded.subagents.map(({ attempt_id, progress }) => <section key={`${attempt_id}:${progress.parent_tool_use_id}`} className="grid gap-1 break-words text-sm">
+        <h3 className="font-medium">{taskLabel(progress.status)}</h3>
+        <p className="text-secondary">父调用 {progress.parent_tool_use_id} · 工作尝试 {attempt_id}</p>
+        <p>{subagentUsageLabel(progress.usage)}</p>
+        {progress.tools.map(tool => <p key={tool.tool_use_id}>{subagentToolLabels[tool.kind]} · {taskLabel(tool.status)}</p>)}
+      </section>)}</div></Details> : null}
       {asked.summary ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
       {check ? <section className="grid gap-3 rounded-panel border border-warning-border bg-warning-subtle p-3">

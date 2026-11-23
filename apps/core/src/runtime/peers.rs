@@ -109,6 +109,28 @@ impl PeerDeliveryLocks {
     }
 }
 
+#[derive(Default)]
+pub(super) struct BlobLocks {
+    hashes: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl BlobLocks {
+    fn for_hash(&self, hash: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut hashes = self.hashes.lock().expect("blob locks");
+        hashes.retain(|_, hash| hash.strong_count() > 0);
+        if let Some(lock) = hashes.get(hash).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        hashes.insert(hash.into(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub(super) async fn lock(&self, hash: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.for_hash(hash).lock_owned().await
+    }
+}
+
 /// `(author, seq, hash)` of a fork evidence event, the order the evidence is read in.
 type ForkKey = (String, u64, String);
 
@@ -2364,7 +2386,7 @@ impl Runtime {
     pub(crate) async fn fetch_blob(&self, network: &str, peer: &str, blob: &BlobRef) -> Result<()> {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(blob.size as usize <= MAX_BLOB_BYTES, "attachment too large");
-        let _download = self.blob_fetch.lock().await;
+        let _download = self.blob_locks.lock(&blob.hash).await;
         let (part, target, committed) = {
             let blob = blob.clone();
             self.store
@@ -2385,11 +2407,6 @@ impl Runtime {
         }
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
-        if !tokio::fs::try_exists(&part).await? {
-            let dir = dir.to_owned();
-            let size = blob.size;
-            tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
-        }
         let connection = self.net()?.connect(peer, net::BLOB).await?;
         let (mut send, mut recv) = connection
             .open_bi()
@@ -2407,13 +2424,33 @@ impl Runtime {
         if let Some(error) = header["error"].as_str() {
             bail!("{error}");
         }
+        {
+            let _room = self.staging_room_lock.lock().await;
+            let existing = tokio::fs::metadata(&part)
+                .await
+                .ok()
+                .map(|item| item.len())
+                .unwrap_or(0);
+            let dir = dir.to_owned();
+            let additional = blob.size.saturating_sub(existing);
+            let new_object = existing == 0;
+            tokio::task::spawn_blocking(move || staging_room_for(&dir, additional, new_object))
+                .await??;
+            let reserved = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&part)
+                .await?;
+            reserved.set_len(blob.size).await?;
+        }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(&part)
             .await?;
-        file.set_len(committed).await?;
+        file.set_len(blob.size).await?;
         file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
@@ -2486,7 +2523,7 @@ impl Runtime {
 }
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
-pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
+pub(super) fn staging_room_for(dir: &Path, size: u64, new_object: bool) -> Result<()> {
     let mut objects = 0;
     let mut bytes = size;
     for entry in std::fs::read_dir(dir)? {
@@ -2495,7 +2532,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
         bytes += metadata.len();
     }
     ensure!(
-        objects < MAX_STAGED_OBJECTS && bytes <= MAX_STAGED_BYTES,
+        (!new_object || objects < MAX_STAGED_OBJECTS) && bytes <= MAX_STAGED_BYTES,
         "attachment staging is full"
     );
     Ok(())

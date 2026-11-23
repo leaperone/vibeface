@@ -41,7 +41,7 @@ impl Runtime {
         let scope = id(input, "conversation_id")?;
         let work_id = id(input, "work_id")?;
         self.require_scope(access, &scope).await?;
-        let (work, target, sources) = {
+        let (work, target, sources, subagents) = {
             let network = access.network_id().to_owned();
             self.store
                 .call("chat_controls.work_detail", move |store| {
@@ -52,14 +52,17 @@ impl Runtime {
                     );
                     let target = store.work_input_target(&network, &scope, &work_id)?;
                     let sources = store.work_source_events(&network, &scope, &work_id)?;
-                    Ok((work, target, sources))
+                    let subagents = store.work_subagents(&network, &scope, &work_id)?;
+                    Ok((work, target, sources, subagents))
                 })
                 .await?
         };
         let mut value = serde_json::to_value(&work)?;
         value["target"] = json!(target);
         value["source_events"] = json!(sources);
-        Ok(json!({"work":value,"coverage":{"source":"shared_history","complete":false}}))
+        Ok(
+            json!({"work":value,"subagents":subagents,"coverage":{"source":"shared_history","complete":false}}),
+        )
     }
 
     async fn require_attachment_scope(&self, access: &Access, scope: &str) -> Result<()> {
@@ -143,7 +146,7 @@ impl Runtime {
             blob.size > 0 && blob.size as usize <= MAX_BLOB_BYTES,
             "attachment must be 1 byte to 64 MiB"
         );
-        let _upload = self.blob_fetch.lock().await;
+        let _upload = self.blob_locks.lock(&blob.hash).await;
         self.require_attachment_scope(access, scope).await?;
         let (part, target, committed) = {
             let hash = blob.hash.clone();
@@ -177,10 +180,27 @@ impl Runtime {
         );
         let dir = part.parent().context("partial directory")?;
         tokio::fs::create_dir_all(dir).await?;
-        if !tokio::fs::try_exists(&part).await? {
+        {
+            let _room = self.staging_room_lock.lock().await;
+            let existing = tokio::fs::metadata(&part)
+                .await
+                .ok()
+                .map(|item| item.len())
+                .unwrap_or(0);
             let dir = dir.to_owned();
-            tokio::task::spawn_blocking(move || super::peers::staging_room(&dir, blob.size))
-                .await??;
+            let additional = blob.size.saturating_sub(existing);
+            let new_object = existing == 0;
+            tokio::task::spawn_blocking(move || {
+                super::peers::staging_room_for(&dir, additional, new_object)
+            })
+            .await??;
+            let reserved = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&part)
+                .await?;
+            reserved.set_len(blob.size).await?;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -188,7 +208,7 @@ impl Runtime {
             .truncate(false)
             .open(&part)
             .await?;
-        file.set_len(committed).await?;
+        file.set_len(blob.size).await?;
         file.seek(std::io::SeekFrom::Start(committed)).await?;
         file.write_all(&data).await?;
         file.sync_data().await?;

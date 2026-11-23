@@ -8,7 +8,7 @@ import type {
   ConversationMemoryConflict, ConversationHistory, HistoryCoverage, HistoryPage, HistorySection, DeliveryRecord, AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionChoice, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, OpenWorkCard, WorkCard, SkillSet, SteerOutcome, Busy,
-  WorkPhase, WorkDetail, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
+  WorkPhase, WorkDetail, SubagentProgress, SubagentStatus, SubagentTool, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
   AgentLane, QueueHoldReason, ContextProjection, ManagerJob, ScopeJob, SentCoverage, MemoryConflict,
   InputTarget, InputIntent, InputReceipt, InputNotSaved, InputControlAction, QueuedInput, ScopeContext, SessionScope, WorkspaceChannel, WorkspaceTask, WorkspaceAssignment, WorkspaceCommand, WorkspaceCommandResult, WorkspaceCommandNotSaved, WorkspaceDomainState, WorkspaceHistory, WorkspaceHistoryBody, WorkspaceInputBody, WorkspaceSpeaker, MessageSearchScope, MessageSearchPage,
   NodeObservation, NodeReport, NodeSessionPath, SelectedNodePath,
@@ -312,7 +312,7 @@ function workspaceHistoryBody(value: unknown): WorkspaceHistoryBody {
     case 'workspace_commanded': return { type: data.type, command_id: text(data.command_id), command: parseWorkspaceCommand(data.command) }
     case 'message_posted': return { type: data.type, message_id: text(data.message_id), role: text(data.role), text: text(data.text), attachments: attachments(data.attachments), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure) }
     case 'work_dispatched': return { type: data.type, work_id: text(data.work_id), title: text(data.title), prompt: text(data.prompt) }
-    case 'work_progress': return { type: data.type, work_id: text(data.work_id), phase: workPhase(data.phase), summary: text(data.summary), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id) }
+    case 'work_progress': return { type: data.type, work_id: text(data.work_id), phase: workPhase(data.phase), summary: text(data.summary), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id), ...(data.subagent == null ? {} : { subagent: parseSubagentProgress(data.subagent) }) }
     case 'work_finished': {
       const outcome = workOutcome(data.outcome)
       if (!outcome) throw new Error('工作结果缺少终态。')
@@ -642,7 +642,33 @@ export function parseWorkDetail(value: unknown): WorkDetail {
   const data = record(value), coverage = record(data.coverage), shared = record(data.work), sourceEvents = texts(shared.source_events)
   if (coverage.source !== 'shared_history' || coverage.complete !== false) throw new Error('工作详情的历史范围无法确认。')
   if (sourceEvents.length > 64) throw new Error('工作详情的来源引用超出范围。')
-  return { work: { ...openWork(shared), target: shared.target === null ? null : parseInputTarget(shared.target), source_events: sourceEvents }, coverage: { source: 'shared_history', complete: false } }
+  const subagents = list(data.subagents).map(item => {
+    const data = record(item)
+    return { attempt_id: subagentId(data.attempt_id), progress: parseSubagentProgress(data.progress) }
+  })
+  if (subagents.length > 64 || new Set(subagents.map(item => JSON.stringify([item.attempt_id, item.progress.parent_tool_use_id]))).size !== subagents.length) throw new Error('子代理记录超出范围或重复。')
+  return { work: { ...openWork(shared), target: shared.target === null ? null : parseInputTarget(shared.target), source_events: sourceEvents }, subagents, coverage: { source: 'shared_history', complete: false } }
+}
+
+function subagentId(value: unknown): string {
+  const id = text(value)
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(id)) throw new Error('子代理编号无效。')
+  return id
+}
+function subagentStatus(value: unknown): SubagentStatus {
+  if (value === 'running' || value === 'completed' || value === 'failed' || value === 'interrupted') return value
+  throw new Error('子代理状态无效。')
+}
+function parseSubagentProgress(value: unknown): SubagentProgress {
+  const data = record(value), tools = list(data.tools).map((item): SubagentTool => {
+    const tool = record(item), kind = tool.kind
+    if (kind !== 'command' && kind !== 'file_change' && kind !== 'web_search' && kind !== 'tool') throw new Error('子代理工具类别无效。')
+    return { tool_use_id: subagentId(tool.tool_use_id), kind, status: subagentStatus(tool.status) }
+  })
+  if (tools.length > 32 || new Set(tools.map(tool => tool.tool_use_id)).size !== tools.length) throw new Error('子代理工具记录超出范围或重复。')
+  const usage = data.usage === null ? null : record(data.usage)
+  const count = (value: unknown) => value === null ? null : number(value)
+  return { parent_tool_use_id: subagentId(data.parent_tool_use_id), status: subagentStatus(data.status), tools, usage: usage && { input_tokens: count(usage.input_tokens), output_tokens: count(usage.output_tokens), cache_creation_input_tokens: count(usage.cache_creation_input_tokens), cache_read_input_tokens: count(usage.cache_read_input_tokens) } }
 }
 
 type WorkspaceOverviewInput = {

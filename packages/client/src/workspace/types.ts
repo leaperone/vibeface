@@ -77,7 +77,7 @@ export type WorkspaceHistoryBody =
   | { type: 'message_posted'; message_id: string; role: string; text: string; attachments?: Attachment[]; in_reply_to?: string; status?: ReplyStatus; failure?: FailureKind }
   | { type: 'work_finished'; work_id: string; outcome: WorkOutcome; result_text: string; failure_reason?: string; failure?: FailureKind }
   | { type: 'work_dispatched'; work_id: string; title: string; prompt: string }
-  | { type: 'work_progress'; work_id: string; phase: WorkPhase; summary: string; thread_id?: string; turn_id?: string }
+  | { type: 'work_progress'; work_id: string; phase: WorkPhase; summary: string; thread_id?: string; turn_id?: string; subagent?: SubagentProgress }
 export type WorkspaceSpeaker = { kind: 'human'; device_id: string } | { kind: 'bot'; bot_id: string } | { kind: 'node'; device_id: string }
 export type WorkspaceHistoryItem = { event_hash: string; created_at_ms: number; scope_id: string; kind: string; body: WorkspaceHistoryBody; speaker: WorkspaceSpeaker }
 export type WorkspaceHistory = { history_authority: string; events: WorkspaceHistoryItem[]; next_cursor: string | null; complete: boolean; coverage: { limit: number; truncated: boolean; scope: 'task' | 'channel' | 'workspace' } }
@@ -276,7 +276,12 @@ export type ConfirmReason = "offline" | "disconnected" | "unverified"
 /** A work no result has settled yet, from any conversation. */
 export type OpenWork = WorkRecord & { conversation_id: string }
 export type WorkDetailWork = Omit<OpenWork, 'target'> & { target: InputTarget | null; source_events: string[] }
-export type WorkDetail = { work: WorkDetailWork; coverage: { source: 'shared_history'; complete: false } }
+export type SubagentStatus = 'running' | 'completed' | 'failed' | 'interrupted'
+export type SubagentUsage = { input_tokens: number | null; output_tokens: number | null; cache_creation_input_tokens: number | null; cache_read_input_tokens: number | null }
+export type SubagentTool = { tool_use_id: string; kind: 'command' | 'file_change' | 'web_search' | 'tool'; status: SubagentStatus }
+export type SubagentProgress = { parent_tool_use_id: string; status: SubagentStatus; tools: SubagentTool[]; usage: SubagentUsage | null }
+export type WorkSubagent = { attempt_id: string; progress: SubagentProgress }
+export type WorkDetail = { work: WorkDetailWork; subagents: WorkSubagent[]; coverage: { source: 'shared_history'; complete: false } }
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string

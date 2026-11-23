@@ -313,6 +313,7 @@ pub enum Signal {
         summary: String,
         at_ms: i64,
     },
+    Subagent(crate::model::SubagentProgress),
     InterruptRequested,
     TurnCompleted {
         turn_id: String,
@@ -444,6 +445,7 @@ fn progress(record: &WorkRecord, phase: WorkPhase, summary: &str) -> Option<Even
         summary: summary.into(),
         thread_id: handle.map(|handle| handle.thread_id.clone()),
         turn_id: handle.map(|handle| handle.turn_id.clone()),
+        subagent: None,
     })
 }
 
@@ -504,6 +506,16 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         (Running { .. } | Interrupting { .. }, Signal::Text(text)) => {
             record.text = bounded(&text);
             None
+        }
+        (Running { .. } | Interrupting { .. }, Signal::Subagent(subagent)) => {
+            let mut event = progress(record, WorkPhase::Running, &record.progress)?;
+            if let EventBody::WorkProgress {
+                subagent: snapshot, ..
+            } = &mut event
+            {
+                *snapshot = Some(subagent);
+            }
+            Some(event)
         }
         (Running { .. }, Signal::Progress { summary, at_ms }) => {
             let summary: String = summary.chars().take(500).collect();

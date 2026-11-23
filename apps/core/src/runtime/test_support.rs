@@ -235,6 +235,7 @@ pub(super) async fn instructed_bot(
                     summary: String::new(),
                     thread_id: Some(thread.clone()),
                     turn_id: None,
+                    subagent: None,
                 };
                 store.append_event(&identity, &network, scope, progress, vec![], now_ms())?;
             }

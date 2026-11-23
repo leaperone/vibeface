@@ -1081,7 +1081,8 @@ impl TurnAttempt {
             confirm_cursor_seen(&self.node, &self.job, &shown, self.phase.result()?).await?;
         }
         let output = prefix(&self.phase.result()?.output, REPLY_LIMIT).to_owned();
-        self.commit_reply(JobOutcome::Completed, output).await
+        let outcome = JobOutcome::completed_for(&self.job, &output);
+        self.commit_reply(outcome, output).await
     }
 
     async fn commit_reply(&mut self, outcome: JobOutcome, text: String) -> Result<RecordedReply> {

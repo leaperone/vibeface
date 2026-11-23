@@ -206,6 +206,75 @@ async fn peer_delivery_locks_serialize_same_target_and_allow_other_scopes() -> R
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn blob_locks_serialize_same_hash_and_allow_other_hashes() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let locks = Arc::new(BlobLocks::default());
+    let first_active = Arc::new(AtomicBool::new(false));
+    let same_hash_entered = Arc::new(AtomicBool::new(false));
+    let other_hash_parallel = Arc::new(AtomicBool::new(false));
+    let (first_ready_tx, first_ready_rx) = tokio::sync::oneshot::channel();
+    let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+    let first = tokio::spawn({
+        let locks = locks.clone();
+        let first_active = first_active.clone();
+        async move {
+            let _guard = locks.lock("hash-a").await;
+            first_active.store(true, Ordering::SeqCst);
+            first_ready_tx.send(()).expect("first waiter");
+            release_first_rx.await.expect("first release");
+            first_active.store(false, Ordering::SeqCst);
+        }
+    });
+    first_ready_rx.await?;
+
+    let same_hash = tokio::spawn({
+        let locks = locks.clone();
+        let first_active = first_active.clone();
+        let same_hash_entered = same_hash_entered.clone();
+        async move {
+            let _guard = locks.lock("hash-a").await;
+            assert!(!first_active.load(Ordering::SeqCst));
+            same_hash_entered.store(true, Ordering::SeqCst);
+        }
+    });
+    let other_hash = tokio::spawn({
+        let locks = locks.clone();
+        let first_active = first_active.clone();
+        let other_hash_parallel = other_hash_parallel.clone();
+        async move {
+            let _guard = locks.lock("hash-b").await;
+            other_hash_parallel.store(first_active.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    });
+
+    other_hash.await?;
+    assert!(other_hash_parallel.load(Ordering::SeqCst));
+    assert!(!same_hash_entered.load(Ordering::SeqCst));
+
+    release_first_tx.send(()).expect("release first hash");
+    first.await?;
+    same_hash.await?;
+    assert!(same_hash_entered.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[test]
+fn staging_room_counts_preallocated_reservations() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("vibeface-staging-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir)?;
+    std::fs::File::create(dir.join("a.part"))?.set_len(200 * 1024 * 1024)?;
+    let result = {
+        assert!(staging_room_for(&dir, 56 * 1024 * 1024, true).is_ok());
+        assert!(staging_room_for(&dir, 57 * 1024 * 1024, true).is_err());
+        Ok::<_, anyhow::Error>(())
+    };
+    std::fs::remove_dir_all(&dir)?;
+    result
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn synced_assignments_run_only_after_explicit_delivery_and_are_admitted_once() -> Result<()> {
     use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};

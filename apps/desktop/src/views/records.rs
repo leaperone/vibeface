@@ -5,7 +5,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use vibeface_bridge::failure::FailureKind;
 use vibeface_protocol::workspace::{
-    Attachment, InputControl, InputIntent, InputTarget, WorkspaceCommand, WorkspaceSpeaker,
+    Attachment, InputControl, InputIntent, InputTarget, MAX_WORK_SUBAGENTS, SubagentProgress,
+    WorkSubagent, WorkspaceCommand, WorkspaceSpeaker,
 };
 
 /// An event belongs to the connection that rendered its control, even if the network
@@ -120,6 +121,7 @@ pub struct WorkDetail {
     pub network_id: String,
     pub work: WorkRecord,
     pub coverage: WorkCoverage,
+    pub subagents: Vec<WorkSubagent>,
 }
 
 pub fn parse_work_detail(
@@ -133,6 +135,7 @@ pub fn parse_work_detail(
     struct Wire {
         work: WorkRecord,
         coverage: WorkCoverage,
+        subagents: Vec<WorkSubagent>,
     }
     valid_id(network)?;
     valid_id(conversation)?;
@@ -167,6 +170,19 @@ pub fn parse_work_detail(
     );
     let wire: Wire = serde_json::from_value(value).context("工作详情格式无效")?;
     let work = &wire.work;
+    ensure!(
+        wire.subagents.len() <= MAX_WORK_SUBAGENTS,
+        "子代理记录超过读取上限"
+    );
+    let mut subagents = BTreeSet::new();
+    for subagent in &wire.subagents {
+        valid_id(&subagent.attempt_id)?;
+        subagent.progress.validate().map_err(anyhow::Error::msg)?;
+        ensure!(
+            subagents.insert((&subagent.attempt_id, &subagent.progress.parent_tool_use_id)),
+            "子代理记录重复"
+        );
+    }
     ensure!(
         work.conversation_id == conversation && work.work_id == work_id,
         "工作详情不属于请求的对话或工作"
@@ -219,6 +235,7 @@ pub fn parse_work_detail(
         network_id: network.into(),
         work: wire.work,
         coverage: wire.coverage,
+        subagents: wire.subagents,
     })
 }
 
@@ -315,6 +332,7 @@ pub enum HistoryBody {
         summary: String,
         thread_id: Option<String>,
         turn_id: Option<String>,
+        subagent: Option<SubagentProgress>,
     },
     WorkFinished {
         work_id: String,
@@ -566,11 +584,17 @@ pub fn parse_workspace_history(
                     }
                 }
                 if let HistoryBody::WorkProgress {
-                    thread_id, turn_id, ..
+                    thread_id,
+                    turn_id,
+                    subagent,
+                    ..
                 } = body
                 {
                     for id in [thread_id, turn_id].into_iter().flatten() {
                         valid_id(id)?;
+                    }
+                    if let Some(subagent) = subagent {
+                        subagent.validate().map_err(anyhow::Error::msg)?;
                     }
                 }
                 Some(event.scope_id.clone())

@@ -46,8 +46,13 @@ async fn uploads_serialize_with_downloads_and_hash_without_the_store_lock() -> R
         lock(&HASH_PAUSES).insert(part.clone(), (entered, paused));
         let final_chunk = chunk(1024 * 1024, &content[1024 * 1024..]);
         let uploader = node.clone();
+        let upload_access = access.clone();
         let upload =
-            tokio::spawn(async move { uploader.upload_attachment(&access, &final_chunk).await });
+            tokio::spawn(async move {
+                uploader
+                    .upload_attachment(&upload_access, &final_chunk)
+                    .await
+            });
         let entered = tokio::time::timeout(Duration::from_secs(5), hashing).await;
         if !matches!(entered, Ok(Ok(()))) {
             let _ = resume.send(());
@@ -55,6 +60,16 @@ async fn uploads_serialize_with_downloads_and_hash_without_the_store_lock() -> R
             upload.abort();
             bail!("the upload did not reach its hash barrier");
         }
+        let other_content = b"parallel attachment";
+        let other_hash = crate::crypto::digest(other_content);
+        let other_chunk = json!({"conversation_id":"c","hash":other_hash,"size":other_content.len(),"offset":0,
+            "data":base64::engine::general_purpose::STANDARD.encode(other_content)});
+        let other_upload = node.upload_attachment(
+            &access,
+            &other_chunk,
+        );
+        let other_upload = tokio::time::timeout(Duration::from_millis(250), other_upload).await;
+        let other_upload_completed = other_upload.is_ok();
         let store_available = tokio::time::timeout(Duration::from_millis(250), async {
             let hash = hash.clone();
             let network = network.clone();
@@ -94,6 +109,16 @@ async fn uploads_serialize_with_downloads_and_hash_without_the_store_lock() -> R
             upload.await??,
             json!({"offset":content.len(),"complete":true})
         );
+        assert!(
+            other_upload_completed,
+            "a different attachment must not wait for this hash"
+        );
+        if let Ok(result) = other_upload {
+            assert_eq!(
+                result?,
+                json!({"offset":other_content.len(),"complete":true})
+            );
+        }
         match download_before_hash {
             Ok(result) => result??,
             Err(_) => download.await??,

@@ -632,7 +632,7 @@ impl Runtime {
             return None;
         };
         let outcome = match status {
-            TurnStatus::Completed => JobOutcome::Completed,
+            TurnStatus::Completed => JobOutcome::completed_for(&job, &text),
             TurnStatus::Failed => JobOutcome::Failed(ExecFailure::new(
                 error.map_or(FailureKind::Unknown, |failure| failure.kind),
                 "the provider recorded a failed turn",
