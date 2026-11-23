@@ -198,6 +198,8 @@ vibeface service uninstall
 
 本节只适用于 GitHub 受管安装。npm 安装按上面的 npm 命令更新。
 
+更新器优先使用当前进程提供的 `GITHUB_TOKEN` 查询 GitHub API。在 macOS 上，未提供令牌时，更新器会尝试复用以默认 Homebrew 路径安装的 `gh` 的 GitHub 登录。遇到 `403 rate limit exceeded` 时，用运行节点的同一 macOS 账户执行 `gh auth status --hostname github.com` 检查登录状态。更新器不会将令牌保存到更新配置。
+
 安装受管后台服务时会根据现有策略或安装包选定渠道，并注册每小时自动更新。新版 CLI 启动或重新启动受管后台服务时也会检查定时任务。用以下命令查看策略、查询可用版本或主动申请升级：
 
 ```sh

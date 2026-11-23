@@ -502,22 +502,140 @@ async fn get_optional_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn response(client: &Client, url: &str) -> Result<reqwest::Response> {
-    let url = Url::parse(url)?;
-    ensure!(trusted_url(&url), "update URL is not approved");
-    let token = std::env::var("GITHUB_TOKEN").ok();
-    request(client, url, token.as_deref())
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?
+    release_response(client, url)
+        .await?
         .error_for_status()
         .map_err(reqwest::Error::without_url)
         .context("fetch official release")
 }
 
+async fn release_response(client: &Client, url: &str) -> Result<reqwest::Response> {
+    let url = Url::parse(url)?;
+    ensure!(trusted_url(&url), "update URL is not approved");
+    let explicit = std::env::var("GITHUB_TOKEN").ok();
+    let implicit = explicit
+        .as_ref()
+        .is_none_or(|token| token.trim().is_empty());
+    let token = github_token(&url, explicit, local_github_token()).await;
+    let response = request(client, url.clone(), token.as_deref())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if retry_anonymously(&url, implicit && token.is_some(), response.status()) {
+        drop(response);
+        return Ok(request(client, url, None)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?);
+    }
+    Ok(response)
+}
+
+fn retry_anonymously(url: &Url, implicit_token: bool, status: reqwest::StatusCode) -> bool {
+    implicit_token
+        && url.host_str() == Some("api.github.com")
+        && matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        )
+}
+
+async fn github_token(
+    url: &Url,
+    explicit: Option<String>,
+    local: impl std::future::Future<Output = Option<String>>,
+) -> Option<String> {
+    if url.host_str() != Some("api.github.com") {
+        return None;
+    }
+    match explicit.filter(|token| !token.trim().is_empty()) {
+        Some(token) => Some(token),
+        None => local.await,
+    }
+}
+
+async fn local_github_token() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        static TOKEN: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+        TOKEN
+            .get_or_init(|| async {
+                gh_auth_token(
+                    &[
+                        Path::new("/opt/homebrew/bin/gh"),
+                        Path::new("/usr/local/bin/gh"),
+                    ],
+                    Duration::from_secs(3),
+                )
+                .await
+            })
+            .await
+            .clone()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn gh_auth_token(programs: &[&Path], timeout: Duration) -> Option<String> {
+    const MAX_TOKEN: usize = 4096;
+    tokio::time::timeout(timeout, async {
+        for program in programs {
+            let Ok(mut child) = tokio::process::Command::new(program)
+                .args(["auth", "token", "--hostname", "github.com"])
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            else {
+                continue;
+            };
+            let mut output = zeroize::Zeroizing::new(Vec::new());
+            if child
+                .stdout
+                .take()?
+                .take(MAX_TOKEN as u64 + 1)
+                .read_to_end(&mut output)
+                .await
+                .is_err()
+                || output.len() > MAX_TOKEN
+                || !child
+                    .wait()
+                    .await
+                    .ok()
+                    .is_some_and(|status| status.success())
+            {
+                continue;
+            }
+            let Some(token) = std::str::from_utf8(&output)
+                .ok()
+                .map(str::trim)
+                .filter(|token| {
+                    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic())
+                })
+            else {
+                continue;
+            };
+            return Some(token.to_owned());
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn request(client: &Client, url: Url, token: Option<&str>) -> reqwest::RequestBuilder {
     let api = url.host_str() == Some("api.github.com");
     let request = client.get(url);
-    match token.filter(|token| api && !token.is_empty()) {
+    match token.filter(|token| api && !token.trim().is_empty()) {
         Some(token) => request.bearer_auth(token),
         None => request,
     }
@@ -540,13 +658,8 @@ async fn release_body(response: reqwest::Response, limit: usize) -> Result<Vec<u
 }
 
 async fn get_optional_bytes(client: &Client, url: &str, limit: usize) -> Result<Option<Vec<u8>>> {
-    let url = Url::parse(url)?;
-    ensure!(trusted_url(&url), "update URL is not approved");
-    let token = std::env::var("GITHUB_TOKEN").ok();
-    let response = request(client, url, token.as_deref())
-        .send()
+    let response = release_response(client, url)
         .await
-        .map_err(reqwest::Error::without_url)
         .context("fetch official release")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -1575,6 +1688,118 @@ mod tests {
             .unwrap()
             .headers()
             .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
+    fn only_rejected_implicit_api_credentials_retry_anonymously() {
+        let api = Url::parse(API).unwrap();
+        let asset = Url::parse("https://github.com/leaperone/vibeface/releases").unwrap();
+        for (status, retry) in [
+            (200, false),
+            (401, true),
+            (403, true),
+            (404, false),
+            (429, false),
+            (500, false),
+        ] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert_eq!(retry_anonymously(&api, true, status), retry);
+            assert!(!retry_anonymously(&api, false, status));
+            assert!(!retry_anonymously(&asset, true, status));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_token_prefers_explicit_credentials_and_skips_other_hosts() {
+        let api = Url::parse(API).unwrap();
+        assert_eq!(
+            github_token(&api, Some("explicit-token".to_owned()), async {
+                panic!("explicit credentials must skip local gh")
+            })
+            .await
+            .as_deref(),
+            Some("explicit-token")
+        );
+        for explicit in [None, Some(""), Some(" \t\n")] {
+            assert_eq!(
+                github_token(&api, explicit.map(str::to_owned), async {
+                    Some("local-token".to_owned())
+                })
+                .await
+                .as_deref(),
+                Some("local-token")
+            );
+        }
+        assert!(github_token(&api, None, async { None }).await.is_none());
+        assert!(
+            github_token(
+                &Url::parse("https://github.com/leaperone/vibeface/releases").unwrap(),
+                Some("explicit-token".to_owned()),
+                async { panic!("asset requests must skip local gh") },
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    fn gh_fixture(script: &str) -> Scratch {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.artifacts/update-tests");
+        fs::create_dir_all(&root).unwrap();
+        let scratch = Scratch::create(&root).unwrap();
+        let program = scratch.0.join("gh");
+        fs::write(&program, format!("#!/bin/sh\n{script}\n")).unwrap();
+        mark_runnable(&program);
+        scratch
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gh_auth_token_validates_noninteractive_output_and_falls_back() {
+        let scratch = gh_fixture(
+            r#"[ "$*" = 'auth token --hostname github.com' ] &&
+[ "$GH_PROMPT_DISABLED" = 1 ] || exit 1
+printf 'local-token\n'"#,
+        );
+        assert_eq!(
+            gh_auth_token(
+                &[&scratch.0.join("missing"), &scratch.0.join("gh")],
+                Duration::from_secs(2),
+            )
+            .await
+            .as_deref(),
+            Some("local-token")
+        );
+        for script in [
+            "".to_owned(),
+            "printf 'token\\n'; exit 1".to_owned(),
+            "printf ' \\n\\t'".to_owned(),
+            "printf 'first\\nsecond\\n'".to_owned(),
+            "printf '\\377'".to_owned(),
+            format!("printf '%s' '{}'", "a".repeat(4097)),
+        ] {
+            let scratch = gh_fixture(&script);
+            assert!(
+                gh_auth_token(&[&scratch.0.join("gh")], Duration::from_secs(2))
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gh_auth_token_times_out() {
+        let scratch = gh_fixture("exec /bin/sleep 30");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                gh_auth_token(&[&scratch.0.join("gh")], Duration::from_millis(50)),
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
