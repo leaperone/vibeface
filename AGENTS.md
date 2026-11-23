@@ -13,6 +13,7 @@
 - 对明确进入交付的改动，要积极主动地 shipping PR（提交、推送并创建 PR）；合并须经用户明确授权。
 - 发版、版本递增、创建或推送发布 tag 前，先读 `.agents/skills/release/SKILL.md`；合并或验收通过不构成发布授权。
 - 任何新功能在独立分支产生首个提交后，立即 push 并创建 PR。当前开发分支 PR 不自动触发 GitHub Actions，须运行相关本地检查；需要远端验证时手动触发对应 workflow。继续开发，不阻塞等待已启动的远端构建，异步巡查并修复失败。避免频繁本地编译，仅在定位问题或必要验收时执行最小相关验证；最终交付前核对最终 HEAD 的必要检查结果，不将 pending 视为通过。
+- Agent 可自行运行与当前改动相关的本地自动化测试，无需逐次确认。测试可以在任务 worktree 的 Git 忽略目录中创建临时 Node，使用并在结束后清理夹具自行生成的访问凭据。不得读取真实设备目录、账号凭据或将凭据写入日志。此授权不包含触发远端工作流、发布或部署。
 - 只执行相关验证。安全与同步行为优先在对应 Rust 模块验证，验收须覆盖真实进程及制品。
 - Web 工作区和 Mobile 的唯一 UI 体系是 `WheatXie/uiarc-pro-reverse` 的 Arc。新增或修改界面先读 `packages/docs/design/uiarc-migration.md`。Web 使用 `packages/uiarc` 中记录来源的组件；Mobile 使用 `apps/mobile/src/components/arc` 的同源原生移植。禁止重新加入 shadcn/ui、React Native Reusables 或另一套组件库、主题和控件样式。
 - 颜色、字体、圆角、控件尺寸和动效来自固定版本的 Arc foundation。运行 `pnpm generate:ui` 生成两端 token，不手改生成文件。新增 Arc 项目使用 `scripts/vendor-uiarc.py` 获取来源并记录哈希；原生移植在 `source.json` 标注对应 Arc 项目。UI 改动必须通过 `pnpm check:ui`。
