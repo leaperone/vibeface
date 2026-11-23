@@ -198,6 +198,8 @@ vibeface service uninstall
 
 本节只适用于 GitHub 受管安装。npm 安装按上面的 npm 命令更新。
 
+更新器可以使用当前进程提供的 `GITHUB_TOKEN` 查询 GitHub API。遇到 `403 rate limit exceeded` 时，先确认后台更新任务是否具备认证。
+
 安装受管后台服务时会根据现有策略或安装包选定渠道，并注册每小时自动更新。新版 CLI 启动或重新启动受管后台服务时也会检查定时任务。用以下命令查看策略、查询可用版本或主动申请升级：
 
 ```sh
