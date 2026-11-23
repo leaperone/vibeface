@@ -1729,7 +1729,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return () => { mounted = false; recoveryPaused.current = true; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
-    let probe: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null
+    let probe: { generation: number; timer?: ReturnType<typeof setTimeout> } | null = null
     const stop = platform.onForeground(() => {
       const active = session.current
       if (!active?.networkId) { retryNow(); return }
