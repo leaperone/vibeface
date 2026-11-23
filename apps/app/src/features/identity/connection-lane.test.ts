@@ -128,7 +128,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
       options.signal?.addEventListener('abort', close)
       const opening = holds.get(candidate.kind === 'lan' ? 'open' : `open:${candidate.address}`) ?? holds.get('open')
       if (opening) await opening.promise
-      return { deviceId: candidate.device_id, close, async request(method: string, params: Record<string, unknown> = {}) {
+      return { deviceId: candidate.device_id, close, idle: () => true, async request(method: string, params: Record<string, unknown> = {}) {
         if (method === 'log') return { accepted: 1 }
         calls.push(method)
         requests.push({ method, params })
@@ -206,6 +206,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   })
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
+    lan: undefined as Platform['lan'], foreground: () => true,
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: {
       ticketDecode: () => JSON.stringify({ entry_id: target, invite_id: inviteId }),
@@ -2194,6 +2195,37 @@ test('an approved join restores only verified authentication and subscription, a
     app.render().disconnect()
     assert.equal(app.timers.size, 0)
     assert.equal(app.render().ready, null)
+  } finally { app.close() }
+})
+
+test('a foreground gateway retries the same LAN sighting after a failed probe and switches to the same Node', async () => {
+  const app = deviceHarness({ saved: true })
+  let advertise: Parameters<NonNullable<Platform['lan']>['watch']>[0] = () => assert.fail('LAN browser is not listening')
+  app.platform.lan = { names: (tag, net, id) => net === network && tag === id, watch(listener) { advertise = listener; return () => {} } }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().ready?.entry.kind, 'gateway')
+    const [retry] = app.timers.values()
+    assert.ok(retry)
+    const sighting = { tag: target, addrs: ['192.168.1.4:7001'] }
+    advertise([{ ...sighting, tag: remote }]); retry()
+    assert.equal(app.sockets.length, 1)
+    const probe = deferred()
+    app.holds.set('open', probe)
+    advertise([sighting]); retry()
+    assert.equal(app.sockets.length, 2, 'a timer must not start a second probe')
+    probe.reject(new Error('LAN not ready')); await settle()
+    app.holds.delete('open')
+    assert.equal(app.render().ready?.entry.kind, 'gateway')
+    app.platform.foreground = () => false
+    retry(); assert.equal(app.sockets.length, 2)
+    app.platform.foreground = () => true
+    retry(); await settle()
+    const reconnect = [...app.timers.values()].find(run => run !== retry)
+    assert.ok(reconnect)
+    reconnect(); await settle()
+    assert.deepEqual(plain(app.render().ready?.entry), { kind: 'lan', device_id: target, addrs: sighting.addrs })
+    assert.ok(![...app.timers.values()].includes(retry))
   } finally { app.close() }
 })
 
