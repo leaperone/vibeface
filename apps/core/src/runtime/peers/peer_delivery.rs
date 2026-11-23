@@ -463,7 +463,22 @@ impl Runtime {
                 "failure":error.downcast_ref::<vibeface_bridge::failure::ExecFailure>().map(|failure| failure.kind)}),
                 )
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let detail = error.to_string();
+                let command_id = envelope.command_id.clone();
+                let network = network.to_owned();
+                let terminal = self
+                    .store
+                    .call("peers.peer_command_failed", move |store| {
+                        store.peer_command_failed(network, &command_id, &detail, now_ms())
+                    })
+                    .await?;
+                if terminal {
+                    tracing::warn!(%error, command_id = envelope.command_id, "peer command rejected after retry limit");
+                    return Ok(true);
+                }
+                return Err(error);
+            }
         };
         {
             let arg0 = (network).to_owned();
