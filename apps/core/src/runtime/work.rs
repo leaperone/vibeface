@@ -1709,7 +1709,11 @@ mod directory_tests {
                 .unwrap_err();
         assert!(missing.is::<AdmissionRejected>());
         assert!(!missing.is::<std::io::Error>());
-        assert!(missing.to_string().starts_with("execution path is invalid:"));
+        assert!(
+            missing
+                .to_string()
+                .starts_with("execution path is invalid:")
+        );
 
         request.cwd = "relative/path".into();
         let relative =

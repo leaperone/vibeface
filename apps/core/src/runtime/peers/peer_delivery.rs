@@ -470,7 +470,7 @@ impl Runtime {
                 let terminal = self
                     .store
                     .call("peers.peer_command_failed", move |store| {
-                        store.peer_command_failed(network, &command_id, &detail, now_ms())
+                        store.peer_command_failed(&network, &command_id, &detail, now_ms())
                     })
                     .await?;
                 if terminal {

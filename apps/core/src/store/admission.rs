@@ -447,7 +447,9 @@ impl Store {
     pub(crate) fn pending_peer_commands(&self, network: &str) -> Result<Vec<PeerAdmission>> {
         let mut admissions: Vec<_> = inbound(&self.connection, network)?
             .into_iter()
-            .filter(|entry| entry.state.pending() && entry.next_attempt_ms <= crate::clock::now_ms())
+            .filter(|entry| {
+                entry.state.pending() && entry.next_attempt_ms <= crate::clock::now_ms()
+            })
             .collect();
         admissions.sort_by_key(|entry| (entry.envelope.sequence, entry.queued_at_ms));
         Ok(admissions)
@@ -462,16 +464,21 @@ impl Store {
     ) -> Result<bool> {
         const MAX_ATTEMPTS: u32 = 8;
         let key = key(INBOUND, network, command_id);
-        let mut admission: PeerAdmission = load(&self.connection, &key)?.context("peer command not found")?;
+        let mut admission: PeerAdmission =
+            load(&self.connection, &key)?.context("peer command not found")?;
         if !admission.state.pending() {
             return Ok(true);
         }
         admission.attempts = admission.attempts.saturating_add(1);
         if admission.attempts >= MAX_ATTEMPTS {
             admission.state = PeerAdmissionState::Rejected;
-            admission.response = json!({"rejected": format!("peer command retry limit exceeded: {detail}")});
+            admission.response =
+                json!({"rejected": format!("peer command retry limit exceeded: {detail}")});
             save(&self.connection, &key, &admission)?;
-            self.connection.execute("DELETE FROM identity_meta WHERE key=?", [pending_key(network, command_id)])?;
+            self.connection.execute(
+                "DELETE FROM identity_meta WHERE key=?",
+                [pending_key(network, command_id)],
+            )?;
             return Ok(true);
         }
         admission.next_attempt_ms = now_ms + 1_000 * (1_i64 << admission.attempts.min(5));
