@@ -203,6 +203,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const waitingTarget = asked ? `question-${asked.question_id}` : null
   const waitingCount = toAnswer.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
+  const showWaiting = Boolean(waitingTarget && (targetHidden || !workspace.connectionOnline))
   const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = reachDevice(workspace.nodes, reach) ?? ready?.entry.device_id
@@ -281,19 +282,19 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       />
       {bot && inputTarget ? <PromptInput
         id="message-text"
-        above={<div className="flex max-w-full flex-col items-start gap-2">
+        above={!workspace.connectionOnline || history && statusLine || showWaiting ? <>
           {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-panel border bg-surface ps-2.5 pe-1 text-sm font-medium max-md:min-h-11">
-          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
-          <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
-        </p> : null}
-        {history && statusLine ? <Button type="button" variant="ghost" size="sm" className="max-w-full text-secondary" onClick={(event) => openActivity(event.currentTarget)}>
-          <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{statusLine}</span>
-        </Button> : null}
-        {waitingTarget && (targetHidden || !workspace.connectionOnline) ? <Button variant="ghost" type="button" className="flex max-w-full items-center gap-1.5 duration-200 ease-out motion-reduce:animate-none"
-          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 break-words">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
-        </Button> : null}
-        </div>}
+            <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
+            <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+          </p> : null}
+          {history && statusLine ? <Button type="button" variant="ghost" size="sm" className="max-w-full" onClick={(event) => openActivity(event.currentTarget)}>
+            <ListChecks aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 truncate">{statusLine}</span>
+          </Button> : null}
+          {showWaiting ? <Button variant="ghost" size="sm" type="button" className="max-w-full"
+            onClick={() => document.getElementById(waitingTarget ?? '')?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
+            <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 truncate">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
+          </Button> : null}
+        </> : null}
         value={text}
         hint={notice}
         reason={reason}
@@ -357,10 +358,10 @@ function TaskHistory({ tasks, botId, attention, open, onOpenChange, onOpen, from
   useEffect(() => () => { from.current = null }, [])
   const leave = () => { from.current = null; onOpenChange(false) }
   return <>
-    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={attention ? `动态，${attention} 项要处理` : '动态'} title={attention ? `动态，${attention} 项要处理` : '动态'} className="relative" onClick={() => onOpen(trigger.current)}><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute end-1 top-1" /> : null}</Button></PageActions>
+    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={attention ? `动态，${attention} 项要处理` : '动态'} title={attention ? `动态，${attention} 项要处理` : '动态'} onClick={() => onOpen(trigger.current)}><span className="relative inline-flex"><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute -end-1 -top-1 ring-2 ring-surface" /> : null}</span></Button></PageActions>
     <Drawer open={open} onOpenChange={onOpenChange}>
       <DrawerContent title="动态" className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); if (from.current) (from.current.isConnected ? from.current : trigger.current)?.focus({ preventScroll: true }) }}>
-        <div className="grid min-h-0 flex-1 content-start gap-6 overflow-y-auto px-4 pb-6">
+        <div className="grid content-start gap-6">
           {workspace.connectionOnline && workspace.incomplete ? <p role="status" className="text-sm text-secondary">同步中</p> : null}
           {before}
           {!workspace.data ? <p role="status" className="text-sm text-secondary">正在读取</p> : tasks.length ? <ActivitySection title="任务"><ul className="divide-y">{tasks.map((task) => {
