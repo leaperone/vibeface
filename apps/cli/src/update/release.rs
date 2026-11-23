@@ -502,26 +502,42 @@ async fn get_optional_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn response(client: &Client, url: &str) -> Result<reqwest::Response> {
-    release_request(client, url)
+    release_response(client, url)
         .await?
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?
         .error_for_status()
         .map_err(reqwest::Error::without_url)
         .context("fetch official release")
 }
 
-async fn release_request(client: &Client, url: &str) -> Result<reqwest::RequestBuilder> {
+async fn release_response(client: &Client, url: &str) -> Result<reqwest::Response> {
     let url = Url::parse(url)?;
     ensure!(trusted_url(&url), "update URL is not approved");
-    let token = github_token(
-        &url,
-        std::env::var("GITHUB_TOKEN").ok(),
-        local_github_token(),
-    )
-    .await;
-    Ok(request(client, url, token.as_deref()))
+    let explicit = std::env::var("GITHUB_TOKEN").ok();
+    let implicit = explicit
+        .as_ref()
+        .is_none_or(|token| token.trim().is_empty());
+    let token = github_token(&url, explicit, local_github_token()).await;
+    let response = request(client, url.clone(), token.as_deref())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if retry_anonymously(&url, implicit && token.is_some(), response.status()) {
+        drop(response);
+        return Ok(request(client, url, None)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?);
+    }
+    Ok(response)
+}
+
+fn retry_anonymously(url: &Url, implicit_token: bool, status: reqwest::StatusCode) -> bool {
+    implicit_token
+        && url.host_str() == Some("api.github.com")
+        && matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        )
 }
 
 async fn github_token(
@@ -642,11 +658,8 @@ async fn release_body(response: reqwest::Response, limit: usize) -> Result<Vec<u
 }
 
 async fn get_optional_bytes(client: &Client, url: &str, limit: usize) -> Result<Option<Vec<u8>>> {
-    let response = release_request(client, url)
-        .await?
-        .send()
+    let response = release_response(client, url)
         .await
-        .map_err(reqwest::Error::without_url)
         .context("fetch official release")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -1676,6 +1689,25 @@ mod tests {
             .headers()
             .contains_key(reqwest::header::AUTHORIZATION)
         );
+    }
+
+    #[test]
+    fn only_rejected_implicit_api_credentials_retry_anonymously() {
+        let api = Url::parse(API).unwrap();
+        let asset = Url::parse("https://github.com/leaperone/vibeface/releases").unwrap();
+        for (status, retry) in [
+            (200, false),
+            (401, true),
+            (403, true),
+            (404, false),
+            (429, false),
+            (500, false),
+        ] {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            assert_eq!(retry_anonymously(&api, true, status), retry);
+            assert!(!retry_anonymously(&api, false, status));
+            assert!(!retry_anonymously(&asset, true, status));
+        }
     }
 
     #[tokio::test]
