@@ -14,7 +14,7 @@ import type {
   NodeObservation, NodeReport, NodeSessionPath, SelectedNodePath,
 } from "./types.ts"
 import { parseMemoryEntry, parseMemorySyncConflict, parseMemorySyncConflicts } from "./memory.ts"
-import { answerId, questionOpen } from "./questions.ts"
+import { answerId, questionInboxKey, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
 import { EYES, HUES, OUTLINES, type Avatar } from "../avatar/face.ts"
@@ -1223,7 +1223,7 @@ export function parseQuestionInbox(value: unknown): { questions: Question[]; dis
   const dismissedQuestions = new Set<string>()
   for (const item of list(data.dismissed_questions ?? [])) {
     const row = record(item)
-    dismissedQuestions.add(JSON.stringify([text(row.conversation_id), text(row.question_id)]))
+    dismissedQuestions.add(questionInboxKey(text(row.conversation_id), text(row.question_id)))
   }
   return { questions: list(data.questions).map(question), dismissedQuestions }
 }
