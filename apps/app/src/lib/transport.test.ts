@@ -376,6 +376,24 @@ test('pending model and write calls do not hold the read budget', async () => {
   finally { channel.close(); await completed }
 })
 
+test('closing a half-open channel keeps a lost write reply unknown and the next connection reads its original receipt', async () => {
+  const app = await harness({ holdRequests: true })
+  const previous = await app.connect()
+  const input = { input_id: 'original-input', text: 'one message' }
+  const sent = previous.request('rpc', { method: 'send_message', ...input })
+  const unknown = assert.rejects(sent, /操作结果还没确认/)
+  assert.equal(app.requests.length, 1, 'the write reached the Node before its reply was lost')
+  previous.close(); await unknown
+  const current = await app.connect()
+  try {
+    const receipt = { input_id: input.input_id, accepted: true }
+    const reading = current.request('rpc', { method: 'input_receipt', input_id: input.input_id })
+    app.reply('1', receipt)
+    assert.deepEqual(await reading, receipt)
+    assert.deepEqual(app.requests.map(request => request.params.method), ['send_message', 'input_receipt'])
+  } finally { current.close(); await settle() }
+})
+
 test('a late timed-out response is not delivered as a workspace push', async t => {
   const app = await harness({ holdRequests: true })
   const events: unknown[] = []

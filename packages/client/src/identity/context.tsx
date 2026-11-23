@@ -1729,6 +1729,27 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return () => { mounted = false; recoveryPaused.current = true; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
+    let probe: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null
+    const stop = platform.onForeground(() => {
+      const active = session.current
+      if (!active?.networkId) { retryNow(); return }
+      if (probe?.generation === active.generation) return
+      if (probe) clearTimeout(probe.timer)
+      const close = () => {
+        if (session.current === active && generation.current === active.generation) active.channel.close()
+      }
+      const pending = { generation: active.generation, timer: setTimeout(close, 5000) }
+      probe = pending
+      void active.channel.request('info').catch(cause => {
+        if (!isResponseError(cause)) close()
+      }).finally(() => {
+        clearTimeout(pending.timer)
+        if (probe === pending) probe = null
+      })
+    })
+    return () => { stop(); if (probe) clearTimeout(probe.timer) }
+  }, [])
+  useEffect(() => {
     // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.
     const { joinTabs } = platform
     if (!joinTabs) return
