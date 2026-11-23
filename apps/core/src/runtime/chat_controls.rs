@@ -189,8 +189,11 @@ impl Runtime {
                 .unwrap_or(0);
             let dir = dir.to_owned();
             let additional = blob.size.saturating_sub(existing);
-            tokio::task::spawn_blocking(move || super::peers::staging_room(&dir, additional))
-                .await??;
+            let new_object = existing == 0;
+            tokio::task::spawn_blocking(move || {
+                super::peers::staging_room_for(&dir, additional, new_object)
+            })
+            .await??;
             let reserved = tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)

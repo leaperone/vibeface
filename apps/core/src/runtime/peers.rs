@@ -2416,7 +2416,9 @@ impl Runtime {
                 .unwrap_or(0);
             let dir = dir.to_owned();
             let additional = blob.size.saturating_sub(existing);
-            tokio::task::spawn_blocking(move || staging_room(&dir, additional)).await??;
+            let new_object = existing == 0;
+            tokio::task::spawn_blocking(move || staging_room_for(&dir, additional, new_object))
+                .await??;
             let reserved = tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -2522,6 +2524,10 @@ impl Runtime {
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
 pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
+    staging_room_for(dir, size, true)
+}
+
+pub(super) fn staging_room_for(dir: &Path, size: u64, new_object: bool) -> Result<()> {
     let mut objects = 0;
     let mut bytes = size;
     for entry in std::fs::read_dir(dir)? {
@@ -2530,7 +2536,7 @@ pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
         bytes += metadata.len();
     }
     ensure!(
-        objects < MAX_STAGED_OBJECTS && bytes <= MAX_STAGED_BYTES,
+        (!new_object || objects < MAX_STAGED_OBJECTS) && bytes <= MAX_STAGED_BYTES,
         "attachment staging is full"
     );
     Ok(())
