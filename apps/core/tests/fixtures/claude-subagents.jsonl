@@ -1,0 +1,10 @@
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"parent_a","name":"Agent","input":{"prompt":"private-params"}},{"type":"tool_use","id":"parent_b","name":"Task","input":{"prompt":"private-params"}}]}}
+{"type":"assistant","parent_tool_use_id":"parent_a","message":{"id":"msg_a","content":[{"type":"text","text":"private-text"},{"type":"thinking","thinking":"private-reasoning"},{"type":"tool_use","id":"tool_a","name":"Bash","input":{"command":"private-params"}}],"usage":{"input_tokens":5,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":1}}}
+{"type":"assistant","parent_tool_use_id":"parent_b","message":{"id":"msg_b","content":[{"type":"tool_use","id":"tool_b","name":"Write","input":{"content":"private-params"}}]}}
+{"type":"user","parent_tool_use_id":"parent_a","message":{"content":[{"type":"tool_result","tool_use_id":"tool_a","is_error":true,"content":"private-output"}]}}
+{"type":"user","parent_tool_use_id":"parent_b","message":{"content":[{"type":"tool_result","tool_use_id":"tool_b","content":"private-output"}]}}
+{"type":"assistant","parent_tool_use_id":"parent_a","message":{"id":"msg_a","content":[{"type":"text","text":"private-text"}],"usage":{"input_tokens":5,"output_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":1}}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"parent_a","content":"private-output"},{"type":"tool_result","tool_use_id":"parent_b","content":"private-output"}]}}
+{"type":"result","parent_tool_use_id":"parent_a","subtype":"success","result":"private-text","usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":3}}
+{"type":"result","parent_tool_use_id":"parent_a","subtype":"success","result":"private-text","usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":3}}
+{"type":"assistant","parent_tool_use_id":"parent_a","message":{"id":"msg_a","content":[{"type":"text","text":"private-text"}],"usage":{"input_tokens":5,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":1}}}

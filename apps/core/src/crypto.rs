@@ -710,9 +710,21 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 id(work)?;
             }
         }
-        EventBody::WorkProgress { work_id, .. } | EventBody::WorkFinished { work_id, .. } => {
-            id(work_id)?
+        EventBody::WorkProgress {
+            work_id,
+            turn_id,
+            subagent,
+            ..
+        } => {
+            id(work_id)?;
+            if let Some(subagent) = subagent {
+                id(turn_id
+                    .as_deref()
+                    .context("subagent progress requires a work attempt")?)?;
+                subagent.validate().map_err(anyhow::Error::msg)?;
+            }
         }
+        EventBody::WorkFinished { work_id, .. } => id(work_id)?,
         EventBody::ConversationCreated { .. } => ensure!(
             event.scope_id != BOTS_SCOPE,
             "the bots scope is not a conversation"

@@ -272,6 +272,10 @@ def turn(frame):
                 result("error_during_execution", True, "", "aborted_streaming")
                 return
         sys.exit(0)
+    if mode == "subagents":
+        with open(os.path.join(os.path.dirname(__file__), "claude-subagents.jsonl")) as frames:
+            for line in frames:
+                emit(json.loads(line))
     assistant("msg_1", {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}}, "tool_use")
     tool_result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "", "is_error": False}
     emit({"type": "user", "message": {"role": "user", "content": [tool_result]}, "parent_tool_use_id": None,

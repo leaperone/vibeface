@@ -19,6 +19,7 @@ const WORK: &str = r###"{
     "failure":null,"state":"finished","target":{"kind":"channel_task","channel_id":"channel-a","task_id":"task-a","bot_id":"bot-a"},
     "source_events":["event-dispatched","event-finished"]
   },
+  "subagents":[],
   "coverage":{"source":"shared_history","complete":false}
 }"###;
 const HISTORY: &str = r###"{
@@ -74,6 +75,37 @@ fn bindings() -> HistoryBindings {
 }
 fn history(value: Value) -> anyhow::Result<WorkspaceHistory> {
     parse_workspace_history(value, "network-a", Some("channel-a"), None, &bindings())
+}
+
+#[test]
+fn subagent_details_validate_parent_attempt_usage_and_safe_labels() {
+    let mut value: Value = serde_json::from_str(WORK).unwrap();
+    value["subagents"] = serde_json::json!([{"attempt_id":"attempt-a","progress":{
+        "parent_tool_use_id":"parent-a","status":"completed","tools":[{"tool_use_id":"tool-a","kind":"command","status":"failed"}],
+        "usage":{"input_tokens":20,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":null}
+    }}]);
+    let detail = parse_work_detail(value.clone(), "network-a", "chat-a", "work-1").unwrap();
+    assert_eq!(detail.subagents[0].attempt_id, "attempt-a");
+    assert_eq!(
+        detail.subagents[0]
+            .progress
+            .usage
+            .as_ref()
+            .unwrap()
+            .input_tokens,
+        Some(20)
+    );
+    let mut invalid = value.clone();
+    invalid["subagents"][0]["progress"]["text"] = serde_json::json!("private-text");
+    assert!(parse_work_detail(invalid, "network-a", "chat-a", "work-1").is_err());
+    let mut duplicate = value.clone();
+    duplicate["subagents"]
+        .as_array_mut()
+        .unwrap()
+        .push(value["subagents"][0].clone());
+    assert!(parse_work_detail(duplicate, "network-a", "chat-a", "work-1").is_err());
+    value["subagents"][0]["progress"]["usage"]["input_tokens"] = serde_json::json!(-1);
+    assert!(parse_work_detail(value, "network-a", "chat-a", "work-1").is_err());
 }
 
 #[test]

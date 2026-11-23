@@ -31,6 +31,10 @@ use vibeface_bridge::{
     failure::{ExecFailure, FailureKind},
     turn::TurnStatus,
 };
+use vibeface_protocol::workspace::{
+    MAX_SUBAGENT_TOOLS, MAX_WORK_SUBAGENTS, SubagentProgress, SubagentStatus, SubagentTool,
+    SubagentToolKind, SubagentUsage,
+};
 
 /// Process trees of the running Claude Code processes, with the program each one runs.
 pub(super) const PIDFILE: &str = "claude.pid";
@@ -526,12 +530,117 @@ enum Frame {
     ToolStarted {
         id: String,
         name: &'static str,
+        subagent: bool,
     },
     ToolEnded {
         id: String,
+        failed: bool,
+    },
+    Subagent {
+        parent: String,
+        update: SubagentUpdate,
     },
     /// The `result` that ends the turn.
     Ended(Ending),
+}
+
+#[derive(Debug, PartialEq)]
+enum SubagentUpdate {
+    Started,
+    Tool(SubagentTool),
+    Usage {
+        message: String,
+        usage: SubagentUsage,
+    },
+    UnknownUsage,
+    Ended {
+        status: SubagentStatus,
+        usage: Option<SubagentUsage>,
+    },
+}
+
+fn frame_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|id| vibeface_protocol::validate_id(id).is_ok())
+        .map(str::to_owned)
+}
+
+fn reported_usage(value: &Value) -> Option<SubagentUsage> {
+    let count = |key: &str| {
+        value[key]
+            .as_u64()
+            .filter(|count| *count <= 9_007_199_254_740_991)
+    };
+    let usage = SubagentUsage {
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        cache_creation_input_tokens: count("cache_creation_input_tokens"),
+        cache_read_input_tokens: count("cache_read_input_tokens"),
+    };
+    (usage != SubagentUsage::default()).then_some(usage)
+}
+
+fn subagent_frames(frame: &Value, parent: String) -> Vec<Frame> {
+    let mut updates = vec![];
+    let blocks = || frame["message"]["content"].as_array().into_iter().flatten();
+    match frame["type"].as_str() {
+        Some("assistant") => {
+            updates.push(SubagentUpdate::Started);
+            for block in blocks().filter(|block| block["type"] == "tool_use") {
+                if let Some(id) = frame_id(&block["id"]) {
+                    updates.push(SubagentUpdate::Tool(SubagentTool {
+                        tool_use_id: id,
+                        kind: subagent_tool_kind(block["name"].as_str().unwrap_or_default()),
+                        status: SubagentStatus::Running,
+                    }));
+                }
+            }
+            updates.push(match frame_id(&frame["message"]["id"]) {
+                Some(message) => SubagentUpdate::Usage {
+                    message,
+                    usage: reported_usage(&frame["message"]["usage"]).unwrap_or_default(),
+                },
+                None => SubagentUpdate::UnknownUsage,
+            });
+        }
+        Some("user") => {
+            for block in blocks().filter(|block| block["type"] == "tool_result") {
+                if let Some(id) = frame_id(&block["tool_use_id"]) {
+                    updates.push(SubagentUpdate::Tool(SubagentTool {
+                        tool_use_id: id,
+                        kind: SubagentToolKind::Tool,
+                        status: if block["is_error"] == true {
+                            SubagentStatus::Failed
+                        } else {
+                            SubagentStatus::Completed
+                        },
+                    }));
+                }
+            }
+        }
+        Some("result") => updates.push(SubagentUpdate::Ended {
+            status: if frame["terminal_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("aborted"))
+            {
+                SubagentStatus::Interrupted
+            } else if frame["subtype"] == "success" && frame["is_error"] != true {
+                SubagentStatus::Completed
+            } else {
+                SubagentStatus::Failed
+            },
+            usage: reported_usage(&frame["usage"]),
+        }),
+        _ => {}
+    }
+    updates
+        .into_iter()
+        .map(|update| Frame::Subagent {
+            parent: parent.clone(),
+            update,
+        })
+        .collect()
 }
 
 /// How a turn ended.
@@ -620,8 +729,10 @@ fn frames(line: &str) -> Vec<Frame> {
     let Ok(frame) = serde_json::from_str::<Value>(line) else {
         return vec![];
     };
-    if frame["parent_tool_use_id"].is_string() {
-        return vec![];
+    if !frame["parent_tool_use_id"].is_null() {
+        return frame_id(&frame["parent_tool_use_id"])
+            .map(|parent| subagent_frames(&frame, parent))
+            .unwrap_or_default();
     }
     let blocks = || frame["message"]["content"].as_array().into_iter().flatten();
     match frame["type"].as_str() {
@@ -648,6 +759,7 @@ fn frames(line: &str) -> Vec<Frame> {
                     "tool_use" => Some(Frame::ToolStarted {
                         id: block["id"].as_str()?.to_owned(),
                         name: tool_kind(block["name"].as_str().unwrap_or_default()),
+                        subagent: matches!(block["name"].as_str(), Some("Task" | "Agent")),
                     }),
                     _ => None,
                 })
@@ -658,6 +770,7 @@ fn frames(line: &str) -> Vec<Frame> {
             .filter_map(|block| {
                 Some(Frame::ToolEnded {
                     id: block["tool_use_id"].as_str()?.to_owned(),
+                    failed: block["is_error"] == true,
                 })
             })
             .collect(),
@@ -668,11 +781,15 @@ fn frames(line: &str) -> Vec<Frame> {
 
 /// How the chat names a Claude Code tool.
 fn tool_kind(name: &str) -> &'static str {
+    subagent_tool_kind(name).as_str()
+}
+
+fn subagent_tool_kind(name: &str) -> SubagentToolKind {
     match name {
-        "Bash" | "BashOutput" | "KillShell" => "command",
-        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "file change",
-        "WebSearch" | "WebFetch" => "web search",
-        _ => "tool",
+        "Bash" | "BashOutput" | "KillShell" => SubagentToolKind::Command,
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => SubagentToolKind::FileChange,
+        "WebSearch" | "WebFetch" => SubagentToolKind::WebSearch,
+        _ => SubagentToolKind::Tool,
     }
 }
 
@@ -686,9 +803,121 @@ struct Turn {
     session: Option<String>,
     tools: HashMap<String, &'static str>,
     ending: Option<Ending>,
+    subagents: HashMap<String, SubagentState>,
+    subagent_update: Option<SubagentProgress>,
+}
+
+struct SubagentState {
+    progress: SubagentProgress,
+    messages: BTreeMap<String, SubagentUsage>,
+    result_usage: Option<SubagentUsage>,
+    usage_overflow: bool,
+}
+
+fn merged_count(previous: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (previous, next) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn merge_usage(previous: &mut SubagentUsage, usage: SubagentUsage) {
+    previous.input_tokens = merged_count(previous.input_tokens, usage.input_tokens);
+    previous.output_tokens = merged_count(previous.output_tokens, usage.output_tokens);
+    previous.cache_creation_input_tokens = merged_count(
+        previous.cache_creation_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    previous.cache_read_input_tokens = merged_count(
+        previous.cache_read_input_tokens,
+        usage.cache_read_input_tokens,
+    );
+}
+
+impl SubagentState {
+    fn apply(&mut self, update: SubagentUpdate) {
+        match update {
+            SubagentUpdate::Started => {}
+            SubagentUpdate::Tool(mut tool) => {
+                if let Some(previous) = self
+                    .progress
+                    .tools
+                    .iter_mut()
+                    .find(|previous| previous.tool_use_id == tool.tool_use_id)
+                {
+                    if tool.status == SubagentStatus::Running {
+                        previous.kind = tool.kind;
+                    } else {
+                        tool.kind = previous.kind;
+                        *previous = tool;
+                    }
+                } else if self.progress.tools.len() < MAX_SUBAGENT_TOOLS {
+                    self.progress.tools.push(tool);
+                }
+            }
+            SubagentUpdate::Usage { message, usage } => {
+                if self.messages.len() >= 256 && !self.messages.contains_key(&message) {
+                    self.usage_overflow = true;
+                } else {
+                    merge_usage(self.messages.entry(message).or_default(), usage);
+                }
+            }
+            SubagentUpdate::UnknownUsage => self.usage_overflow = true,
+            SubagentUpdate::Ended { status, usage } => {
+                if self.progress.status == SubagentStatus::Running {
+                    self.progress.status = status;
+                }
+                if let Some(usage) = usage {
+                    merge_usage(self.result_usage.get_or_insert_default(), usage);
+                }
+            }
+        }
+        let sum = |field: fn(&SubagentUsage) -> Option<u64>| {
+            self.messages.values().try_fold(0_u64, |sum, usage| {
+                sum.checked_add(field(usage)?)
+                    .filter(|sum| *sum <= 9_007_199_254_740_991)
+            })
+        };
+        self.progress.usage = self.result_usage.clone().or_else(|| {
+            (!self.usage_overflow && !self.messages.is_empty()).then(|| SubagentUsage {
+                input_tokens: sum(|usage| usage.input_tokens),
+                output_tokens: sum(|usage| usage.output_tokens),
+                cache_creation_input_tokens: sum(|usage| usage.cache_creation_input_tokens),
+                cache_read_input_tokens: sum(|usage| usage.cache_read_input_tokens),
+            })
+        });
+    }
 }
 
 impl Turn {
+    fn apply_subagent(&mut self, parent: String, update: SubagentUpdate) {
+        let fresh = !self.subagents.contains_key(&parent);
+        if vibeface_protocol::validate_id(&parent).is_err()
+            || self.subagents.len() >= MAX_WORK_SUBAGENTS && !self.subagents.contains_key(&parent)
+        {
+            return;
+        }
+        let state = self
+            .subagents
+            .entry(parent.clone())
+            .or_insert_with(|| SubagentState {
+                progress: SubagentProgress {
+                    parent_tool_use_id: parent,
+                    status: SubagentStatus::Running,
+                    tools: vec![],
+                    usage: None,
+                },
+                messages: BTreeMap::new(),
+                result_usage: None,
+                usage_overflow: false,
+            });
+        let previous = state.progress.clone();
+        state.apply(update);
+        if fresh || state.progress != previous {
+            self.subagent_update = Some(state.progress.clone());
+        }
+    }
+
     /// Takes one frame in; returns what the chat shows of it, shaped as `native_progress`.
     fn apply(&mut self, frame: Frame) -> Option<Value> {
         match frame {
@@ -700,12 +929,28 @@ impl Turn {
             Frame::Text { id, text } => Some(
                 json!({"type":"text_snapshot","item_id":bounded(&id, 128),"text":bounded(&text, 8000)}),
             ),
-            Frame::ToolStarted { id, name } => {
+            Frame::ToolStarted { id, name, subagent } => {
+                if subagent {
+                    self.apply_subagent(id.clone(), SubagentUpdate::Started);
+                }
                 let progress = tool_progress(&id, name, "running");
                 self.tools.insert(id, name);
                 Some(progress)
             }
-            Frame::ToolEnded { id } => {
+            Frame::ToolEnded { id, failed } => {
+                if self.subagents.contains_key(&id) {
+                    self.apply_subagent(
+                        id.clone(),
+                        SubagentUpdate::Ended {
+                            status: if failed {
+                                SubagentStatus::Failed
+                            } else {
+                                SubagentStatus::Completed
+                            },
+                            usage: None,
+                        },
+                    );
+                }
                 let name = self.tools.remove(&id)?;
                 Some(tool_progress(&id, name, "completed"))
             }
@@ -713,6 +958,10 @@ impl Turn {
                 let progress = json!({"type":"status","status":ending.status.as_str()});
                 self.ending = Some(ending);
                 Some(progress)
+            }
+            Frame::Subagent { parent, update } => {
+                self.apply_subagent(parent, update);
+                None
             }
         }
     }
@@ -1594,6 +1843,13 @@ async fn follow(
                 && let Err(error) = node.signal_work(&network, &work_id, signal).await
             {
                 tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code work update was not recorded");
+            }
+            if let Some(subagent) = turn.subagent_update.take()
+                && let Err(error) = node
+                    .signal_work(&network, &work_id, Signal::Subagent(subagent))
+                    .await
+            {
+                tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code subagent update was not recorded");
             }
         }
         if let Some(next) = turn.ending.take() {
@@ -3614,6 +3870,97 @@ time.sleep(0.05)
                 record.state
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_details_preserve_attribution_and_usage_without_changing_the_reply()
+    -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, network) = node(&place).await?;
+        let spec = spec(&node, &place, "subagents", "subagents inspect")?;
+        dispatch(&node, &network, &spec).await?;
+        let finished = until(&node, &spec.work_id, WorkState::finished).await?;
+        assert_work_outcome(&finished, WorkOutcome::Completed);
+        assert_eq!(finished.text, "done: subagents inspect");
+        let detail = node
+            .work_detail(
+                &Access::User {
+                    network_id: network.clone(),
+                    scope: UserScope::Network,
+                },
+                &json!({"conversation_id":"c","work_id":spec.work_id}),
+            )
+            .await?;
+        let subagents: Vec<crate::model::WorkSubagent> =
+            serde_json::from_value(detail["subagents"].clone())?;
+        assert_eq!(subagents.len(), 2);
+        assert!(
+            subagents
+                .iter()
+                .all(|agent| agent.attempt_id == derived(MESSAGE_SEED, &spec.work_id))
+        );
+        let a = &subagents
+            .iter()
+            .find(|agent| agent.progress.parent_tool_use_id == "parent_a")
+            .context("first child")?
+            .progress;
+        let b = &subagents
+            .iter()
+            .find(|agent| agent.progress.parent_tool_use_id == "parent_b")
+            .context("second child")?
+            .progress;
+        assert_eq!(a.status, SubagentStatus::Completed);
+        assert_eq!(a.tools[0].tool_use_id, "tool_a");
+        assert_eq!(a.tools[0].kind, SubagentToolKind::Command);
+        assert_eq!(a.tools[0].status, SubagentStatus::Failed);
+        assert_eq!(
+            a.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(20)
+        );
+        assert_eq!(
+            a.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(7)
+        );
+        assert_eq!(b.status, SubagentStatus::Completed);
+        assert_eq!(b.tools[0].tool_use_id, "tool_b");
+        assert_eq!(b.tools[0].kind, SubagentToolKind::FileChange);
+        assert_eq!(b.usage.as_ref().and_then(|usage| usage.input_tokens), None);
+        assert!(!detail.to_string().contains("private-"));
+        let events = node
+            .store
+            .call("claude.test.subagent_history", {
+                let network = network.clone();
+                let author = node.identity.device_id()?;
+                move |store| store.events_from(&network, &author, 1, 256)
+            })
+            .await?;
+        assert!(!serde_json::to_string(&events)?.contains("private-"));
+        assert_eq!(place.user_frames(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_usage_deduplicates_message_snapshots_and_rejects_invalid_attribution() {
+        let mut turn = Turn::default();
+        for output_tokens in [2, 4, 2] {
+            for frame in frames(&json!({"type":"assistant","parent_tool_use_id":"parent","message":{"id":"message","content":[{"type":"text","text":"private-text"}],"usage":{"input_tokens":5,"output_tokens":output_tokens}}}).to_string()) {
+                assert!(turn.apply(frame).is_none());
+            }
+        }
+        let usage = turn.subagents["parent"].progress.usage.as_ref().unwrap();
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (Some(5), Some(4))
+        );
+        assert!(turn.ending.is_none());
+        assert!(turn.session.is_none());
+        for parent in [
+            json!("invalid parent"),
+            json!({"private":"id"}),
+            json!("x".repeat(129)),
+        ] {
+            assert!(frames(&json!({"type":"assistant","parent_tool_use_id":parent,"message":{"content":[{"type":"text","text":"private-text"}]}}).to_string()).is_empty());
         }
     }
 

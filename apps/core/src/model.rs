@@ -2,6 +2,7 @@ use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub use vibeface_bridge::failure::FailureKind;
+pub use vibeface_protocol::workspace::{SubagentProgress, WorkSubagent};
 
 pub type NetworkId = String;
 pub type DeviceId = String;
@@ -1002,6 +1003,8 @@ pub enum EventBody {
         thread_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentProgress>,
     },
     /// Written by the target, including `unverified`. The user settles an unknown result through
     /// any entry Node, signed; the causal owner may also record it as `unverified`.

@@ -41,7 +41,7 @@ impl Runtime {
         let scope = id(input, "conversation_id")?;
         let work_id = id(input, "work_id")?;
         self.require_scope(access, &scope).await?;
-        let (work, target, sources) = {
+        let (work, target, sources, subagents) = {
             let network = access.network_id().to_owned();
             self.store
                 .call("chat_controls.work_detail", move |store| {
@@ -52,14 +52,15 @@ impl Runtime {
                     );
                     let target = store.work_input_target(&network, &scope, &work_id)?;
                     let sources = store.work_source_events(&network, &scope, &work_id)?;
-                    Ok((work, target, sources))
+                    let subagents = store.work_subagents(&network, &scope, &work_id)?;
+                    Ok((work, target, sources, subagents))
                 })
                 .await?
         };
         let mut value = serde_json::to_value(&work)?;
         value["target"] = json!(target);
         value["source_events"] = json!(sources);
-        Ok(json!({"work":value,"coverage":{"source":"shared_history","complete":false}}))
+        Ok(json!({"work":value,"subagents":subagents,"coverage":{"source":"shared_history","complete":false}}))
     }
 
     async fn require_attachment_scope(&self, access: &Access, scope: &str) -> Result<()> {

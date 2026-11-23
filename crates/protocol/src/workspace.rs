@@ -6,6 +6,101 @@ type EventHash = String;
 type ScopeId = String;
 type VersionVector = BTreeMap<DeviceId, u64>;
 
+pub const MAX_WORK_SUBAGENTS: usize = 64;
+pub const MAX_SUBAGENT_TOOLS: usize = 32;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentToolKind {
+    Command,
+    FileChange,
+    WebSearch,
+    Tool,
+}
+
+impl SubagentToolKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::FileChange => "file change",
+            Self::WebSearch => "web search",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTool {
+    pub tool_use_id: String,
+    pub kind: SubagentToolKind,
+    pub status: SubagentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentProgress {
+    pub parent_tool_use_id: String,
+    pub status: SubagentStatus,
+    pub tools: Vec<SubagentTool>,
+    pub usage: Option<SubagentUsage>,
+}
+
+impl SubagentProgress {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::validate_id(&self.parent_tool_use_id)?;
+        if self.tools.len() > MAX_SUBAGENT_TOOLS {
+            return Err("too many subagent tools".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for tool in &self.tools {
+            crate::validate_id(&tool.tool_use_id)?;
+            if !ids.insert(&tool.tool_use_id) {
+                return Err("duplicate subagent tool".into());
+            }
+        }
+        if let Some(usage) = &self.usage
+            && [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|tokens| tokens > 9_007_199_254_740_991)
+        {
+            return Err("invalid subagent usage".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkSubagent {
+    pub attempt_id: String,
+    pub progress: SubagentProgress,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputTarget {

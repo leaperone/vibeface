@@ -545,6 +545,7 @@ fn maximal_signed_work_events_measure_the_complete_history_response() -> Result<
             summary: String::new(),
             thread_id: None,
             turn_id: None,
+            subagent: None,
         },
         EventBody::WorkFinished {
             work_id: "maximal-work".into(),

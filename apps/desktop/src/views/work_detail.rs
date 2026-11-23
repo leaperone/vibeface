@@ -184,6 +184,37 @@ impl Desktop {
                 ));
             }
         }
+        for subagent in &detail.subagents {
+            let progress = &subagent.progress;
+            let count = |value: Option<u64>| {
+                value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "未知".into())
+            };
+            let usage = progress.usage.as_ref();
+            page = page
+                .child(self.row(
+                    "Claude 子代理",
+                    format!(
+                        "{} · 工作尝试 {}",
+                        progress.parent_tool_use_id, subagent.attempt_id
+                    ),
+                ))
+                .child(self.row("子代理状态", subagent_status(progress.status)))
+                .child(self.row(
+                    "用量（token）",
+                    format!(
+                        "输入 {} · 输出 {} · 缓存写入 {} · 缓存读取 {}",
+                        count(usage.and_then(|usage| usage.input_tokens)),
+                        count(usage.and_then(|usage| usage.output_tokens)),
+                        count(usage.and_then(|usage| usage.cache_creation_input_tokens)),
+                        count(usage.and_then(|usage| usage.cache_read_input_tokens))
+                    ),
+                ));
+            for tool in &progress.tools {
+                page = page.child(self.row(tool.kind.as_str(), subagent_status(tool.status)));
+            }
+        }
         if let Some(failure) = work.failure {
             page = page.child(self.row("执行失败类型", format!("{failure:?}")));
         }
@@ -505,6 +536,15 @@ fn work_state_label(state: WorkState) -> &'static str {
         WorkState::Interrupting => "等待停止确认",
         WorkState::Finished => "已结束",
         WorkState::Unverified => "结果待核实",
+    }
+}
+fn subagent_status(status: vibeface_protocol::workspace::SubagentStatus) -> &'static str {
+    use vibeface_protocol::workspace::SubagentStatus;
+    match status {
+        SubagentStatus::Running => "执行中",
+        SubagentStatus::Completed => "已完成",
+        SubagentStatus::Failed => "失败",
+        SubagentStatus::Interrupted => "已停止",
     }
 }
 pub(crate) fn outcome_label(outcome: WorkOutcome) -> &'static str {

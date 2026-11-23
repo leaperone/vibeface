@@ -1256,7 +1256,7 @@ test("workspace preserves bot and message requests while routing native decision
         let domain: WorkspaceDomainState = { channels: [], tasks: [], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
         current.rpc = async (method, body = {}) => {
           if (method === 'workspace_state') return domain
-          if (method === 'work_detail') return { work: { ...work, conversation_id: 'chat', target: null, source_events: sourceEvents }, coverage: { source: 'shared_history', complete: false } }
+          if (method === 'work_detail') return { work: { ...work, conversation_id: 'chat', target: null, source_events: sourceEvents }, subagents: [], coverage: { source: 'shared_history', complete: false } }
           if (method === 'workspace_command') {
             const command = workspaceModel.parseWorkspaceCommand(body.command)
             assert.ok(command.kind === 'create_task')
@@ -3058,7 +3058,7 @@ const parityShared = () => ({
   async readWork(input: { conversation_id: string; work_id: string }) {
     const work = this.data?.conversation?.conversation_id === input.conversation_id ? this.data.works.find((item) => item.work_id === input.work_id) : undefined
     if (!work) throw new Error('共享历史中找不到这个工作')
-    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history' as const, complete: false as const } }
+    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, subagents: [], coverage: { source: 'shared_history' as const, complete: false as const } }
   },
 })
 
@@ -3441,7 +3441,7 @@ test('composers save each pending draft once and let edited drafts save independ
     const shared = {
       ...parityShared(), data: parseConversation({ ...context, works: [parityWork()] }), workspaceState: domain,
       chatSlot: { conversationId: 'chat', missing: false }, fresh: new Set<string>(), interrupted: [], view: 'chat',
-      readWork: async () => ({ work: { ...parityWork(), conversation_id: 'chat', target: null, source_events: [] }, coverage: { source: 'shared_history', complete: false } }),
+      readWork: async () => ({ work: { ...parityWork(), conversation_id: 'chat', target: null, source_events: [] }, subagents: [], coverage: { source: 'shared_history', complete: false } }),
       readWorkspaceState: async () => domain, readWorkspaceHistory: async (filter: WorkspaceFilter) => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: filter.task_id ? 'task' : 'channel' } }),
       sendMessage: (text: string, files: ReadableFile[], _sent: unknown, options: InputOptions) => {
         attempts.push({ text, files: files.map((file) => file.name), target: options.target, intent: options.intent })
@@ -4286,12 +4286,16 @@ test('both work details read terminal shared records outside Main and discard la
       render()
       workId = 'second'
       render()
-      second.resolve({ work: { ...parityWork({ work_id: 'second', title: 'Task 内已结束工作', state: 'finished', outcome: 'completed', result_text: '完整结果记录' }), target: null, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } })
+      second.resolve({ work: { ...parityWork({ work_id: 'second', title: 'Task 内已结束工作', state: 'finished', outcome: 'completed', result_text: '完整结果记录' }), target: null, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, subagents: [{ attempt_id: 'attempt-a', progress: { parent_tool_use_id: 'parent-a', status: 'completed', tools: [{ tool_use_id: 'tool-a', kind: 'command', status: 'failed' }], usage: { input_tokens: 20, output_tokens: 7, cache_creation_input_tokens: 0, cache_read_input_tokens: null } } }, { attempt_id: 'attempt-a', progress: { parent_tool_use_id: 'parent-b', status: 'running', tools: [], usage: null } }], coverage: { source: 'shared_history', complete: false } })
       await settleComponent()
       assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ conversation_id: 'chat', work_id: 'first' }, { conversation_id: 'chat', work_id: 'second' }])
       assert.match(content(), /完整结果记录/)
       assert.match(content(), /完整执行历史未提供/)
-      first.resolve({ work: { ...parityWork({ work_id: 'first', title: '旧路由迟到内容' }), target: null, source_events: ['b'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } })
+      assert.match(content(), /Claude 子代理|parent-a/)
+      assert.match(content(), /输入 20/)
+      assert.match(content(), /输出 7/)
+      assert.match(content(), /未知/)
+      first.resolve({ work: { ...parityWork({ work_id: 'first', title: '旧路由迟到内容' }), target: null, source_events: ['b'.repeat(64)], conversation_id: 'chat' }, subagents: [], coverage: { source: 'shared_history', complete: false } })
       await settleComponent()
       assert.match(content(), /完整结果记录/)
       assert.doesNotMatch(content(), /旧路由迟到内容/)
@@ -4307,7 +4311,7 @@ test('terminal work followups retain their Task identity or explicitly create a 
     const work = kind === 'unverified' ? parityWork({ state: 'unverified' }) : parityWork({ state: 'finished', outcome: 'failed', prompt: '原始完整交代', result_text: '上次已经产生的输出' })
     const sends: { text: string; options: InputOptions }[] = [], reads: unknown[] = []
     const shared = { ...parityShared(), data: parseConversation(context), openWorks: [],
-      readWork: async () => ({ work: { ...work, target, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } }),
+      readWork: async () => ({ work: { ...work, target, source_events: ['a'.repeat(64)], conversation_id: 'chat' }, subagents: [], coverage: { source: 'shared_history', complete: false } }),
       readWorkspaceState: async (filter: unknown) => { reads.push(filter); return { tasks: [{ task_id: 'stable-task', revision: 3, action: 'continue' }] } },
       sendMessage: async (text: string, _files: unknown[], _sent: unknown, options: InputOptions) => { sends.push({ text, options }); return true },
     }
@@ -5055,7 +5059,7 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
   const workspace = { ...parityShared(), generation: 1, nodes: [], liveProgress: [], writable: true, pendingMessages: [], canSaveMessages: true, questions: [], data, interruptWork: async (work: string) => { stopped.push(work) }, async readWork(input: { conversation_id: string; work_id: string }) {
     const work = data.works.find((item) => item.work_id === input.work_id)
     if (!work) throw new Error('共享历史中找不到这个工作')
-    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, coverage: { source: 'shared_history', complete: false } }
+    return { work: { ...work, target: work.target ?? null, source_events: ['a'.repeat(64)], conversation_id: input.conversation_id }, subagents: [], coverage: { source: 'shared_history', complete: false } }
   } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/arc/product-kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { ...taskLabels, nodeName: () => '设备', promptSummary, taskActive: () => true, taskLabel: () => '', taskStale: () => false, staleTaskLabel: '', progressLabel: () => '', shownState: (work: { state: string }) => work.state, taskAgent: () => null, followUp, followUpCopy }, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/workspace/questions.ts': workspaceQuestions }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
@@ -6169,7 +6173,7 @@ test('queued input edits and cancellation use the exact input CAS and leave the 
 test('task detail keeps long progress collapsed by default and finished tasks keep their result over stale progress', async () => {
   const work = parityWork({ state: 'finished', outcome: 'completed', result_text: '最终结果', summary: '✓ 读记录\n→ 核对结果\n· 等待同步' })
   const workspace = {
-    ...parityShared(), readWork: async () => ({ work: { ...work, conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } }),
+    ...parityShared(), readWork: async () => ({ work: { ...work, conversation_id: 'chat' }, subagents: [], coverage: { source: 'shared_history', complete: false } }),
     generation: 1, connectionOnline: true, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
     data: parseConversation({ ...context, works: [parityWork({ state: 'finished', outcome: 'completed', result_text: '最终结果', summary: '✓ 读记录\n→ 核对结果\n· 等待同步' })] }),
     liveProgress: [{ kind: 'native', work_id: 'work', target_node: 'worker', text: '旧进展行', sequence: 1 }],
@@ -6204,7 +6208,7 @@ test('unknown task detail reads its exact work without starting a Main request a
   const work = parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })
   const workspace = {
     ...parityShared(),
-    readWork: async (input: unknown) => { reads.push(JSON.parse(JSON.stringify(input))); return { work: { ...work, conversation_id: 'chat' }, coverage: { source: 'shared_history', complete: false } } },
+    readWork: async (input: unknown) => { reads.push(JSON.parse(JSON.stringify(input))); return { work: { ...work, conversation_id: 'chat' }, subagents: [], coverage: { source: 'shared_history', complete: false } } },
     refresh: async () => { refreshed++ },
     ...historyActions, generation: 1, isCurrent: () => true, connectionOnline, writable: true, incomplete: false, selectedBot: parityBot, nodes: [parityNode], answered: {},
     data: parseConversation({ ...context, works: [work] }),

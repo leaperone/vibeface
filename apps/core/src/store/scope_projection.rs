@@ -451,6 +451,43 @@ pub(crate) fn notification_target_from(
 }
 
 impl Store {
+    pub(crate) fn work_subagents(
+        &self,
+        network: &str,
+        conversation: &str,
+        work_id: &str,
+    ) -> Result<Vec<crate::model::WorkSubagent>> {
+        let mut query = self.connection.prepare(
+            "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND subject=?
+             AND effective=1 AND kind='work_progress' ORDER BY lamport DESC,author DESC,seq DESC",
+        )?;
+        let mut rows = query.query(params![network, conversation, work_id])?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut result = vec![];
+        while let Some(row) = rows.next()? {
+            let envelope: crate::model::SignedEvent =
+                serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            if let EventBody::WorkProgress {
+                turn_id: Some(attempt_id),
+                subagent: Some(progress),
+                ..
+            } = event.body
+                && seen.insert((attempt_id.clone(), progress.parent_tool_use_id.clone()))
+            {
+                result.push(crate::model::WorkSubagent {
+                    attempt_id,
+                    progress,
+                });
+                if result.len() == vibeface_protocol::workspace::MAX_WORK_SUBAGENTS {
+                    break;
+                }
+            }
+        }
+        result.reverse();
+        Ok(result)
+    }
+
     pub(crate) fn work_source_events(
         &self,
         network: &str,

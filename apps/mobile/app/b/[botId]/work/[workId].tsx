@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils'
 import { Composer } from '@/features/chat/composer'
 import { InputStatus } from '@/features/workspace/workspace'
 import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
+import { subagentToolLabels, subagentUsageLabel } from '@vibeface/client/workspace/labels.ts'
 import { promptIntent } from '@vibeface/client/chat/protocol.ts'
 import type { PickedAttachment } from '@/data/types'
 
@@ -138,6 +139,12 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
         <Text selectable className="font-mono text-sm">{progress.text}</Text>
       </ScrollView> : null}
     </View>
+    {detail?.value.subagents.length ? <Details label={`Claude 子代理 · ${detail.value.subagents.length}`}><View className="gap-4">{detail.value.subagents.map(({ attempt_id, progress }) => <View key={`${attempt_id}:${progress.parent_tool_use_id}`} className="gap-1">
+      <Text className="font-medium">{taskLabel(progress.status)}</Text>
+      <Text selectable className="text-sm text-muted">父调用 {progress.parent_tool_use_id} · 工作尝试 {attempt_id}</Text>
+      <Text className="text-sm">{subagentUsageLabel(progress.usage)}</Text>
+      {progress.tools.map(tool => <Text key={tool.tool_use_id} className="text-sm">{subagentToolLabels[tool.kind]} · {taskLabel(tool.status)}</Text>)}
+    </View>)}</View></Details> : null}
     {work.kind === 'task' ? <Details label="协调回合">
       {coordination ? <>
         <Text>{!shared.connectionOnline || !shared.synced || shared.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</Text>

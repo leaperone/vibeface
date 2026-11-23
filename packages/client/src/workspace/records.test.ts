@@ -190,7 +190,7 @@ test('scope_jobs preserves registered Routine metadata without exposing private 
 })
 
 test('an exact shared Work detail can include an ended Work while keeping coverage incomplete', () => {
-  const detail = parseWorkDetail({ work: { ...work('ended', { state: 'finished', outcome: 'completed', result_text: '已完成的共享结果' }), conversation_id: 'chat', target: { kind: 'task', task_id: 'source-task' }, source_events: ['dispatch-event', 'finished-event'] }, coverage: { source: 'shared_history', complete: false } })
+  const detail = parseWorkDetail({ work: { ...work('ended', { state: 'finished', outcome: 'completed', result_text: '已完成的共享结果' }), conversation_id: 'chat', target: { kind: 'task', task_id: 'source-task' }, source_events: ['dispatch-event', 'finished-event'] }, subagents: [], coverage: { source: 'shared_history', complete: false } })
   assert.equal(detail.work.work_id, 'ended')
   assert.equal(detail.work.result_text, '已完成的共享结果')
   assert.deepEqual(detail.work.target, { kind: 'task', task_id: 'source-task' })
@@ -199,6 +199,20 @@ test('an exact shared Work detail can include an ended Work while keeping covera
   assert.equal(parseWorkDetail({ ...detail, work: { ...detail.work, target: null } }).work.target, null)
   assert.throws(() => parseWorkDetail({ ...detail, coverage: { source: 'native_transcript', complete: true } }))
   assert.throws(() => parseWorkDetail({ ...detail, work: { ...detail.work, source_events: Array.from({ length: 65 }, (_, index) => `event-${index}`) } }))
+})
+
+test('work subagent details retain only safe fields and validate attribution and reported usage', () => {
+  const progress = { parent_tool_use_id: 'parent-a', status: 'completed', tools: [{ tool_use_id: 'tool-a', kind: 'command', status: 'failed' }], usage: { input_tokens: 20, output_tokens: 7, cache_creation_input_tokens: 0, cache_read_input_tokens: null } }
+  const value = { work: { ...work('child-work'), conversation_id: 'chat', target: null, source_events: [] }, subagents: [{ attempt_id: 'attempt-a', progress }, { attempt_id: 'attempt-b', progress: { ...progress, usage: null } }], coverage: { source: 'shared_history', complete: false } }
+  const detail = parseWorkDetail(value)
+  assert.deepEqual(detail.subagents, value.subagents)
+  assert.equal(detail.subagents[1].progress.usage, null)
+  const safe = parseWorkDetail({ ...value, subagents: [{ attempt_id: 'attempt-a', progress: { ...progress, text: 'private-text', input: 'private-params', output: 'private-output', reasoning: 'private-reasoning' } }] })
+  assert(!JSON.stringify(safe).includes('private-'))
+  assert.throws(() => parseWorkDetail({ ...value, subagents: [value.subagents[0], value.subagents[0]] }))
+  assert.throws(() => parseWorkDetail({ ...value, subagents: [{ attempt_id: 'invalid attempt', progress }] }))
+  assert.throws(() => parseWorkDetail({ ...value, subagents: [{ attempt_id: 'attempt-a', progress: { ...progress, usage: { ...progress.usage, input_tokens: -1 } } }] }))
+  assert.throws(() => parseWorkDetail({ ...value, subagents: [{ attempt_id: 'attempt-a', progress: { ...progress, tools: [{ ...progress.tools[0], kind: 'private-tool-name' }] } }] }))
 })
 
 test('native approval choices retain their bound action and answers remain readable labels', () => {
