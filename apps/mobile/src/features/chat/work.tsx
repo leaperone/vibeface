@@ -20,6 +20,7 @@ import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
+import { touchRow } from '@/lib/layout'
 import { cn } from '@/lib/utils'
 import { InputStatus } from '@/features/workspace/workspace'
 
@@ -112,7 +113,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
     const result = failed ? workFailure(work) : work.result_text ? work.result_text.split('\n')[0] : workFailure(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
     const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
-      <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-control px-2 py-2 active:bg-surface-muted">
+      <Pressable accessibilityRole="link" className={cn(touchRow, '-mx-2 flex-row items-start gap-2 rounded-control px-2 py-2 active:bg-surface-muted')}>
         <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted')} />
         <View className="min-w-0 flex-1">
           <Text numberOfLines={1} className="text-sm text-foreground">{title}</Text>
@@ -124,7 +125,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
     </Link>
   }
   return <Link href={href} asChild>
-    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-2  active:bg-surface-muted ">
+    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-2 active:bg-surface-muted">
       {/* Waiting on an answer, it only says so: the question card below asks. */}
       <Icon as={state === 'waiting' ? Hand : state === 'awaiting_children' ? Hourglass : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale || state === 'awaiting_children' ? 'text-muted' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
