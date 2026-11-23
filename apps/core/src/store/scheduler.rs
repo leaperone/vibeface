@@ -3891,8 +3891,8 @@ fn end_job_from(
     let attempt_id = attempt.id.clone();
     ensure!(
         !matches!(outcome, JobOutcome::NoChange)
-            || matches!(job.scope, SessionScope::Routine { .. }),
-        "no-change outcome only applies to routine jobs"
+            || (matches!(job.scope, SessionScope::Routine { .. }) && text.trim().is_empty()),
+        "no-change outcome only applies to empty routine replies"
     );
     if let Some(context) = session
         .shown

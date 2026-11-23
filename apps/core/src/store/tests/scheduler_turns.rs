@@ -143,6 +143,22 @@ fn an_empty_human_completion_still_leaves_a_reply() -> Result<()> {
         .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    let rejected = store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &attempt,
+        JobOutcome::NoChange,
+        "",
+        3,
+    );
+    assert!(
+        rejected
+            .expect_err("no-change must be limited to routines")
+            .to_string()
+            .contains("empty routine replies")
+    );
     store.finish_job(
         &net.a,
         &net.network,
