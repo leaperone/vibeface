@@ -129,6 +129,39 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
 }
 
 #[test]
+fn an_empty_human_completion_still_leaves_a_reply() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    bot_conversation(&mut store, &net)?;
+    store.post_input_fixture(
+        &net.a,
+        &net.network,
+        signed_user(&net, "m1", "first", true)?,
+        2,
+    )?;
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "",
+        3,
+    )?;
+    let reply = store
+        .message(&net.network, "c", &claimed.job.message_id)?
+        .context("reply")?;
+    assert_eq!(reply.status, Some(ReplyStatus::Completed));
+    assert_eq!(reply.text, "（没有回复内容）");
+    Ok(())
+}
+
+#[test]
 fn confirming_a_stopped_main_turn_skips_a_work_of_unknown_scope() -> Result<()> {
     let net = net()?;
     let (mut store, _) = bot_with_message(&net)?;

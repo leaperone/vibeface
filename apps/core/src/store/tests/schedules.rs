@@ -106,6 +106,58 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
 }
 
 #[test]
+fn a_routine_no_change_keeps_completion_without_a_reply() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    bot_conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    let (saved, _) = store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", 5),
+        Provider::Codex,
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
+    };
+    let slot = 1_000 + 3 * 5 * 60_000;
+    let trigger = schedule_trigger(&schedule_id, slot);
+    assert_eq!(
+        store.admit_due_schedules(&net.a, &net.network, slot + 10)?,
+        vec![("c".to_owned(), trigger.clone())]
+    );
+    let claimed = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("routine job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::NoChange,
+        "",
+        slot + 20,
+    )?;
+    assert!(matches!(
+        store.scheduler_job("c", &trigger)?.context("job")?.state,
+        JobState::Completed { .. }
+    ));
+    assert!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .is_none()
+    );
+    assert!(store.pending_notifications(&net.network, "web")?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn a_schedule_uses_the_receiver_seen_time_when_the_writer_clock_is_fast() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;

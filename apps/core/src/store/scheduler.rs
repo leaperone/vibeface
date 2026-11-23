@@ -3815,6 +3815,7 @@ pub(crate) fn admit_work_result_from(
 fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, Option<FailureKind>, &'static str) {
     match outcome {
         JobOutcome::Completed => (ReplyStatus::Completed, None, "（没有回复内容）"),
+        JobOutcome::NoChange => (ReplyStatus::Completed, None, ""),
         JobOutcome::Failed(failure) => (ReplyStatus::Failed, Some(failure.kind), ""),
         JobOutcome::Cancelled(_) => (ReplyStatus::Stopped, None, "已停止回复。"),
         JobOutcome::Interrupted { failure, .. } => {
@@ -3888,6 +3889,11 @@ fn end_job_from(
         .context("scheduler attempt missing")?
         .clone();
     let attempt_id = attempt.id.clone();
+    ensure!(
+        !matches!(outcome, JobOutcome::NoChange)
+            || matches!(job.scope, SessionScope::Routine { .. }),
+        "no-change outcome only applies to routine jobs"
+    );
     if let Some(context) = session
         .shown
         .context
@@ -3895,7 +3901,7 @@ fn end_job_from(
         .filter(|context| context.attempt_id == attempt_id)
     {
         context.stage = match &outcome {
-            JobOutcome::Completed => ContextStage::Completed,
+            JobOutcome::Completed | JobOutcome::NoChange => ContextStage::Completed,
             JobOutcome::Failed(_) => ContextStage::Failed,
             JobOutcome::Cancelled(_) => ContextStage::Cancelled,
             JobOutcome::Interrupted {
@@ -3923,13 +3929,16 @@ fn end_job_from(
         outcome: &outcome,
         text: &text,
     };
+    let publish_reply = !matches!(outcome, JobOutcome::NoChange);
     if !pending_reconciliation
+        && publish_reply
         && let Some((work_id, signal)) = task_work_signal(&job.trigger, change)
     {
         super::work::apply_signal_from(
             connection, blob_dir, identity, network, work_id, signal, at,
         )?;
     } else if !pending_reconciliation
+        && publish_reply
         && post_reply_from(
             connection,
             blob_dir,
@@ -3994,7 +4003,7 @@ fn end_job_from(
             )?;
         }
     }
-    if matches!(outcome, JobOutcome::Completed) {
+    if matches!(outcome, JobOutcome::Completed | JobOutcome::NoChange) {
         session.shown.memory_conflicts = super::Store::commit_staged_memory_from(
             connection,
             blob_dir,
@@ -4007,7 +4016,7 @@ fn end_job_from(
         )?;
     }
     job.state = match outcome {
-        JobOutcome::Completed => JobState::Completed { attempt },
+        JobOutcome::Completed | JobOutcome::NoChange => JobState::Completed { attempt },
         JobOutcome::Failed(failure) => JobState::Failed { attempt, failure },
         JobOutcome::Cancelled(evidence) => JobState::Cancelled {
             attempt: Some(attempt),
