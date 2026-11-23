@@ -294,6 +294,9 @@ export default function ChatScreen() {
       onEndReachedThreshold={0.25}
       onScrollBeginDrag={() => { restoration.current.done = true }}
       maintainVisibleContentPosition={scrollButton.id === id && scrollButton.visible ? { minIndexForVisible: 0 } : undefined}
+      windowSize={7}
+      maxToRenderPerBatch={8}
+      updateCellsBatchingPeriod={32}
       keyExtractor={(row) => row.key}
       onScrollToIndexFailed={({ index, averageItemLength }) => {
         if (scrollInset.current.id !== id) return

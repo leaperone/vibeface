@@ -9,7 +9,7 @@ import { base64ToBytes, bytesToBase64, sha256Hex } from "../lib/byte-codec.ts"
 import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
-import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
+import { mergeProgress, type ChangedEvent, type LiveProgress } from "../lib/progress.ts"
 import { inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, replyUnsettled, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
@@ -807,6 +807,24 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
 
   useEffect(() => {
     void refreshRef.current().then(() => { if (booted && !ledgerFailed) return settleOutbox() }).catch(showRefreshError)
+    let queuedProgress: ChangedEvent[] = []
+    let progressTimer: ReturnType<typeof setTimeout> | null = null
+    const flushProgress = () => {
+      progressTimer = null
+      const batch = queuedProgress
+      queuedProgress = []
+      if (!batch.length) return
+      setLiveProgress((previous) => {
+        let next = previous
+        for (const item of batch) next = mergeProgress(next, item)
+        if (next.some((item) => item.needsRefresh && !previous.find((prior) => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
+        return next
+      })
+    }
+    const queueProgress = (event: ChangedEvent) => {
+      queuedProgress.push(event)
+      progressTimer ??= setTimeout(flushProgress, 50)
+    }
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
       if (event.type === "records") { applyRecords(event.value).catch(() => scheduleRefresh()); return }
@@ -822,11 +840,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         ? shown?.scheduler?.jobs.some((job) => job.scope.kind === 'main' && job.trigger === event.trigger)
         : shown?.works.some((work) => work.work_id === event.work_id && work.target_node === event.target_node)
       if (!known) { scheduleRefresh(); return }
-      setLiveProgress((previous) => {
-        const next = mergeProgress(previous, event)
-        if (next.some((item) => item.needsRefresh && !previous.find((prior) => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
-        return next
-      })
+      queueProgress(event)
     })
     // A device coming or going is pushed once the Node's sync notices; this rereads sooner while one is away and catches anything missed.
     let ticks = 0
@@ -838,6 +852,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
       unsubscribe(); clearInterval(timer)
+      if (progressTimer !== null) clearTimeout(progressTimer)
+      queuedProgress = []
       if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
       refreshTimer.current = null
       stopForeground()
