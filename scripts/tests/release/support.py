@@ -98,7 +98,9 @@ class Fixture:
             path.chmod(0o755)
         self.save({'head': 'a' * 40, 'events': [], 'releases': {}, 'on_main': ['a' * 40]})
         with zipfile.ZipFile(self.root / 'network-guard.zip', 'w') as guard:
-            guard.writestr('sitecustomize.py',
+            # Run the frozen CLI with Python 3.14's extraction policy on earlier interpreters too.
+            baseline_policy = 'import tarfile\ntarfile.TarFile.extraction_filter = staticmethod(tarfile.data_filter)\n' if baseline else ''
+            guard.writestr('sitecustomize.py', baseline_policy +
                 'import socket\n'
                 'def denied(*args, **kwargs): raise AssertionError("network forbidden in release fixture")\n'
                 'socket.socket.connect = denied\n'
