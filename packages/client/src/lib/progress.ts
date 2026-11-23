@@ -91,3 +91,22 @@ export function mergeProgress(previous: LiveProgress[], event: ChangedEvent): Li
   }
   return current ? previous.map(item => item.key === key ? next : item) : [...previous, next]
 }
+
+/** Keep every delta available to terminal records; only the display waits for a burst. */
+export function progressDisplay(publish: (items: LiveProgress[]) => void) {
+  let items: LiveProgress[] = []
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const cancel = () => { if (timer !== null) clearTimeout(timer); timer = null }
+  return {
+    read: () => items,
+    cancel,
+    replace(next: LiveProgress[]) { cancel(); items = next; publish(items) },
+    push(event: ChangedEvent) {
+      const previous = items
+      items = mergeProgress(items, event)
+      if (items === previous) return false
+      timer ??= setTimeout(() => { timer = null; publish(items) }, 50)
+      return items.some(item => item.needsRefresh && !previous.find(prior => prior.key === item.key)?.needsRefresh)
+    },
+  }
+}
