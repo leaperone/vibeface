@@ -12,8 +12,10 @@
 .composerFrame:focus-within { border-color: var(--border-strong); }
 .composerFrame:has(textarea:focus-visible) { border-color: var(--foreground); box-shadow: 0 0 0 3px var(--focus-ring); }
 .composerFrame label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-.composerFrame .input, .composerFrame .input:disabled { min-height: 0; max-height: 40vh; resize: none; border: 0; border-radius: 0; padding: var(--space-1); background: transparent; font-size: var(--text-base); box-shadow: none; }
+/* As Arc ai-chat's editor: the field grows with its text up to 40vh, one line at rest and three while focused. */
+.composerFrame .input, .composerFrame .input:disabled { field-sizing: content; min-height: calc(1lh + 2 * var(--space-1)); max-height: 40vh; resize: none; border: 0; border-radius: 0; padding: var(--space-1); background: transparent; font-size: var(--text-base); box-shadow: none; }
 .composerFrame .input:focus-visible { box-shadow: none; }
+.composerFrame:focus-within .input { min-height: calc(3lh + 2 * var(--space-1)); }
 /* Status and the open-question pill sit in the flow above the frame, so they never cover the newest message. */
 .above { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: var(--space-1); padding-bottom: var(--space-2); }
 .tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); padding-top: var(--space-2); }
