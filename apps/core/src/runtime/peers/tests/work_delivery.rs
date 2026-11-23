@@ -261,6 +261,20 @@ async fn blob_locks_serialize_same_hash_and_allow_other_hashes() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn staging_room_counts_preallocated_reservations() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("vibeface-staging-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir)?;
+    std::fs::File::create(dir.join("a.part"))?.set_len(200 * 1024 * 1024)?;
+    let result = (|| {
+        assert!(staging_room(&dir, 56 * 1024 * 1024).is_ok());
+        assert!(staging_room(&dir, 57 * 1024 * 1024).is_err());
+        Ok::<_, anyhow::Error>(())
+    })();
+    std::fs::remove_dir_all(&dir)?;
+    result
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn synced_assignments_run_only_after_explicit_delivery_and_are_admitted_once() -> Result<()> {
     use crate::workspace::{WORKSPACE_SCOPE, WorkspaceCommand};

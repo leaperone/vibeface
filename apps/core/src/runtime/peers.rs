@@ -2409,11 +2409,21 @@ impl Runtime {
         tokio::fs::create_dir_all(dir).await?;
         {
             let _room = self.staging_room_lock.lock().await;
-            if !tokio::fs::try_exists(&part).await? {
-                let dir = dir.to_owned();
-                let size = blob.size;
-                tokio::task::spawn_blocking(move || staging_room(&dir, size)).await??;
-            }
+            let existing = tokio::fs::metadata(&part)
+                .await
+                .ok()
+                .map(|item| item.len())
+                .unwrap_or(0);
+            let dir = dir.to_owned();
+            let additional = blob.size.saturating_sub(existing);
+            tokio::task::spawn_blocking(move || staging_room(&dir, additional)).await??;
+            let reserved = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&part)
+                .await?;
+            reserved.set_len(blob.size).await?;
         }
         let connection = self.net()?.connect(peer, net::BLOB).await?;
         let (mut send, mut recv) = connection
@@ -2438,7 +2448,7 @@ impl Runtime {
             .truncate(false)
             .open(&part)
             .await?;
-        file.set_len(committed).await?;
+        file.set_len(blob.size).await?;
         file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
