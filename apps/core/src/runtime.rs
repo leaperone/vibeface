@@ -1566,6 +1566,66 @@ impl Runtime {
                 .await?;
                 Ok(json!({"dismissed":true}))
             }
+            Ok(BusinessCommand::DismissQuestion(_)) => {
+                ensure!(access.is_user(), "only clients hide questions from 待处理");
+                let scope = scope.context("conversation_id is required")?;
+                let question_id = id(input, "question_id")?;
+                let query_network = network.to_owned();
+                let query_scope = scope.clone();
+                let query_question = question_id.clone();
+                let question = self
+                    .store
+                    .call("dismiss_question_check", move |store| {
+                        store.question(&query_network, &query_question)
+                    })
+                    .await?;
+                let Some(question) = question else {
+                    return Ok(json!({"dismissed":false}));
+                };
+                ensure!(
+                    question["conversation_id"] == query_scope,
+                    "问题不属于这个对话"
+                );
+                let open = question["answer"].is_null() && question["closed"].is_null();
+                if !open {
+                    return Ok(json!({"dismissed":false}));
+                }
+                let attention = question["attention"]["kind"].as_str();
+                let approval_choice = question["choices"].as_array().is_some_and(|choices| {
+                    choices
+                        .iter()
+                        .any(|choice| choice.get("action").is_some_and(|action| !action.is_null()))
+                });
+                ensure!(
+                    question["about"]["request_id"].is_null()
+                        && !matches!(attention, Some("approval" | "browser_takeover"))
+                        && !approval_choice,
+                    "挂起的审批不能从待处理中清除"
+                );
+                let notification_id = inbox_question_notification_id(&query_scope, &question_id);
+                let readback_id = notification_id.clone();
+                let query_network = network.to_owned();
+                let already = self
+                    .store
+                    .call("dismiss_question_readback", move |store| {
+                        store.notification_acked(&query_network, &readback_id, INBOX_CLIENT)
+                    })
+                    .await?;
+                if already {
+                    return Ok(json!({"dismissed":true}));
+                }
+                self.append(
+                    network,
+                    &query_scope,
+                    EventBody::NotificationAcked {
+                        notification_id,
+                        client_id: INBOX_CLIENT.into(),
+                        attestation: Some(attestation(input)?),
+                    },
+                )
+                .await?;
+                Ok(json!({"dismissed":true}))
+            }
             Ok(BusinessCommand::Ack(_)) => {
                 ensure!(access.is_user(), "only clients acknowledge notifications");
                 let notification = id(input, "notification_id")?;

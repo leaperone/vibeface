@@ -2,7 +2,7 @@ import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
+import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionInboxDismissible, questionInboxKey, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -64,6 +64,16 @@ test("待处理 lists exactly the open questions, urgent first, then newest firs
     row("lost", 5, { about: { ...about, request_id: "r" }, closed: "request_lost" })] })
   assert.equal(questions[4].closed, "request_lost")
   assert.deepEqual(openQuestions(questions).map((question) => question.question_id), ["urgent", "new", "old"])
+})
+
+test("only ordinary questions can receive a private list receipt", () => {
+  const parsed = (extra: Record<string, unknown> = {}) => parseQuestions({ questions: [row("q", 1, extra)] })[0]
+  assert.equal(questionInboxDismissible(parsed()), true)
+  assert.equal(questionInboxDismissible(parsed({ about: { ...about, request_id: "request" } })), false)
+  assert.equal(questionInboxDismissible(parsed({ attention: { kind: "approval", device_id: "worker" } })), false)
+  assert.equal(questionInboxDismissible(parsed({ choices: [{ label: "允许", action: "allow_once" }] })), false)
+  assert.equal(questionInboxKey("chat", "q"), questionInboxKey("chat", "q"))
+  assert.notEqual(questionInboxKey("chat", "q"), questionInboxKey("other", "q"))
 })
 
 test("an answer folds into its question instead of showing as a message", () => {

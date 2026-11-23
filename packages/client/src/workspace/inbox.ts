@@ -2,7 +2,7 @@ import { recoveryCopy } from "../identity/copy.ts"
 import type { ClientPrincipal, JoinRequest, PendingRecovery } from "../lib/node.ts"
 import { failedWork, nodeName } from "./labels.ts"
 import { botReadiness, workChecks } from "./model.ts"
-import { openQuestions } from "./questions.ts"
+import { openQuestions, questionInboxDismissible, questionInboxKey } from "./questions.ts"
 import { isSessionNotification, type BotRecord, type CoordinationCheck, type NodeInfo, type NotificationRecord, type OpenWork, type PendingCheck, type PendingMessage, type Question, type WriteStatus } from "./types.ts"
 
 export type WriteCardKind = "read_only" | "forked" | "conflicts"
@@ -29,6 +29,7 @@ export type InboxSource = {
   }
   workspace: {
     writeState: WriteStatus; questions: readonly Question[]; answered: Readonly<Record<string, string>>
+    dismissedQuestions?: ReadonlySet<string>
     openWorks: OpenWork[]; nodes: NodeInfo[]; data: { checks: CoordinationCheck[] } | null
     pendingMessages: readonly PendingMessage[]
     notifications: readonly NotificationRecord[]; ignoredNotifications: ReadonlySet<string>; bots: readonly BotRecord[]
@@ -52,7 +53,7 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   if (write.state === "read_only") items.push({ key: "write:read_only", kind: "write", write: "read_only", title: "这个节点暂时只读" })
   if (write.state === "forked") items.push({ key: "write:forked", kind: "write", write: "forked", title: "这个节点的数据被复制过" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", kind: "write", write: "conflicts", title: "有设备的数据被复制过" })
-  for (const question of openQuestions(workspace.questions)) items.push({
+  for (const question of openQuestions(workspace.questions)) if (!questionInboxDismissible(question) || !workspace.dismissedQuestions?.has(questionInboxKey(question.conversation_id, question.question_id))) items.push({
     key: `question:${question.question_id}`, kind: "question", question, title: question.text, meta: question.bot?.name, done: question.question_id in workspace.answered,
   })
   const checks = [...workChecks(workspace.openWorks, workspace.nodes), ...(workspace.data?.checks ?? []).map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail }))]

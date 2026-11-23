@@ -16,7 +16,7 @@ import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodeReport, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseQuestionInbox, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
   parseInputReceipt, parseInputNotSaved, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
@@ -27,7 +27,7 @@ import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./hi
 import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
 import { notificationPreferences, systemNotifications } from "./system-notifications.ts"
-import { answerId } from "./questions.ts"
+import { answerId, questionInboxDismissible, questionInboxKey } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
@@ -152,6 +152,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
   const [ignoredNotifications, setIgnoredNotifications] = useState<ReadonlySet<string>>(new Set())
   const [questions, setQuestions] = useState<Question[]>([])
+  const [dismissedQuestions, setDismissedQuestions] = useState<ReadonlySet<string>>(new Set())
   const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
   const openWorksRef = useRef<OpenWork[]>([])
   const knownWorks = useRef(new Map<string, WorkDetailWork>())
@@ -196,6 +197,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const messagesRef = useRef<PendingMessage[]>([])
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
+  const dismissedQuestionsRef = useRef<ReadonlySet<string>>(new Set())
   const ackNotificationRef = useRef<(notification: NotificationRecord) => Promise<void>>(async () => {})
   const ignoredNotificationsRef = useRef<ReadonlySet<string>>(new Set())
   const inFlight = useRef(new Set<string>())
@@ -596,11 +598,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       const parsedNotifications = parseNotifications(rawNotifications)
       const nextNotifications = platform.explicitMessageRead ? parsedNotifications : unreadSince(parsedNotifications, true)
-      const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
+      const nextBots = parseBots(rawBots), questionInbox = parseQuestionInbox(rawQuestions), nextQuestions = questionInbox.questions
+      const nextDismissedQuestions = new Set([...dismissedQuestionsRef.current, ...questionInbox.dismissedQuestions])
       openWorksRef.current = parseOpenWorks(rawWorks)
       if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
       botsRef.current = nextBots
-      setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
+      dismissedQuestionsRef.current = nextDismissedQuestions
+      setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setDismissedQuestions(nextDismissedQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
       if (platform.explicitMessageRead && viewRef.current === 'chat' && platform.foreground()) {
@@ -709,6 +713,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
     // Only what still wants the person is listed, so a missing one is closed or answered either way.
     if (item.method === "dismiss_work") return !parseOpenWorks(await rpc("open_works")).some((work) => work.work_id === item.params.work_id)
+    if (item.method === "dismiss_question") {
+      const inbox = parseQuestionInbox(await rpc("questions"))
+      return inbox.dismissedQuestions.has(questionInboxKey(item.params.conversation_id, item.params.question_id))
+    }
     // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "answer") return !parseQuestions(await rpc("questions")).some((question) => question.question_id === item.params.question_id)
     if (item.method !== "control_schedule" && item.method !== "set_owner" && item.method !== "resolve") throw new OutboxCorruptError()
@@ -1464,7 +1472,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, nodesRead: nodeReport !== null, nodeReport, refreshNodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, nodesRead: nodeReport !== null, nodeReport, refreshNodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, dismissedQuestions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
@@ -1626,6 +1634,20 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       openWorksRef.current = openWorksRef.current.filter((item) => item.work_id !== workId)
       setOpenWorks(openWorksRef.current)
+      if (viewRef.current === "tasks") scheduleRefresh()
+    }),
+    /** Hides one ordinary open question from 待处理 on every device without answering or closing it. */
+    dismissQuestion: (question: Question) => withMutation(`dismiss-question:${questionInboxKey(question.conversation_id, question.question_id)}`, async () => {
+      if (!questionInboxDismissible(question)) throw new Error("挂起的审批不能从待处理中清除。")
+      const params = { conversation_id: question.conversation_id, question_id: question.question_id }
+      await signedWrite(question.conversation_id, { method: "dismiss_question", params: {
+        ...params,
+        attestation: await attest(question.conversation_id, writeBody({ method: "dismiss_question", params }, clientId)),
+      } })
+      requireCurrent()
+      const next = new Set([...dismissedQuestionsRef.current, questionInboxKey(question.conversation_id, question.question_id)])
+      dismissedQuestionsRef.current = next
+      setDismissedQuestions(next)
       if (viewRef.current === "tasks") scheduleRefresh()
     }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, () => interruptRegisteredWork(activeId.current, workId)),

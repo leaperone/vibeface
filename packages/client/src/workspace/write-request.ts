@@ -23,6 +23,7 @@ export type WriteRequests = {
   control_schedule: { conversation_id: string; schedule_id: string; action: ScheduleAction }
   set_owner: { conversation_id: string; scheduler_node: string; epoch: number }
   dismiss_work: { conversation_id: string; work_id: string }
+  dismiss_question: { conversation_id: string; question_id: string }
   answer: { question_id: string; text: string }
   resolve: { conversation_id: string; check_id: string; outcome: 'completed' | 'interrupted'; note: string }
 }
@@ -66,6 +67,7 @@ export function parseWriteRequest(method: WriteMethod, value: unknown): WriteReq
       return { conversation_id: text(p.conversation_id), scheduler_node: validTarget(p.scheduler_node), epoch: p.epoch }
     }
     case 'dismiss_work': return { conversation_id: text(p.conversation_id), work_id: text(p.work_id) }
+    case 'dismiss_question': return { conversation_id: text(p.conversation_id), question_id: text(p.question_id) }
     case 'answer': return { question_id: text(p.question_id), text: text(p.text) }
     case 'resolve': {
       if (p.outcome !== 'completed' && p.outcome !== 'interrupted' || !text(p.check_id).startsWith('work:') || typeof p.note !== 'string' || new TextEncoder().encode(p.note).length > 4096) throw new Error('invalid resolution')
@@ -89,6 +91,7 @@ export function writeBody(operation: WriteOperation, clientId: string): Record<s
     case 'control_schedule': return { type: 'schedule_controlled', schedule_id: operation.params.schedule_id, action: operation.params.action }
     case 'set_owner': return ownerBody(operation.params.scheduler_node, operation.params.epoch)
     case 'dismiss_work': return { type: 'notification_acked', notification_id: operation.params.work_id, client_id: 'inbox' }
+    case 'dismiss_question': return { type: 'notification_acked', notification_id: `question:${operation.params.conversation_id}:${operation.params.question_id}`, client_id: 'inbox' }
     case 'answer': return answerBody(operation.params.question_id, operation.params.text)
     case 'resolve': return { type: 'work_finished', work_id: operation.params.check_id.slice(5), outcome: operation.params.outcome, result_text: operation.params.note }
   }
@@ -108,6 +111,7 @@ export function writeKeySuffix(operation: WriteOperation): string {
     case 'control_schedule': return `schedule:${operation.params.schedule_id}:${operation.params.action}`
     case 'set_owner': return `owner:${operation.params.conversation_id}:${operation.params.epoch}`
     case 'dismiss_work': return `dismiss:${operation.params.work_id}`
+    case 'dismiss_question': return `dismiss-question:${operation.params.conversation_id}:${operation.params.question_id}`
     case 'answer': return `answer:${operation.params.question_id}`
     case 'resolve': return `resolve:${operation.params.check_id}`
   }

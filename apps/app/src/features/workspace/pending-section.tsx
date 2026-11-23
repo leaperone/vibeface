@@ -15,18 +15,21 @@ import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { fixOnDevice,fixOnDeviceLabel,nodeName } from '@vibeface/client/workspace/labels.ts'
+import { questionInboxDismissible } from '@vibeface/client/workspace/questions.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
-import { Bell,CheckCheck,ChevronRight,CircleX,EyeOff,Settings,X } from 'lucide-react'
+import { Bell,CheckCheck,ChevronRight,CircleX,EyeOff,ListChecks,Settings,X } from 'lucide-react'
 import { useLayoutEffect,useRef,useState } from 'react'
 
 /** 待处理 atop the task page: every card the person acts on in place. Waiting task conversations stay in the task list below; nothing waiting, nothing shown. */
 export function PendingSection() {
   const items = useInbox()
   const workspace = useWorkspace()
+  const pendingAnswers = workspace.pendingAnswers ?? []
   const inputs = items.flatMap((item) => item.kind === 'undelivered' ? [item.message] : [])
   const listItems = items.filter((item) => item.kind !== 'undelivered')
+  const questions = items.filter((item): item is Extract<typeof items[number], { kind: 'question' }> => item.kind === 'question' && !item.done && !pendingAnswers.some((pending) => pending.question_id === item.question.question_id) && questionInboxDismissible(item.question))
   const attention = items.filter((item): item is Extract<typeof items[number], { kind: 'attention' }> => item.kind === 'attention')
-  const [busy, setBusy] = useState<"ignore" | "read" | null>(null)
+  const [busy, setBusy] = useState<"ignore" | "read" | "questions" | null>(null)
   const bulkFocusKey = "__inbox-bulk__"
   // A handled card leaves with the button just pressed; the card now in its place, or the page title once the section empties, takes the focus.
   const list = useRef<HTMLUListElement>(null)
@@ -53,8 +56,19 @@ export function PendingSection() {
     }, kind === "ignore" ? "忽略待处理提醒" : "标记提醒已读")
     setBusy(null)
   }
+  const clearQuestions = async () => {
+    const snapshot = questions.map((item) => item.question)
+    if (!snapshot.length) return
+    held.current = { key: bulkFocusKey, index: 0 }
+    setBusy("questions")
+    await workspace.run(async () => {
+      for (const question of snapshot) await workspace.dismissQuestion(question)
+      workspace.announce(`已从待处理中移除 ${snapshot.length} 个问题。`)
+    }, "清除待处理问题")
+    setBusy(null)
+  }
   return <section className="grid gap-3" aria-labelledby="pending-heading">
-    <h2 id="pending-heading" className="text-lg font-medium">{terms.inbox.label}</h2>
+    <div className="flex flex-wrap items-center justify-between gap-2"><h2 id="pending-heading" className="text-lg font-medium">{terms.inbox.label}</h2>{questions.length ? <Button type="button" variant="secondary" disabled={!workspace.writable || busy !== null} aria-busy={busy === "questions" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void clearQuestions()}><ListChecks aria-hidden="true" />移出待处理（{questions.length}）</Button> : null}</div>
     {inputs.length ? <section className="grid gap-3"><h3 className="text-sm font-medium text-secondary">待确认</h3>{inputs.map((input) => <div key={input.message_id} data-pending-input="" tabIndex={-1} onFocus={() => { held.current = { key: `undelivered:${input.message_id}`, index: 0 } }} className="grid gap-2 outline-none"><p className="line-clamp-2 text-sm">{input.text}</p><InputTargetLink target={input.target} conversationId={input.conversation_id} /><WorkspaceInputStatus pending={input} /></div>)}</section> : null}
     {attention.length ? <h3 className="mt-3 text-sm font-medium text-secondary">更新</h3> : null}
     {attention.length ? <div className="flex flex-wrap justify-end gap-2">

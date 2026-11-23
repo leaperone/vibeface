@@ -890,6 +890,12 @@ impl BotChange {
 
 /// The `client_id` of an ack that closes a failed work in 待处理; see `NotificationAcked`.
 pub const INBOX_CLIENT: &str = "inbox";
+/// Namespace for list-only receipts that hide an ordinary question from 待处理.
+pub const INBOX_QUESTION_PREFIX: &str = "question:";
+
+pub fn inbox_question_notification_id(conversation_id: &str, question_id: &str) -> String {
+    format!("{INBOX_QUESTION_PREFIX}{conversation_id}:{question_id}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
