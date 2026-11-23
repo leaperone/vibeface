@@ -490,21 +490,23 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
    */
   async function goDirect(fresh: LanSighting[]) {
     const active = session.current
-    if (!active?.networkId || active.entry.kind !== 'gateway') return
+    if (!active?.networkId || active.entry.kind !== 'gateway' || !platform.foreground()) return
     const addrs = lanSeen(active.networkId, [active.entry.device_id], fresh)?.get(active.entry.device_id)
     if (!addrs) return
     probing.current?.abort()
     const probe = probing.current = new AbortController()
-    try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS, signal: probe.signal })).close() } catch { return }
-    for (let waited = 0; !active.channel.idle(); waited += 500) {
-      if (waited >= 30000 || session.current !== active || probe.signal.aborted) return
-      await new Promise(resolve => setTimeout(resolve, 500))
-    }
-    if (session.current !== active || !reconnect.current || switching.current || reconnectTimer.current !== null || sensitive.current) return
-    generation.current += 1; session.current = null; listeners.current.clear()
-    active.channel.close()
-    step({ type: 'lost', reason: '正在改用局域网直连。' })
-    setPhase('reconnecting'); scheduleReconnect(true)
+    try {
+      try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS, signal: probe.signal })).close() } catch { return }
+      for (let waited = 0; !active.channel.idle(); waited += 500) {
+        if (waited >= 30000 || session.current !== active || probe.signal.aborted) return
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+      if (probe.signal.aborted || !platform.foreground() || session.current !== active || !reconnect.current || switching.current || reconnectTimer.current !== null || sensitive.current) return
+      generation.current += 1; session.current = null; listeners.current.clear()
+      active.channel.close()
+      step({ type: 'lost', reason: '正在改用局域网直连。' })
+      setPhase('reconnecting'); scheduleReconnect(true)
+    } finally { if (probing.current === probe) probing.current = null }
   }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
     if (target.entry.kind === 'local') {
@@ -1631,13 +1633,25 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
   useEffect(() => page?.watchInvitation(invitation => { if (!spentLinks.current.has(invitation)) { setInitialInvitation(invitation); setError('') } }), [])
-  useEffect(() => platform.lan?.watch(seen => {
-    const key = ({ tag, addrs }: LanSighting) => `${tag} ${addrs.join(' ')}`
-    const before = new Set(lanSightings.current.map(key))
-    lanSightings.current = seen
-    const fresh = seen.filter(item => !before.has(key(item)))
-    if (fresh.length) void goDirect(fresh)
-  }), [])
+  useEffect(() => {
+    const stop = platform.lan?.watch(seen => {
+      const key = ({ tag, addrs }: LanSighting) => `${tag} ${addrs.join(' ')}`
+      const before = new Set(lanSightings.current.map(key))
+      lanSightings.current = seen
+      const active = session.current
+      if (active?.networkId && !lanSeen(active.networkId, [active.entry.device_id])?.size) probing.current?.abort()
+      const fresh = seen.filter(item => !before.has(key(item)))
+      if (fresh.length) void goDirect(fresh)
+    })
+    return () => { stop?.(); probing.current?.abort() }
+  }, [])
+  useEffect(() => {
+    if (!platform.lan || ready?.entry.kind !== 'gateway') return
+    const timer = setInterval(() => {
+      if (!probing.current) void goDirect(lanSightings.current)
+    }, 60_000)
+    return () => clearInterval(timer)
+  }, [ready])
   useEffect(() => ready ? connectLogSink((records, source) => ready.request('log', { records, source })) : undefined, [ready])
   // The phone records each change of connection stage, with the way it was trying, to explain transport trouble later.
   const loggedPhase = useRef<Phase | null>(null)
