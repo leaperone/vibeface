@@ -336,9 +336,8 @@ pub struct Runtime {
     sync_peers: std::sync::Mutex<HashMap<String, peers::PeerSync>>,
     peer_delivery_locks: peers::PeerDeliveryLocks,
     removed_sync_limits: peers::RemovedSyncLimits,
-    /// Two syncs downloading the same attachment would share one staging file.
-    /// ponytail: one download at a time; per-attachment locks if parallel downloads matter.
-    blob_fetch: Mutex<()>,
+    /// Downloads and local uploads of the same attachment share one staging file.
+    blob_locks: peers::BlobLocks,
     /// Changes with every process start, so peers can tell a restart from a quiet link.
     boot: String,
     sync_wakeup: tokio::sync::Notify,
@@ -620,7 +619,7 @@ impl Runtime {
             sync_peers: std::sync::Mutex::new(HashMap::new()),
             peer_delivery_locks: peers::PeerDeliveryLocks::default(),
             removed_sync_limits: peers::RemovedSyncLimits::default(),
-            blob_fetch: Mutex::new(()),
+            blob_locks: peers::BlobLocks::default(),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),
             have_wakeup,

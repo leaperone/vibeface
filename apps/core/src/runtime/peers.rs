@@ -109,6 +109,28 @@ impl PeerDeliveryLocks {
     }
 }
 
+#[derive(Default)]
+pub(super) struct BlobLocks {
+    hashes: std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl BlobLocks {
+    fn for_hash(&self, hash: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut hashes = self.hashes.lock().expect("blob locks");
+        hashes.retain(|_, hash| hash.strong_count() > 0);
+        if let Some(lock) = hashes.get(hash).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        hashes.insert(hash.into(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub(super) async fn lock(&self, hash: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.for_hash(hash).lock_owned().await
+    }
+}
+
 /// `(author, seq, hash)` of a fork evidence event, the order the evidence is read in.
 type ForkKey = (String, u64, String);
 
@@ -2364,7 +2386,7 @@ impl Runtime {
     pub(crate) async fn fetch_blob(&self, network: &str, peer: &str, blob: &BlobRef) -> Result<()> {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(blob.size as usize <= MAX_BLOB_BYTES, "attachment too large");
-        let _download = self.blob_fetch.lock().await;
+        let _download = self.blob_locks.lock(&blob.hash).await;
         let (part, target, committed) = {
             let blob = blob.clone();
             self.store

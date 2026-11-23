@@ -143,7 +143,7 @@ impl Runtime {
             blob.size > 0 && blob.size as usize <= MAX_BLOB_BYTES,
             "attachment must be 1 byte to 64 MiB"
         );
-        let _upload = self.blob_fetch.lock().await;
+        let _upload = self.blob_locks.lock(&blob.hash).await;
         self.require_attachment_scope(access, scope).await?;
         let (part, target, committed) = {
             let hash = blob.hash.clone();
