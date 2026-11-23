@@ -641,6 +641,7 @@ fn details(app: &App) -> Text<'static> {
             field("Peer ID", &peer.device_id);
             field("Connection", peer.reachability());
             field("Path", peer.path_label());
+            field("RTT", &peer.rtt());
             field("Last sync", &peer.last_sync(crate::now_ms()));
         }
     }
@@ -745,8 +746,8 @@ mod tests {
             "local_listen":"127.0.0.1:4791","public_url":"http://127.0.0.1:4790","http_enabled":true,
             "version":"0.0.1","error":null,"mesh":{"enabled":false,"network":"vibeface","records":null,"neighbors":null},
             "peers":[
-                {"device_id":"b".repeat(64), "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1},
-                {"device_id":"c".repeat(64), "name":"Build", "path":null, "reachable":null, "synced_ms":null}
+                {"device_id":"b".repeat(64), "name":"设备 e\u{301} 👩‍💻 \u{1b}]52;c;secret\u{7}\u{202e}extra long name", "path":"direct", "reachable":true, "synced_ms":1, "rtt_ms":12},
+                {"device_id":"c".repeat(64), "name":"Build", "path":null, "reachable":null, "synced_ms":null, "rtt_ms":null}
             ]
         })).unwrap().into()
     }

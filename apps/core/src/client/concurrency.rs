@@ -370,6 +370,20 @@ impl Calls {
             .count()
     }
 
+    /// Records `id` as used, as every answered request does; a repeat ends the channel.
+    pub(super) fn reserve(&mut self, id: &str) -> Result<()> {
+        ensure!(
+            !self.seen.contains(id),
+            "duplicate request ID; the original outcome may be unknown"
+        );
+        ensure!(
+            self.seen.len() < REQUEST_IDS,
+            "client request ID capacity reached; reconnect before sending more requests"
+        );
+        self.seen.insert(id.to_owned());
+        Ok(())
+    }
+
     pub(super) fn accept(
         &mut self,
         node: &Arc<Runtime>,
@@ -377,15 +391,7 @@ impl Calls {
         authority: &Authority,
         request: Request,
     ) -> Result<Option<Response>> {
-        ensure!(
-            !self.seen.contains(&request.id),
-            "duplicate request ID; the original outcome may be unknown"
-        );
-        ensure!(
-            self.seen.len() < REQUEST_IDS,
-            "client request ID capacity reached; reconnect before sending more requests"
-        );
-        self.seen.insert(request.id.clone());
+        self.reserve(&request.id)?;
         let lane = command::client_policy(&request.input).lane;
         if lane == Lane::Ordered {
             if self.waiting.len() < ORDERED_QUEUE {
@@ -616,13 +622,21 @@ impl Calls {
                     id: completed.id,
                     result: Value::Null,
                     error: Some(crate::logging::scrub(&error.to_string())),
-                    code: error
-                        .downcast_ref::<crate::discovery::CodexMissing>()
-                        .map(|_| crate::discovery::CodexMissing::CODE),
+                    code: error_code(&error),
                 }
             }
         })
     }
+}
+
+/// The code a refused request answers with, for errors a client acts on by kind.
+pub(super) fn error_code(error: &anyhow::Error) -> Option<&'static str> {
+    if error.is::<crate::discovery::CodexMissing>() {
+        return Some(crate::discovery::CodexMissing::CODE);
+    }
+    error
+        .downcast_ref::<crate::logging::Refused>()
+        .map(|refused| refused.code)
 }
 
 #[cfg(all(test, unix))]

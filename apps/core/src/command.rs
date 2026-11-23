@@ -283,6 +283,7 @@ business_commands! {
     RegisterPush("register_push") => (Ordered, AuthoritativeWriter, None);
     UnregisterPush("unregister_push") => (Ordered, AuthoritativeWriter, None);
     DismissWork("dismiss_work") => (Ordered, AuthoritativeWriter, None);
+    DismissQuestion("dismiss_question") => (Ordered, AuthoritativeWriter, None);
     Ack("ack") => (Ordered, AuthoritativeWriter, None);
 }
 

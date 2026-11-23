@@ -1,9 +1,8 @@
 import { BotFace,botMood } from '@/components/app/bot-face'
 import { PromptInput } from '@/components/arc/conversation-composer'
 import { Chat,type ChatEntry } from '@/components/arc/conversation-thread'
-import { ActionCard,Details,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
+import { ActionCard,Dot,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
-import { providerIcons } from '@/features/devices/ai-settings'
 import { ActionButton } from '@/features/workspace/present'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
@@ -12,24 +11,23 @@ import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
-import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
-import { chatTimeline,firstUnread,taskMessage } from '@vibeface/client/chat/timeline.ts'
+import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
+import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
-import { failureText,outcomeUnknown,taskError,workFailure } from '@vibeface/client/lib/errors.ts'
-import { providerNames,type ProviderId } from '@vibeface/client/lib/node.ts'
+import { failureText,taskError } from '@vibeface/client/lib/errors.ts'
 import { botCopy,placeChanges,scheduleName,scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { chatTaskState,nodeName,progressLabel,queueHoldLabels,staleTaskLabel,taskActive,taskAgent,taskCopy,taskLabel,taskProgress,taskStale } from '@vibeface/client/workspace/labels.ts'
+import { chatStatusLine,chatTaskState,nodeName,staleTaskLabel,taskActive,taskCopy,taskLabel,taskStale } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness,historySections,pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspace/questions.ts'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { BotChangeRecord,InputTarget,ManagerJob,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
-import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,Link2,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
-import { useEffect,useRef,useState } from 'react'
+import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
+import { useEffect,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
 import type { ChatMessage } from './elements/message'
@@ -54,6 +52,7 @@ function NoBot() {
 export function ConversationScreen({ missing = false, active }: { missing?: boolean; active: boolean }) {
   const workspace = useWorkspace()
   const navigate = useNavigate()
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
   const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
   const { directory, ready, retryNow } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
@@ -62,6 +61,10 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
   const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
+  const [activityOpen, setActivityOpen] = useState(false)
+  // The control that opened the activity drawer gets focus back, or the header button once it is gone, unless a link in it navigated away.
+  const activityFrom = useRef<HTMLElement | null>(null)
+  const openActivity = (from: HTMLElement | null) => { activityFrom.current = from; setActivityOpen(true) }
   const { conversationId, data, chatSlot } = workspace
   const pendingMessages = workspace.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
   const bot = workspace.selectedBot
@@ -87,53 +90,34 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const pendingRow = (message: ChatMessage, retry?: () => Promise<void>): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message, retry })
   const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
 
-  // Tasks sit right after the message that started them.
   const works = data?.works ?? []
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
   const currentWorks = new Set(workspace.openWorks?.filter((work) => work.conversation_id === conversationId).map((work) => work.work_id))
-  const confirming = new Set(checks.flatMap((check) => check.kind === 'work' ? [check.work_id] : []))
-  const tasks: TaskRow[] = works.map((work, index) => {
+  const confirming = new Set(checks.flatMap((check) => check.kind === 'work' ? [check.work_id] : check.kind === 'device' ? check.works.map((work) => work.work_id) : []))
+  const tasks: TaskRow[] = works.map((work) => {
     const shown = chatTaskState(work, works, workspace.nodes)
     const asking = workApproval({ work, conversationId, questions: data?.questions ?? [], answered: workspace.answered })
     const state = shown === 'running' && asking ? 'waiting' : shown
-    const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
     const attention = state === 'waiting' || confirming.has(work.work_id) || currentWorks.has(work.work_id) && (taskStale(state, workspace.connectionOnline) || ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified', 'unknown', 'unverified', 'awaiting_confirmation'].includes(state))
-    return { id: work.work_id, state, attention, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work), trigger: work.trigger, work, joined: joined?.title }
+    return { id: work.work_id, state, attention, device: work.target_node, work }
   })
-  const groups = new Map<string, TaskRow[]>()
-  for (const task of tasks) groups.set(task.trigger, [...groups.get(task.trigger) ?? [], task])
+  const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && !(task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)) && (taskActive(task.state) || task.state === 'awaiting_children')).length
 
-  // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
-  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} overwritten={data?.overwritten ?? []} /> })
 
-  // Questions and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
+  // Questions sit where they were asked; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
-  const visible = (data?.messages ?? []).filter((message) => !folded.hidden.has(message.message_id))
-  const taskGroups = new Map<string, ChatEntry[]>()
-  for (const [trigger, group] of groups) {
-    const messageId = taskMessage({ trigger, jobs, messages: visible, works })
-    if (!messageId || !bot) continue
-    const cards = group.map((task) => <TaskCard key={task.id} task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} live={workspace.connectionOnline} away={task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)} />)
-    const working = group.filter((task) => workspace.connectionOnline && (taskActive(task.state) || task.state === 'awaiting_children') && !task.attention).length
-    const attention = group.filter((task) => task.attention).length
-    const label = [`${group.length} 个任务`, working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : '', !working && !attention && group.every((task) => task.state === 'completed') ? '已完成' : ''].filter(Boolean).join(' · ')
-    const row = { key: `task-group:${trigger}`, node: group.length > 1 ? <Details label={label} className="min-w-0">{cards}</Details> : cards[0] }
-    taskGroups.set(messageId, [...taskGroups.get(messageId) ?? [], row])
-  }
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const timeline = chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-    ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ], merged)
 
   // 重试 sits on the newest reply when it failed or was stopped; it reads the conversation again first and words what it sends by what the reply may have done.
   const newest = data?.messages.at(-1)
   const endedAsk = newest && ['failed', 'stopped', 'interrupted'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
-  // A reply whose outcome is unknown may have done its work: it is checked, never retried.
-  const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && replyUnsettled(job))
     ? async () => { setSendError(null); await workspace.retryReply(messageId) } : undefined
   const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
@@ -141,8 +125,10 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
   const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
-  const entries: ChatEntry[] = placedChanges.first.map(changeRow)
+  const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
+  // The newest reply failed with no 重试, or the newest supplement's outcome is unknown: it can only be read again.
+  let requery = false
   for (const message of timeline.messages) {
     const start = entries.length
     for (const aside of timeline.before.get(message.message_id) ?? []) entries.push(aside)
@@ -152,60 +138,44 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
-    entries.push(...taskGroups.get(message.message_id) ?? [])
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
-    if (recordedJob?.runtime) entries.push({ key: `runtime:${recordedJob.trigger}`, node: <Details label="运行信息">{runtimeLabel(recordedJob.runtime)}</Details> })
-    if (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob))) entries.push({ key: `query:${message.message_id}`, node: <ActionButton variant="ghost" action={() => workspace.refresh()}>再查一次</ActionButton> })
-    if (recordedJob?.state === 'reconciling' || recordedJob?.pending_check) entries.push({ key: `reconcile:${recordedJob.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-sm text-secondary">设备正在查询上次回复，系统不会自动重发。</p></ActionCard> })
+    if (message.message_id === newest?.message_id && !retry && (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob)) || merged.has(message.message_id) && (merged.get(message.message_id) ?? 'unknown') === 'unknown')) requery = true
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
-      if (job.state === 'queued' && message.role === 'user') entries.push({ key: `queued-actions:${job.trigger}`, node: <p className="text-sm text-secondary">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</p> })
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
       // A reply that ended with no message of its own: 重试 sits on this line while the message is the newest.
       const again = message.role === 'user' && message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} refresh={() => workspace.refresh()} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply), message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined))
-    for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
     if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
   entries.push(...timeline.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
-  for (const pending of pendingMessages) {
-    if (!data?.messages.some((message) => message.message_id === pending.message_id)) entries.push(pendingRow({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: pending.created_at_ms, state: 'sending' }))
-    entries.push({ key: `delivery:${pending.message_id}`, node: <WorkspaceInputStatus pending={pending} /> })
-  }
+  for (const pending of pendingMessages) if (!data?.messages.some((message) => message.message_id === pending.message_id)) entries.push(pendingRow({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: pending.created_at_ms, state: 'sending' }))
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here && (botReadiness(here) === 'ready' || botReadiness(here) === 'unverified') && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
-  const activeReply = activeJobs.find((job) => job.state === 'cancelling') ?? activeJobs.find((job) => job.state === 'running') ?? activeJobs.find((job) => job.state === 'claimed') ?? activeJobs[0]
-  const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.trigger === activeReply?.trigger && item.status)?.status
-  // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
   const remote = data?.scheduler?.remote
-  if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
   // A question waiting on the person is the status already; a spinner under it would say the bot is still thinking.
   const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
   const asked = toAnswer[0]
   const stopping = activeJobs.some((job) => job.state === 'cancelling')
-  const activity = !workspace.connectionOnline || remote?.reachable === false ? '暂时收不到最新进展，显示最近记录'
-    : stopping ? '正在确认停止回复'
-    : activeReply?.state === 'pending_delivery' ? '等待设备接收'
-    : activeReply?.state === 'queued' ? '等待处理'
-    : activeReply?.state === 'claimed' ? '正在准备'
-    : activeReply?.state === 'steering' ? '正在加入本轮'
-    : status ? progressLabel(status) : '正在处理你的要求'
-  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{stopping ? <CircleStop aria-hidden="true" className="size-4 shrink-0" />
-    : bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{activity}</p> })
+  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{stopping ? '正在停止' : !workspace.connectionOnline || remote?.reachable === false ? '暂时收不到进展' : '思考中'}</p> })
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
   if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-sm text-foreground before:h-px before:flex-1 before:bg-foreground/40 after:h-px after:flex-1 after:bg-foreground/40">新消息</p> })
 
-  // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
+  // Everything waiting on the person lives in the activity drawer; the status line above the composer counts it.
+  const reconciling = jobs.filter((job) => job.state === 'reconciling' || job.pending_check)
+  const undecided = (pending: PendingMessage) => pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown'
+  const inputStatus = (pending: PendingMessage) => <div key={pending.message_id} className="grid gap-2"><p className="line-clamp-2 text-sm">{pending.text}</p><WorkspaceInputStatus pending={pending} /></div>
+  const ownerUnknown = Boolean(remote && !remote.reachable && !ownerAway && newest?.role === 'user')
   const cards = [
     ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
       <ActionButton variant="primary" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
@@ -215,16 +185,25 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       <ActionButton variant="primary" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
     </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
+    remote && ownerUnknown ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
+    ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>} />),
+    ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
-  if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
+  // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here. The owner-unknown card has no action.
+  const attention = cards.length - (ownerUnknown ? 1 : 0) + (requery && !reconciling.length ? 1 : 0) + tasks.filter((task) => task.attention && task.state !== 'waiting' && !confirming.has(task.id)).length
+  const sending = pendingMessages.filter((pending) => !undecided(pending))
+  const changeGroups = [...placedChanges.first, ...[...placedChanges.after.values()].flat()]
+  const runtime = jobs.filter((job) => job.runtime).at(-1)?.runtime
+  const statusLine = chatStatusLine({ attention, tasks: runningTasks, hold: jobs.find((job) => job.state === 'queued')?.hold_reason })
 
   const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
-  const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
-  const waitingCount = toAnswer.length + cards.length
+  const waitingTarget = asked ? `question-${asked.question_id}` : null
+  const waitingCount = toAnswer.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
+  const showWaiting = Boolean(waitingTarget && (targetHidden || !workspace.connectionOnline))
   const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = reachDevice(workspace.nodes, reach) ?? ready?.entry.device_id
@@ -232,6 +211,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const setupTo = setupDevice ? '/devices/$deviceId' : '/devices'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
+  // This screen stays mounted, hidden, on other routes, so leaving this chat or route closes the drawer and drops its focus return.
+  useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
   useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
@@ -260,7 +241,17 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const setText = (value: string) => setDrafts((current) => { const next = new Map(current).set(conversationId, value); draftStorage.writeStorage(draftKey, Object.fromEntries(next)); return next })
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
-  const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} name={bot.name} /> : null
+  const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} attention={attention} open={activityOpen} onOpenChange={setActivityOpen} onOpen={openActivity} from={activityFrom}
+    before={<>
+      {cards.length || requery ? <ActivitySection title="要处理">{cards}{requery && !reconciling.length ? <ActionButton variant="ghost" className="justify-self-start" disabled={!workspace.connectionOnline} action={() => workspace.refresh()}>再查一次</ActionButton> : null}</ActivitySection> : null}
+      {sending.length ? <ActivitySection title="发送中">{sending.map(inputStatus)}</ActivitySection> : null}
+      {inputTarget ? <InputQueue target={inputTarget} /> : null}
+    </>}
+    after={<>
+      {changeGroups.length ? <ActivitySection title="最近改动">{changeGroups.map((records) => <ChangeCard key={records[0].change_id} records={records} schedules={data?.bot_settings?.schedules ?? []} overwritten={data?.overwritten ?? []} />)}</ActivitySection> : null}
+      {data?.sent?.length ? <ActivitySection title="发给其他 Bot">{data.sent.map((sent) => <SentToBot key={sent.message_id} sent={sent} to={workspace.bots.find((item) => item.conversation_id === sent.to) ?? { name: '另一个 Bot' }} />)}</ActivitySection> : null}
+      {runtime ? <ActivitySection title="运行信息"><p className="text-sm text-secondary">{runtimeLabel(runtime)}</p></ActivitySection> : null}
+    </>} /> : null
   if (bot && !data) return <section className="conversation-screen" aria-label="对话">{history}<ChatSkeleton /></section>
 
   if (data && historySections.some((section) => !data.history[section].complete)) entries.unshift({ key: 'history-controls', node: <HistoryControls key={`${workspace.generation}:${conversationId}`} workspace={workspace} /> })
@@ -276,7 +267,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             <h2 className="max-w-full text-lg font-medium [overflow-wrap:anywhere]">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {!needsSetup ? <p className="text-sm leading-relaxed text-secondary">说说你想完成的第一件事，也可以随时补充要求。</p> : null}
           {starting ? <p role="status" className="flex items-center gap-1.5 text-secondary"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-secondary"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
@@ -284,7 +274,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
               : <p className="flex items-center gap-1.5 text-sm text-secondary"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
             : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
-              <p className="text-sm text-secondary">选一句填入草稿，可修改，不会直接发送。</p>
               <div className="flex flex-wrap justify-center gap-2">
                 {starters[bot.project ? 'project' : 'general'].map((example) => <button key={example} type="button" className={`${buttonStyles.button} ${buttonStyles.secondary} h-auto max-w-full whitespace-normal! py-2! [overflow-wrap:anywhere]`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</button>)}
               </div>
@@ -293,16 +282,19 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       />
       {bot && inputTarget ? <PromptInput
         id="message-text"
-        above={<div className="flex max-w-full flex-col items-start gap-2">
+        above={!workspace.connectionOnline || history && statusLine || showWaiting ? <>
           {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-panel border bg-surface ps-2.5 pe-1 text-sm font-medium max-md:min-h-11">
-          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
-          <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
-        </p> : null}
-        {waitingTarget && (targetHidden || !workspace.connectionOnline) ? <Button variant="ghost" type="button" className="flex max-w-full items-center gap-1.5 duration-200 ease-out motion-reduce:animate-none"
-          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 break-words">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
-        </Button> : null}
-        </div>}
+            <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
+            <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+          </p> : null}
+          {history && statusLine ? <Button type="button" variant="ghost" size="sm" className="max-w-full" onClick={(event) => openActivity(event.currentTarget)}>
+            <ListChecks aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 truncate">{statusLine}</span>
+          </Button> : null}
+          {showWaiting ? <Button variant="ghost" size="sm" type="button" className="max-w-full max-md:min-h-11!"
+            onClick={() => document.getElementById(waitingTarget ?? '')?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
+            <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 truncate">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
+          </Button> : null}
+        </> : null}
         value={text}
         hint={notice}
         reason={reason}
@@ -324,7 +316,6 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       >
         <InlineError error={sendError} className="basis-full" />
         {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
-        <InputQueue target={inputTarget} />
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
@@ -344,7 +335,7 @@ function useOffscreen(id: string | null, revision: number) {
   return hidden
 }
 
-type TaskRow = { id: string; state: string; attention: boolean; device: string; summary: string; agent: ProviderId | null; trigger: string; work: WorkRecord; joined?: string }
+type TaskRow = { id: string; state: string; attention: boolean; device: string; work: WorkRecord }
 
 function TaskIcon({ state, stale, away = false }: { state: string; stale: boolean; away?: boolean }) {
   const failed = ['failed', 'rejected', 'dispatch_rejected'].includes(state)
@@ -355,66 +346,39 @@ function TaskIcon({ state, stale, away = false }: { state: string; stale: boolea
   return <Icon aria-hidden="true" className={`size-4 shrink-0 ${state === 'completed' ? 'text-success' : failed ? 'text-danger' : state === 'waiting' ? 'text-warning' : !stale && !away && taskActive(state) ? 'animate-spin text-info motion-reduce:animate-none' : 'text-secondary'}`} />
 }
 
-function TaskCard({ task, botId, device, here, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; live: boolean; away: boolean }) {
-  const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  const title = task.work.title || '任务'
-  const ongoing = taskActive(task.state) || task.state === 'awaiting_children'
-  const stale = taskStale(task.state, live) || !live && task.state === 'awaiting_children'
-  const label = stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)
-  const reason = !ongoing && task.state !== 'completed' ? workFailure(task.work).split('\n')[0] : ''
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} aria-label={`${title} · ${label} · 查看任务`} className="-mx-2 flex min-h-9 items-start gap-2 rounded-control px-2 py-2 text-sm transition-colors hover:bg-surface-muted/60 hover:text-foreground active:bg-surface-muted max-md:min-h-11 max-md:py-3">
-    <TaskIcon state={task.state} stale={stale} away={away} />
-    <span className="min-w-0 flex-1">{ongoing ? <><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={label} agent={task.agent} className="text-sm" /></span>
-      {task.joined ? <span className="flex min-w-0 items-center gap-1 text-sm text-secondary"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
-        : taskActive(task.state) && task.summary ? <span className="line-clamp-2 whitespace-pre-wrap break-words text-sm text-secondary">{stale ? '最近进展：' : ''}{task.summary}</span> : null}</>
-      : <><span className="text-secondary">{label} · 查看任务</span>{reason ? <span className={`block break-words ${failed ? 'text-danger' : 'text-secondary'}`}>{reason}</span> : null}</>}</span>
-    {task.state === 'completed' ? null : <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />}
-  </Link></div>
+function ActivitySection({ title, children }: { title: string; children: ReactNode }) {
+  return <section className="grid gap-3"><h3 className="text-sm font-medium text-secondary">{title}</h3>{children}</section>
 }
 
-function TaskHistory({ tasks, botId, name }: { tasks: TaskRow[]; botId: string; name: string }) {
+/** The header's 动态 drawer: what waits on the person and what is in flight (`before`), this chat's tasks, then records (`after`). */
+function TaskHistory({ tasks, botId, attention, open, onOpenChange, onOpen, from, before, after }: { tasks: TaskRow[]; botId: string; attention: number; open: boolean; onOpenChange: (open: boolean) => void; onOpen: (from: HTMLElement | null) => void; from: RefObject<HTMLElement | null>; before: ReactNode; after: ReactNode }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
-  const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
-  const leaving = useRef(false)
-  useEffect(() => () => { leaving.current = true }, [])
-  const working = tasks.filter((task) => workspace.connectionOnline && !task.attention && (taskActive(task.state) || task.state === 'awaiting_children')).length
-  const attention = tasks.filter((task) => task.attention).length
-  const count = [working ? `${working} 进行中` : '', attention ? `${attention} 待处理` : ''].filter(Boolean).join(' · ')
+  useEffect(() => () => { from.current = null }, [])
+  const leave = () => { from.current = null; onOpenChange(false) }
   return <>
-    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={`执行记录${count ? ` · ${count}` : ''}`} onClick={() => { leaving.current = false; setOpen(true) }}><ListChecks aria-hidden="true" /><span>执行记录</span>{count ? <span className="text-sm text-secondary max-sm:sr-only">{count}</span> : null}{count ? <span className="text-sm sm:hidden">{working + attention}</span> : null}</Button></PageActions>
-    <Drawer open={open} onOpenChange={setOpen}>
-      <DrawerContent title="执行记录" description={`${name}的执行工作记录。任务对话在任务页查看。`} className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); if (!leaving.current) trigger.current?.focus({ preventScroll: true }) }}>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-6">
-          {!workspace.connectionOnline || workspace.incomplete ? <p role="status" className="pb-3 text-sm text-secondary">{!workspace.connectionOnline ? '暂时收不到最新执行状态，显示最近记录。' : '执行记录正在同步，显示已读取的部分。'}</p> : null}
-          {!workspace.data ? <p role="status" className="py-6 text-sm text-secondary">正在读取执行记录</p> : tasks.length ? <ul className="divide-y">{tasks.map((task) => {
+    <PageActions><Button ref={trigger} type="button" variant="ghost" size="sm" aria-label={attention ? `动态，${attention} 项要处理` : '动态'} title={attention ? `动态，${attention} 项要处理` : '动态'} onClick={() => onOpen(trigger.current)}><span className="relative inline-flex"><ListChecks aria-hidden="true" />{attention ? <Dot tone="warning" className="absolute -end-1 -top-1 ring-2 ring-surface" /> : null}</span></Button></PageActions>
+    <Drawer open={open} onOpenChange={onOpenChange}>
+      <DrawerContent title="动态" className="!w-full min-w-0 gap-0 sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); if (from.current) (from.current.isConnected ? from.current : trigger.current)?.focus({ preventScroll: true }) }}>
+        <div className="grid content-start gap-6">
+          {workspace.connectionOnline && workspace.incomplete ? <p role="status" className="text-sm text-secondary">同步中</p> : null}
+          {before}
+          {!workspace.data ? <p role="status" className="text-sm text-secondary">正在读取</p> : tasks.length ? <ActivitySection title="任务"><ul className="divide-y">{tasks.map((task) => {
             const stale = taskStale(task.state, workspace.connectionOnline) || !workspace.connectionOnline && task.state === 'awaiting_children'
             const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
-            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={() => { leaving.current = true; setOpen(false) }} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-control px-2 py-3 hover:bg-surface-muted/60 active:bg-surface-muted">
+            return <li key={task.id}><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} onClick={leave} className="-mx-2 flex min-h-11 min-w-0 items-start gap-2 rounded-control px-2 py-3 hover:bg-surface-muted/60 active:bg-surface-muted">
               <TaskIcon state={task.state} stale={stale} away={away} />
               <span className="grid min-w-0 flex-1 gap-1"><span className="break-words font-medium">{task.work.title || '任务'}</span><span className="flex min-w-0 flex-wrap gap-x-1 text-sm text-secondary"><span>{stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)}</span><span aria-hidden="true">·</span><span className="min-w-0 break-words">{nodeName(task.device, { nodes: workspace.nodes, directory })}</span></span></span>
               <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-secondary" />
             </Link></li>
-          })}</ul> : <p className="py-6 text-sm text-secondary">{!workspace.connectionOnline || workspace.incomplete ? '最近记录中还没有执行工作。' : '还没有执行工作'}</p>}
-          <RoutedAction variant="secondary" to="/tasks" onClick={() => { leaving.current = true; setOpen(false) }}>查看任务对话</RoutedAction>
+          })}</ul></ActivitySection> : null}
+          {after}
+          <RoutedAction variant="secondary" className="justify-self-start" to="/tasks" onClick={leave}>查看任务对话</RoutedAction>
         </div>
       </DrawerContent>
     </Drawer>
   </>
-}
-
-/** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
-function TaskMeta({ device, here, label, agent, className = '' }: { device: string; here: boolean; label: string; agent: ProviderId | null; className?: string }) {
-  const by = agent ? providerNames[agent] : ''
-  const Agent = agent ? providerIcons[agent] : null
-  const dot = <span aria-hidden="true">·</span>
-  return <span className={`flex min-w-0 max-w-full items-center gap-1 text-secondary ${className}`}>
-    <span aria-hidden="true" className="hidden @sm:inline">·</span>
-    {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{dot}</> : null}
-    {here ? <span className="sr-only">{device}</span> : <><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{dot}</>}
-    <span className="shrink-0">{label}</span>
-  </span>
 }
 
 /** Shaped like a message from another bot, its name above the text, so both directions read as one kind of thing. */
@@ -433,7 +397,7 @@ function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot
 /** `retry`: 重试, only offered while its message is the newest. */
 function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promise<void>; refresh: () => Promise<void> }) {
   return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-    <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
+    <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />没能回复</span>
     {job.failure ? <span className="min-w-0 truncate text-secondary" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
     {retry ? <ActionButton variant="ghost" className="-ms-1" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
   </div>

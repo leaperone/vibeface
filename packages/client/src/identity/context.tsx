@@ -22,7 +22,8 @@ import type { Link, LinkEvent } from '../lib/link.ts'
 import { candidates, defaultGateway, gatewaysOf, markReached, mergeEntrances, openEntrances, storedEntrances, storedGateway, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, Gateway, OpenEntrance } from '../lib/entrances.ts'
 import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
-import { connectLogSink, failureFields, reportLog } from '../lib/web-log.ts'
+import { connectLogSink, failureFields, logSource, reportLog } from '../lib/web-log.ts'
+import { recordFailure, requestConversation } from '../lib/error-ref.ts'
 import { storageOf } from '../workspace/storage.ts'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'erasing' | 'erase_failed' | 'ready'
@@ -38,7 +39,7 @@ type RecoveryCompletion = { active: Session; clientId: string; wait: WaitRecord;
 /** This computer's own join, as the Node reports it while the manager approves. */
 type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string; admin?: string }
 /** `open`: 加入 may go ahead; `used` or `expired`: the link's computer would refuse it. */
-export type InviteState = 'open' | 'used' | 'expired'
+type InviteState = 'open' | 'used' | 'expired'
 const inviteState = (value: unknown): InviteState | null => {
   const state = record(value).invite
   return state === 'open' || state === 'used' || state === 'expired' ? state : null
@@ -105,7 +106,7 @@ type DeviceContextValue = {
   setGateway(address: string | null): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
-export type UnsavedRecovery = { name: string; code: string; attempted: boolean }
+type UnsavedRecovery = { name: string; code: string; attempted: boolean }
 type KeptRecovery = UnsavedRecovery & { bytes: Uint8Array }
 const UNSAVED_KEY = 'vibeface.unsaved-recovery'
 /** This tab's session storage, where it exists: a reload keeps the sealed file, closing the tab drops it. */
@@ -363,7 +364,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       // Codex not installed yet is a setup step for the owner, not a failed request.
       const missing = (cause as { code?: unknown } | null)?.code === 'codex_missing'
       const message = messageOf(cause)
-      if (method !== 'log') reportLog({ level: missing ? 'info' : 'warn', event: missing ? 'web.codex_missing' : 'web.rpc_failed', message, fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self, ...failureFields(cause, message) } })
+      if (method !== 'log') {
+        const conversation = requestConversation(params)
+        const ref = missing ? undefined : recordFailure(cause, message, conversation).ref
+        reportLog({ level: missing ? 'info' : 'warn', event: missing ? 'web.codex_missing' : 'web.rpc_failed', message, ...(conversation ? { conversation_id: conversation } : {}), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self, ...(ref ? { ref } : {}), ...failureFields(cause, message) } })
+      }
       throw cause
     }
     if (session.current !== active || active.generation !== generation.current) throw changed()
@@ -1633,7 +1638,18 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const fresh = seen.filter(item => !before.has(key(item)))
     if (fresh.length) void goDirect(fresh)
   }), [])
-  useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
+  useEffect(() => ready ? connectLogSink((records, source) => ready.request('log', { records, source })) : undefined, [ready])
+  // The phone records each change of connection stage, with the way it was trying, to explain transport trouble later.
+  const loggedPhase = useRef<Phase | null>(null)
+  useEffect(() => {
+    const from = loggedPhase.current
+    if (from === phase || logSource() !== 'mobile') return
+    loggedPhase.current = phase
+    const way = entry && (entry.kind === 'lan' ? { addrs: entry.addrs } : { address: entry.address })
+    reportLog({ level: 'info', event: 'mobile.connection', message: `${from ?? 'start'} → ${phase}`, fields: {
+      from, to: phase, ...(entry ? { path: entry.kind, node: entry.device_id, ...way } : {}), ...(error && phase !== 'ready' ? { reason: error.slice(0, 300) } : {}),
+    } })
+  }, [phase, entry, error])
   useEffect(() => {
     let mounted = true
     let version = generation.current

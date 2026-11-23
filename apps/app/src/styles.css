@@ -18,8 +18,11 @@
 * { box-sizing: border-box; border-color: var(--border); }
 html { font-family: var(--font-body); color: var(--foreground); background: var(--background); overflow-x: clip; }
 body { margin: 0; font-size: var(--text-base); line-height: var(--leading-body); letter-spacing: var(--tracking-body); -webkit-font-smoothing: antialiased; position: fixed; inset-inline: 0; top: var(--app-top,0px); height: var(--app-height,100dvh); overflow: hidden; }
-/* Arc secondary text keeps supporting copy and placeholders readable in both themes. */
-:root { --page-width: 48rem; --text-muted: var(--text-secondary); }
+/* Arc secondary text keeps supporting copy and placeholders readable in both themes. Arc inks a disabled ghost button with its muted
+   color and no fade, so a disabled button gets that color back from the root, which keeps it; otherwise it would match an enabled one. */
+:root { --page-width: 48rem; --arc-text-muted: var(--text-muted); }
+body { --text-muted: var(--text-secondary); }
+button:disabled { --text-muted: var(--arc-text-muted); }
 a { color: inherit; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }

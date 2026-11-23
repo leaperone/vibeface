@@ -28,9 +28,9 @@ export type LanStream = {
 /** Opens a stream to Node `deviceId` at any of `addrs` (`ip:port`) within `timeoutMs`. */
 export type LanDial = (deviceId: string, addrs: string[], timeoutMs: number) => Promise<LanStream>
 /** Explicit native-only transport for the inspected local Node; browser local-origin checks stay in place. */
-export type NativeLocalCarrier = (entry: Extract<ConnectionEntry, { kind: 'local' }>, timeoutMs: number) => Promise<LanStream>
+type NativeLocalCarrier = (entry: Extract<ConnectionEntry, { kind: 'local' }>, timeoutMs: number) => Promise<LanStream>
 /** Selected local Node's ordinary Gateway channel; remote Gateway entries remain browser WebSockets. */
-export type NativeLocalGatewayCarrier = (entry: Extract<ConnectionEntry, { kind: 'gateway' }>, target: string, timeoutMs: number) => Promise<LanStream | null>
+type NativeLocalGatewayCarrier = (entry: Extract<ConnectionEntry, { kind: 'gateway' }>, target: string, timeoutMs: number) => Promise<LanStream | null>
 type ConnectOptions = {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void

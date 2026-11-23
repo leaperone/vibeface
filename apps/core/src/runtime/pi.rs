@@ -2232,6 +2232,7 @@ mod tests {
             tool_token: Some("tool-token-fixture".into()),
             provider_env: env(dir, mode),
             process_started: None,
+            restricted: false,
             turn_binding,
         }
     }

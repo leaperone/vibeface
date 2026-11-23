@@ -529,7 +529,7 @@ impl Delivery {
             .unsigned
             .windows
             .iter()
-            .map(|w| budget::WindowRef {
+            .map(|w| budget_codec::WindowRef {
                 order_id: stored.view.order_id.clone(),
                 index: w.index,
             })
@@ -539,7 +539,7 @@ impl Delivery {
             .execute(
                 self,
                 &format!("budget-{id}/refund-{}", stored.view.order_id),
-                chain::Call::Budget(Box::new(budget::BudgetAction::Refund {
+                chain::Call::Budget(Box::new(budget_codec::BudgetAction::Refund {
                     budget_id: parse_word(&id)?,
                     windows,
                 })),
@@ -1517,18 +1517,26 @@ mod tests {
             "77".repeat(32),
             hex::encode(hash(&serde_json::to_vec(&ids)?))
         );
-        let (target, calldata) = budget::BudgetAction::Reserve {
-            budget_id: budget_id.into(),
-            reservations: orders[..2]
-                .iter()
-                .map(|order| budget::Reservation {
-                    order: order.order.clone(),
-                    source_seals: order.source_seals.clone(),
-                    wallet_signature: order.wallet_signature.clone(),
-                })
-                .collect(),
-        }
-        .encode(rpc.chain.config(), Address::repeat_byte(0x11))?;
+        let codec = budget_codec::CodecContext::from_config(
+            rpc.chain.config(),
+            Address::repeat_byte(0x11),
+        )?;
+        let encoded = budget_codec::encode_action(
+            &codec,
+            budget_codec::BudgetAction::Reserve {
+                budget_id: budget_id.into(),
+                reservations: orders[..2]
+                    .iter()
+                    .map(|order| budget_codec::Reservation {
+                        order: order.order.clone(),
+                        source_seals: order.source_seals.clone(),
+                        wallet_signature: order.wallet_signature.clone(),
+                    })
+                    .collect(),
+            },
+        )?;
+        let target = encoded.target;
+        let calldata = encoded.calldata;
         intent.to = chain::address_hex(target);
         intent.calldata = format!("0x{}", hex::encode(calldata));
         let transaction_id = intent.id.clone();

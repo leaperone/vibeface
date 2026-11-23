@@ -74,13 +74,13 @@ bash scripts/build-web.sh
 
 通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
-在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择；没有 Bot 时打开执行任务会让这个服务同时运行 Bot，因为派来的任务由 Bot 接下。服务的**设置**分别展开**运行 Bot**与**执行任务**的模型配置，两个角色独立保存；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
+在签名管理浏览器或可信本机会话打开设备详情页的 **Bot 与任务**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：打开某一行的 **运行 Bot** 开关，由它运行 Bot，关掉即关闭 Bot；各行的 **执行任务** 开关控制本机执行任务，Bot 和执行任务可分别选择；没有 Bot 时打开执行任务会让这个服务同时运行 Bot，因为派来的任务由 Bot 接下。服务的**设置**分别展开**运行 Bot**与**执行任务**的模型配置，两个角色独立保存；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
 网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
 ### 使用 Cursor CLI
 
-Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login` 的已有订阅登录。网页进入设备 AI 设置时自动发现并检查 Cursor，也可点**自动接入**或显式配置程序绝对路径。发现结果会保存，已有有效自定义 CLI 保持选择；不支持的旧 SDK Bridge 选择会重新发现官方 CLI。Vibeface 不安装 Agent，不自动执行登录。
+Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login` 的已有订阅登录。网页显示设备的 **AI 服务** 时自动发现并检查 Cursor，也可点**自动接入**或显式配置程序绝对路径。发现结果会保存，已有有效自定义 CLI 保持选择；不支持的旧 SDK Bridge 选择会重新发现官方 CLI。Vibeface 不安装 Agent，不自动执行登录。
 
 ```sh
 ./vibeface init \
@@ -110,19 +110,19 @@ Node 使用已安装的官方 Cursor Agent CLI，通过 ACP 复用 `agent login`
     --workspace /absolute/path/to/manager-workspace
 ```
 
-可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。需要在 Node 私有目录登录时，按[设备 AI 设置中的认证命令](deployment.md#为-node-私有目录登录)操作。
+可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。需要在 Node 私有目录登录时，按设备 **AI 服务** 中的[认证命令](deployment.md#为-node-私有目录登录)操作。
 
 Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，Codex 等 CLI 工具的令牌和地址经线程的 Shell 环境传入，Cursor 使用当前 attempt 的 MCP bearer。Provider 凭据按官方 CLI 认证途径使用，不进入 Node 工具载荷或共享记录；各 Provider 不承诺相同的系统隔离。
 
 ### 使用 Claude Code、pi 或 opencode
 
-三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先安装所选程序。Claude Code 与 OpenCode 使用 Node 私有目录。Claude 可在私有登录明确未建立时借用本机 CLI 的访问令牌，保留原 CLI 的刷新权；OpenCode 仍使用私有登录。需要登录时按设备 AI 设置提供的命令在这台电脑上操作，再点**检查可用性**。pi 只隔离会话目录，继续读取用户本机认证配置。已有显式认证环境仍按对应 Provider 使用。
+三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先安装所选程序。Claude Code 与 OpenCode 使用 Node 私有目录。Claude 可在私有登录明确未建立时借用本机 CLI 的访问令牌，保留原 CLI 的刷新权；OpenCode 仍使用私有登录。需要登录时按设备 **AI 服务** 提供的命令在这台电脑上操作，再点**检查可用性**。pi 只隔离会话目录，继续读取用户本机认证配置。已有显式认证环境仍按对应 Provider 使用。
 
 | 产品 | 程序 | 登录 | Node 怎么运行 |
 |---|---|---|---|
-| Claude Code | `claude` | 先用私有登录；明确未登录时借用本机 CLI 访问令牌，或使用现有认证环境。AI 设置提供带私有 `CLAUDE_CONFIG_DIR` 的 `claude auth login` | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
+| Claude Code | `claude` | 先用私有登录；明确未登录时借用本机 CLI 访问令牌，或使用现有认证环境。**AI 服务** 提供带私有 `CLAUDE_CONFIG_DIR` 的 `claude auth login` | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
 | pi | npm 包 `@earendil-works/pi-coding-agent` 的 `pi` | pi 里的 `/login`，或所用服务的密钥变量 | 每轮和每个任务一个 `pi --mode rpc --no-extensions` 进程 |
-| opencode | `opencode` | AI 设置提供带私有 XDG 与 DB 路径的 `opencode --standalone auth login`，或现有认证环境 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
+| opencode | `opencode` | **AI 服务** 提供带私有 XDG 与 DB 路径的 `opencode --standalone auth login`，或现有认证环境 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
 
 #### opencode 自定义模型服务
 
@@ -626,7 +626,7 @@ GitHub 受管安装通过安装根目录下固定的 `current/vibeface` 启动�
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略参数时使用 `VIBEFACE_DATA_DIR`，未设置时使用 `~/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
-`status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
+`status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、直连还是经中继、往返时间和多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`vibeface health` 经同一 socket 读取 Node 健康检查发现的问题和最近 1 小时的 warn、error 统计，见 [排障](troubleshooting.md#看健康检查)。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
 
 ```sh
 vibeface status --json
@@ -677,9 +677,9 @@ vibeface service uninstall
 
 ## 备份与恢复
 
-建网时网页生成加密恢复文件，下载并确认与密码分开保存后才建网。之后在管理设备的**设置 → 找回 → 换恢复密码**，用当前恢复文件和旧密码换新密码，同时下载新文件，旧文件随即作废；网页不单独导出恢复文件。密码只保护恢复材料，不发送给 Node，不作为节点连接密码。
+建网时网页生成加密恢复文件，下载并确认与密码分开保存后才建网。之后在管理设备的**设置 → 安全 → 恢复密码**，用当前恢复文件和旧密码换新密码，同时下载新文件，旧文件随即作废；网页不单独导出恢复文件。密码只保护恢复材料，不发送给 Node，不作为节点连接密码。
 
-恢复密码只输一次，网页和手机按同一规则检查是否足够强，输入框下方用图标和一个词显示强度（太弱、可用、较强），太弱的不接受：
+网页建网和换恢复密码时，新恢复密码都要输入两遍，两遍不一致不能继续；手机换恢复密码时新密码只输一次。网页和手机按同一规则检查是否足够强，输入框下方用图标和一个词显示强度（太弱、可用、较强），太弱的不接受：
 
 - 少于 8 个字符。
 - 常见密码（如 `password`、`iloveyou`，结尾加数字或符号也算），只有 3 种以内的字符，或键盘、数字、字母上的连续一串（如 `12345678`、`qwertyui`、`abcdefgh`，正反都算）。

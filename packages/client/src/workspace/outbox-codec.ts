@@ -8,14 +8,14 @@ import { attachmentLimit, parseInputReceipt, parseWorkspaceCommandNotSaved } fro
 import { parseAttestation, parseWriteRequest, writeBody, writeKeySuffix, ownerBody, type WriteMethod } from './write-request.ts'
 import { inputTargetKey } from '../chat/protocol.ts'
 
-const methods: readonly WriteMethod[] = ['message', 'workspace_command', 'control_memory', 'ack', 'create_bot', 'delete_bot', 'set_primary_bot', 'set_bot_project', 'set_bot_avatar', 'control_schedule', 'set_owner', 'dismiss_work', 'answer', 'resolve']
+const methods: readonly WriteMethod[] = ['message', 'workspace_command', 'control_memory', 'ack', 'create_bot', 'delete_bot', 'set_primary_bot', 'set_bot_project', 'set_bot_avatar', 'control_schedule', 'set_owner', 'dismiss_work', 'dismiss_question', 'answer', 'resolve']
 function fail(): never { throw new OutboxCorruptError() }
 const own = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key)
 function keys(data: Record<string, unknown>, required: string[], optional: string[] = []) {
   if (required.some(key => !own(data, key) || data[key] === undefined) || Object.keys(data).some(key => !required.includes(key) && !optional.includes(key))) fail()
 }
 /** Compare a domain parser's projection without changing a single stored value or key order. */
-export function exactProjection(raw: unknown, parsed: unknown): void {
+function exactProjection(raw: unknown, parsed: unknown): void {
   if (raw === parsed) return
   if (Array.isArray(raw) && Array.isArray(parsed)) {
     if (raw.length !== parsed.length || Object.keys(raw).length !== raw.length || Object.keys(raw).some((key, index) => key !== String(index))) fail()

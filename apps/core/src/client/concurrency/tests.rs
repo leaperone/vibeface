@@ -1535,3 +1535,13 @@ async fn maintenance_busy_precedes_both_business_rejection_kinds() -> Result<()>
     std::fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+#[test]
+fn an_answered_undecodable_request_id_cannot_be_reused() {
+    let mut calls = Calls::default();
+    calls.reserve("r1").expect("a new ID is recorded");
+    assert!(
+        calls.reserve("r1").is_err(),
+        "a repeated ID ends the channel instead of answering for another request"
+    );
+}

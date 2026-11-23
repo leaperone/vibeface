@@ -4,22 +4,23 @@ import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, Ci
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { failureText, outcomeUnknown, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { runtimeLabel } from '@vibeface/client/chat/protocol.ts'
+import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { replyUnsettled, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
-import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { chatTaskState, interruptedCopy, nodeName, queueHoldLabels, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
+import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
-import { ActionCard, Details, providerIcons } from '@/components/kit'
+import { ActionCard, providerIcons } from '@/components/kit'
 import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
+import { touchRow } from '@/lib/layout'
 import { cn } from '@/lib/utils'
 import { InputStatus } from '@/features/workspace/workspace'
 
@@ -28,67 +29,66 @@ export type Row = { key: string; node: ReactNode }
 /** Why a reply or task failed: its kind's words, else the first line of its original text. */
 const cause = (kind: FailureKind | undefined, raw: string | null | undefined) => failureText(kind) || (raw ? taskError(raw).split('\n').at(-1) ?? '' : '')
 
-/** Plain-language reason a work needs the person; the device's own words stay out of the card. */
+/** Short reason a work needs the person. */
 function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
-  if (check.reason === 'offline') return `${device} 离线了，报不回这个任务的结果。`
-  if (check.reason === 'disconnected') return `${device} 上的 Codex 断开了，报不回这个任务的结果。`
-  if (check.detail.startsWith('设备已移除')) return `${device} 已移除，报不回这个任务的结果。`
-  if (/restart/i.test(check.detail)) return '设备在 Bot 工作时重启了，系统不会自动重做。'
-  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return '和 Bot 的连接断了，系统不会自动重做。'
-  return '这次的结果没法自动确认，系统不会自动重做。'
+  if (check.reason === 'offline') return `${device} 离线`
+  if (check.reason === 'disconnected') return `${device} 上的 Codex 断开`
+  if (check.detail.startsWith('设备已移除')) return `${device} 已移除`
+  if (/restart/i.test(check.detail)) return '设备重启了'
+  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return '连接断了'
+  return '结果没法自动确认'
 }
 
+type ChatActivity = { todo: ReactNode[]; sending: ReactNode[]; tasks: ReactNode[]; changes: ReactNode[]; runtime: ReactNode[] }
+
 /**
- * What the chat shows besides messages, as on the web: tasks after the message that started them, what a turn changed
- * after its reply, and everything waiting on the person (a device to take over, results to confirm) at the end.
+ * What the chat knows besides messages. The list keeps only `failures`, a one-line JobLine after the message that got no
+ * reply; everything else lives on the activity page, counted by `attention`, `tasks` and `hold` for the status line.
  */
 export function useChatExtras(conversationId: string, botId: string) {
   const shared = useLive()
   const { directory } = useDevice()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
-  const after = new Map<string, Row[]>()
-  const rest: Row[] = []
-  const cards: ReactNode[] = []
-  if (!shared || !data) return { after, rest, cards, first: [] as Row[] }
+  const failures = new Map<string, Row[]>()
+  const activity: ChatActivity = { todo: [], sending: [], tasks: [], changes: [], runtime: [] }
+  let tasks = 0, hold: QueueHoldReason | null = null
+  if (!shared || !data) return { failures, activity, attention: 0, tasks, hold }
   const lookup = { nodes: shared.nodes, directory }
-  const add = (at: string | undefined, row: Row) => {
-    if (at) after.set(at, [...after.get(at) ?? [], row])
-    else rest.push(row)
-  }
   const asking = new Set(data.questions.filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const jobs = data.scheduler?.jobs ?? []
   const shown = new Set(data.messages.map((message) => message.message_id))
   data.works.forEach((work, index) => {
     const state = chatTaskState(work, data.works, shared.nodes)
     const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
+    const stale = taskStale(shownAs, shared.connectionOnline), away = shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)
+    if (shared.connectionOnline && !away && (taskActive(shownAs) || shownAs === 'awaiting_children')) tasks++
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
-    const scheduledReply = data.messages.find((message) => message.role !== 'user' && scheduleTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
-    const cause = scheduledReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
-    add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} /> })
+    activity.tasks.unshift(<TaskCard key={`task:${work.work_id}`} work={work} state={shownAs} stale={stale} away={away} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} />)
   })
   for (const job of jobs) {
     const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
-    if (job.runtime) add(at, { key: `runtime:${job.trigger}`, node: <Details label="运行信息"><Text className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text></Details> })
-    if (job.state === 'reconciling' || job.pending_check) cards.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>}><Text className="text-sm text-muted">设备正在查询上次回复，系统不会自动重发。</Text></ActionCard>)
-    const message = data.messages.find((message) => message.message_id === job.message_id && message.role === 'user')
-    if (job.state === 'queued' && message) add(job.message_id, { key: `queued:${job.trigger}`, node: <Text className="text-sm text-muted">{job.hold_reason ? queueHoldLabels[job.hold_reason] : '等待开始工作'}</Text> })
-    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(at, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+    if (job.runtime) activity.runtime.unshift(<Text key={`runtime:${job.trigger}`} className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text>)
+    if (job.state === 'reconciling' || job.pending_check) activity.todo.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} />)
+    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
   }
+  hold = jobs.find((job) => job.state === 'queued')?.hold_reason ?? null
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
-  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} overwritten={data.overwritten} /> })
-  for (const [at, turns] of changes.after) for (const records of turns) add(at, changeRow(records))
-  const first = changes.first.map(changeRow)
+  for (const records of [...changes.first, ...[...changes.after.values()].flat()]) activity.changes.unshift(<ChangeCard key={`change:${records[0].change_id}`} records={records} schedules={schedules} overwritten={data.overwritten} />)
 
-  for (const pending of shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')) cards.push(<InputStatus key={`delivery:${pending.message_id}`} pending={pending} />)
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
   if (owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked)) {
-    cards.push(<ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`}
+    activity.todo.unshift(<ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`}
       actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(here.device_id, lookup)}</ActionButton>} />)
   }
-  for (const check of pendingChecks(data, shared.nodes, conversationId)) cards.push(<ConfirmCard key={check.check_id} check={check} />)
-  return { after, rest, cards, first }
+  for (const check of pendingChecks(data, shared.nodes, conversationId)) activity.todo.push(<ConfirmCard key={check.check_id} check={check} />)
+  for (const pending of shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')) {
+    const card = <InputStatus key={`delivery:${pending.message_id}`} pending={pending} />
+    if (pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown') activity.todo.push(card)
+    else activity.sending.push(card)
+  }
+  return { failures, activity, attention: activity.todo.length, tasks, hold }
 }
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */
@@ -113,7 +113,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
     const result = failed ? workFailure(work) : work.result_text ? work.result_text.split('\n')[0] : workFailure(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
     const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
-      <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-control px-2 py-2 active:bg-surface-muted">
+      <Pressable accessibilityRole="link" className={cn(touchRow, '-mx-2 flex-row items-start gap-2 rounded-control px-2 py-2 active:bg-surface-muted')}>
         <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted')} />
         <View className="min-w-0 flex-1">
           <Text numberOfLines={1} className="text-sm text-foreground">{title}</Text>
@@ -125,7 +125,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
     </Link>
   }
   return <Link href={href} asChild>
-    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-2  active:bg-surface-muted ">
+    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-panel border border-border bg-surface px-4 py-2 active:bg-surface-muted">
       {/* Waiting on an answer, it only says so: the question card below asks. */}
       <Icon as={state === 'waiting' ? Hand : state === 'awaiting_children' ? Hourglass : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale || state === 'awaiting_children' ? 'text-muted' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
@@ -143,10 +143,10 @@ function JobLine({ job }: { job: ManagerJob }) {
   const shared = useLive()
   const reason = job.failure ? cause(job.failure.kind, job.failure.detail) : ''
   const newest = shared?.data?.messages.at(-1)
-  const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail)
+  const retry = shared && newest?.role === 'user' && newest.message_id === job.message_id && !replyUnsettled(job)
     ? () => shared.retryReply(newest.message_id) : undefined
   return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
-    <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-sm text-danger">Bot 没能回复</Text></View>
+    <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-sm text-danger">没能回复</Text></View>
     {reason ? <Text className="shrink text-sm text-muted">{reason}</Text> : null}
     {shared ? retry ? <ActionButton variant="ghost" disabled={!shared.writable} action={retry}>重试</ActionButton> : <ActionButton variant="ghost" action={() => shared.refresh()}>再查一次</ActionButton> : null}
   </View>
@@ -162,12 +162,10 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   if (!shared) return null
   const lookup = { nodes: shared.nodes, directory }
   if (check.kind === 'process') return <ActionCard icon={CircleQuestionMark} title="上次回复的程序还在运行"
-    actions={<ActionButton disabled={!shared.writable} action={() => shared.confirmStopped(check)}>确认已停止</ActionButton>}>
-    <Text>{confirmText({ reason: 'unverified', detail: check.detail }, '')}相关程序还没退出，退出后会自动处理。</Text>
-  </ActionCard>
+    actions={<ActionButton disabled={!shared.writable} action={() => shared.confirmStopped(check)}>确认已停止</ActionButton>} />
   const device = nodeName(check.target_node, lookup)
   if (check.kind === 'device') return <ActionCard icon={confirmIcons[check.reason]} title={`${check.works.length} 个任务`}>
-    <Text>{check.reason === 'offline' ? `${device} 离线了，报不回这些任务的结果。` : `${device} 上的 Codex 断开了，报不回这些任务的结果。`}它们实际做完了吗？</Text>
+    <Text>{check.reason === 'offline' ? `${device} 离线` : `${device} 上的 Codex 断开`} · 它们做完了吗？</Text>
     {check.works.map((work) => <View key={work.work_id} className="gap-2">
       <Text numberOfLines={2} className="font-medium">{work.title || '任务结果'}</Text>
       <View className="flex-row gap-2">
@@ -181,7 +179,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     <ActionButton variant="secondary" disabled={!shared.writable} action={answer('interrupted')}>没做完</ActionButton>
     <ActionButton disabled={!shared.writable} action={answer('completed')}>做完了</ActionButton>
   </>}>
-    <Text>{confirmText(check, device)}它实际做完了吗？</Text>
+    <Text>{confirmText(check, device)} · 它做完了吗？</Text>
     <Input accessibilityLabel="补充说明" placeholder="补充说明（可选）" maxLength={2000} value={note} onChangeText={setNote} />
   </ActionCard>
 }

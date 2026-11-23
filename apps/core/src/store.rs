@@ -996,6 +996,19 @@ impl Store {
             })
             .collect()
     }
+
+    pub fn notification_acked(
+        &self,
+        network_id: &str,
+        notification_id: &str,
+        client_id: &str,
+    ) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notification_acks WHERE network_id=? AND notification_id=? AND client_id=?)",
+            params![network_id, notification_id, client_id],
+            |row| row.get(0),
+        )?)
+    }
     /// A Node belongs to at most one network.
     pub fn network(&self) -> Result<Option<NetworkId>> {
         network_from(&self.connection)

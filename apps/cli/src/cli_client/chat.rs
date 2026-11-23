@@ -906,7 +906,7 @@ pub async fn run(options: ChatOptions) -> Result<()> {
                 .send_input(&bot.conversation, input, &options.attachments)
                 .await?;
             show_operation(&profile, &operation)?;
-            if options.wait {
+            if options.wait && operation.state != OperationState::Rejected {
                 wait_for_reply(
                     &profile,
                     &bot.conversation,
@@ -917,11 +917,7 @@ pub async fn run(options: ChatOptions) -> Result<()> {
                 )
                 .await
             } else {
-                let state = if operation.state == OperationState::Accepted {
-                    State::Accepted
-                } else {
-                    State::Unknown
-                };
+                let state = sent_state(&operation);
                 show_final(
                     &profile,
                     &bot.conversation,
@@ -943,6 +939,15 @@ pub async fn run(options: ChatOptions) -> Result<()> {
     .await;
     reader.close();
     result
+}
+
+/// A rejected input was never queued, so no reply follows it.
+fn sent_state(operation: &OperationSnapshot) -> State {
+    match operation.state {
+        OperationState::Accepted => State::Accepted,
+        OperationState::Rejected => State::Failed,
+        _ => State::Unknown,
+    }
 }
 
 async fn wait_for_reply(
@@ -1153,6 +1158,9 @@ async fn interactive_chat(
                         let operation = profile.send_input(&bot.conversation, input, &attachments).await?;
                         attachments.clear();
                         show_operation(profile, &operation)?;
+                        if operation.state == OperationState::Rejected {
+                            require_accepted(&operation)?;
+                        }
                         pending.insert(id, item);
                     }
                     Ok(())
@@ -1354,6 +1362,25 @@ async fn slash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_send_is_final_and_an_unconfirmed_one_stays_unknown() {
+        let sent = |state| {
+            sent_state(&OperationSnapshot {
+                id: "m".into(),
+                network_id: "n".into(),
+                client_id: "c".into(),
+                target_node: "t".into(),
+                state,
+                sequence: None,
+                result: None,
+            })
+        };
+        assert_eq!(sent(OperationState::Rejected), State::Failed);
+        assert!(sent(OperationState::Rejected).terminal());
+        assert_eq!(sent(OperationState::Accepted), State::Accepted);
+        assert_eq!(sent(OperationState::Unknown), State::Unknown);
+    }
 
     #[test]
     fn exact_bot_id_wins_and_duplicate_names_list_candidates() {

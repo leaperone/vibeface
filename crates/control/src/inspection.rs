@@ -105,6 +105,8 @@ pub struct PeerStatus {
     pub reachable: Option<bool>,
     #[serde(deserialize_with = "required_nullable")]
     pub synced_ms: Option<i64>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub rtt_ms: Option<u32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -428,7 +430,7 @@ exit "$(cat "$fixture_dir/exit-code")"
             ),
             (
                 "\"peers\":[]",
-                "\"peers\":[{\"device_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"peer\",\"path\":\"unknown\",\"reachable\":null,\"synced_ms\":null}]",
+                "\"peers\":[{\"device_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"peer\",\"path\":\"unknown\",\"reachable\":null,\"synced_ms\":null,\"rtt_ms\":null}]",
                 true,
             ),
             ("\"stopped\"", "\"idle\"", false),

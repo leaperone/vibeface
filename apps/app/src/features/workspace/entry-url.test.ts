@@ -34,7 +34,7 @@ import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { messageKey, replyStatusLabel, inputTargetKey, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { messageKey, replyStatusLabel, inputTargetKey, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { addDeviceCopy, deviceCopy, joinCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread, messageTimes, taskMessage } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
@@ -1422,9 +1422,9 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
-        '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
@@ -2582,6 +2582,161 @@ test("automatic connection checks the three local services without changing uses
   })
 })
 
+test('onboarding saves the picked bot provider only on 下一步 and reads back an unknown result before another try', async (t) => {
+  for (const outcome of ['chosen', 'applied', 'not-applied', 'unreadable']) await t.test(outcome, async () => {
+    const unverified = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } } as const
+    const codex: ProviderStatus = {
+      provider: 'codex', authentication_source: 'private_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/codex', app_server: null,
+      endpoint: null, execution_model: '', execution_readiness: unverified, setup: null, installed: true, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: unverified,
+      probe: { provider: 'codex', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const claude: ProviderStatus = { ...codex, provider: 'claude', installed: false, probe: { ...codex.probe, provider: 'claude' } }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [codex, claude], display_paths: {}, suggested_roots: [] }
+    const chosen: NodeSettingsResponse = { ...initial, providers: [{ ...codex, roles: ['agent', 'execution'] }, claude] }
+    const write = pendingResult(), readback = pendingResult(), calls: { method: string; params: unknown }[] = []
+    const connection = { isCurrent: () => true, request: async (method: string, params?: unknown) => {
+      calls.push({ method, params })
+      return method === 'configure_provider' ? write.promise : calls.length === 1 ? initial : readback.promise
+    } }
+    let next = 0
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener() {}, removeEventListener() {} } })
+    const render = () => app.render('AiSettings', { onboarding: true, onNext: () => { next++ } })
+    const settle = async () => { for (let turn = 0; turn < 3; turn++) { await settleComponent(); render() } }
+    const choice = () => render().find(({ type }) => type === 'RadioGroup')
+    const button = (label: string) => render().find(({ type, props }) => type === 'Button' && elementText(props.children) === label)
+    const status = () => elementText(render().find(({ props }) => props.id === 'bot-choice-status')?.props.children)
+    const pick = () => (choice()?.props.onValueChange as (value: string) => void)('codex')
+    const press = () => (button('下一步')?.props.onClick as () => void)()
+    const writes = () => calls.filter((call) => call.method === 'configure_provider')
+    try {
+      render(); await settle()
+      assert.deepEqual(JSON.parse(JSON.stringify(choice()?.props.options)).map((option: { value: string }) => option.value), ['codex'], 'only found services that can run the bot are offered')
+      assert.equal(choice()?.props.value, '')
+      assert.deepEqual(calls.map((call) => call.method), ['node_settings'], 'entering the step neither connects Codex or Claude Code nor picks a service')
+      assert.equal(button('下一步')?.props.disabled, true)
+      assert.equal(button('下一步')?.props['aria-describedby'], 'bot-choice-status')
+      assert.equal(status(), '先选一项 AI 服务', 'the disabled 下一步 says why')
+      pick()
+      assert.equal(choice()?.props.value, 'codex')
+      assert.equal(writes().length, 0, 'picking a service only changes the draft, without writing')
+      assert.equal(button('下一步')?.props.disabled, false)
+      assert.equal(status(), '下一步会让所选服务运行 Bot，也打开它的「执行任务」', 'on a fresh device the bot write also executes tasks, said before it is made')
+      press(); press()
+      assert.deepEqual(JSON.parse(JSON.stringify(writes())), [{ method: 'configure_provider', params: { provider: 'codex', bot: true, execution: true } }], 'one 下一步 is the same write as 运行 Bot on a fresh device')
+      assert.equal(status(), '正在让 Codex 运行 Bot')
+      assert.deepEqual([button('下一步')?.props.loading, button('下一步')?.props.disabled], [true, false], 'the pressed 下一步 stays busy rather than disabled, so focus stays on it')
+      assert.equal(button('稍后设置')?.props.disabled, true, 'the step cannot be left while its write is pending')
+      if (outcome === 'chosen') {
+        write.resolve(chosen); await settle()
+        assert.equal(next, 1, 'a saved pick moves on')
+        return
+      }
+      write.reject(new Error('client response timed out; outcome may be unknown')); await settle()
+      assert.equal(calls.at(-1)?.method, 'node_settings', 'an unknown write is read back instead of resent')
+      press()
+      assert.equal(writes().length, 1, 'no other try starts before the read-back')
+      assert.equal(button('稍后设置')?.props.disabled, true)
+      if (outcome === 'unreadable') readback.reject(new Error('device read failed'))
+      else readback.resolve(outcome === 'applied' ? chosen : initial)
+      await settle()
+      assert.equal(render().some(({ type }) => type === 'InlineError'), outcome !== 'applied', 'the failed write stays shown unless the read-back shows it took effect')
+      assert.equal(choice()?.props.value, 'codex', 'the pick stays')
+      assert.equal(next, 0, 'a failed write keeps the step')
+      assert.equal(button('稍后设置')?.props.disabled, false)
+      if (outcome === 'unreadable') {
+        press()
+        assert.equal(writes().length, 1, 'an unreadable result blocks another try until it is read again')
+        assert.equal(button('下一步')?.props.disabled, true)
+        assert.equal(status(), '重新读取后才能继续')
+        ;(button('重新读取')?.props.onClick as () => void)()
+        assert.ok(!render().some(({ type }) => type === 'InlineError'), 'the read clears the error')
+        assert.equal(button('重新读取')?.props.loading, true, 'the pressed button stays, busy, so focus stays on it')
+        assert.equal(status(), '正在重新读取这台电脑的 AI 服务')
+        await settle()
+        assert.equal(button('重新读取')?.props.loading, false)
+        assert.equal(status(), '重新读取后才能继续', 'a read that fails again keeps the step blocked')
+        return
+      }
+      if (outcome === 'applied') assert.equal(status(), 'Codex 已设为运行 Bot')
+      press()
+      assert.equal(writes().length, outcome === 'applied' ? 1 : 2, 'a read-back showing the write applied moves on without sending it again')
+      assert.equal(next, outcome === 'applied' ? 1 : 0)
+    } finally { app.close() }
+  })
+})
+
+test('onboarding keeps the unasked Cursor check quiet unless only reading again can clear its result', async (t) => {
+  for (const outcome of ['read-back', 'unreadable']) await t.test(outcome, async () => {
+    const unverified = { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } } as const
+    const cursor: ProviderStatus = {
+      provider: 'cursor', authentication_source: 'local_cli_login', roles: [], supports: ['agent', 'execution'], bin: '/fixture/agent', app_server: null,
+      endpoint: null, execution_model: '', execution_readiness: unverified, setup: null, installed: true, home: null, sessions: null, env: [],
+      state: 'off', issues: [], readiness: unverified,
+      probe: { provider: 'cursor', config_id: 'fixture', checked_at_ms: null, launch: { state: 'unchecked' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+      observed: { installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'unknown', evidence: 'launch_prerequisites' }, authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' } },
+    }
+    const initial: NodeSettingsResponse = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: null }, providers: [cursor], display_paths: {}, suggested_roots: [] }
+    const calls: string[] = []
+    const connection = { isCurrent: () => true, request: async (method: string) => {
+      calls.push(method)
+      if (method === 'configure_provider') throw new Error('client response timed out; outcome may be unknown')
+      if (calls.length > 1 && outcome === 'unreadable') throw new Error('device read failed')
+      return initial
+    } }
+    const app = componentHarness('../devices/ai-settings.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: connection }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ isCurrent: () => true, refresh: async () => {} }) },
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' } } },
+    }, { window: { addEventListener() {}, removeEventListener() {} } })
+    const render = () => app.render('AiSettings', { onboarding: true, onNext() {} })
+    try {
+      render(); for (let turn = 0; turn < 5; turn++) { await settleComponent(); render() }
+      assert.deepEqual(calls, ['node_settings', 'configure_provider', 'node_settings'], 'the failed check is read back, not sent again')
+      const elements = render()
+      const shown = elements.find(({ type }) => type === 'InlineError')
+      const status = elementText(elements.find(({ props }) => props.id === 'bot-choice-status')?.props.children)
+      if (outcome === 'read-back') {
+        assert.equal(shown, undefined, 'a check nobody asked for does not fail loudly')
+        assert.equal(status, '先选一项 AI 服务')
+        return
+      }
+      assert.ok(shown, 'the failed check is shown when only reading again clears it')
+      assert.ok(elements.some(({ type, props }) => type === 'Button' && elementText(props.children) === '重新读取'), 'an unknown result comes with the one action that clears it')
+      assert.equal(status, '重新读取后才能继续')
+    } finally { app.close() }
+  })
+})
+
+test('the onboarding step counts only on the network it was started for', () => {
+  const stored = new Map<string, string>()
+  const app = componentHarness('../identity/onboarding-flag.ts', {}, { localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => { stored.set(key, value) }, removeItem: (key: string) => { stored.delete(key) } } })
+  const step = (network?: string) => { app.render('useOnboarding', network); return app.output }
+  const flag = app.module as { startOnboarding(network: string): void; setOnboardingStep(network: string, step: 4 | 5): void; finishOnboarding(): void }
+  try {
+    stored.set('vibeface.onboarding', '4')
+    assert.equal(step('network-a'), null, 'a step saved without its network counts as none')
+    flag.startOnboarding('network-a')
+    assert.deepEqual([step('network-a'), step('network-b'), step(undefined)], [4, null, null])
+    flag.setOnboardingStep('network-a', 5)
+    assert.deepEqual([step('network-a'), step('network-b')], [5, null])
+    flag.finishOnboarding()
+    assert.equal(step('network-a'), null)
+    assert.equal(stored.size, 0)
+  } finally { app.close() }
+})
+
 test("compact system provider cards use external service evidence without local prerequisites", async (t) => {
   for (const mode of ['system', 'spawn'] satisfies NonNullable<ProviderStatus['app_server']>['mode'][]) for (const installed of [false, true]) for (const authentication of ['authenticated', 'unverified', 'sign_in_required'] satisfies ProviderStatus['probe']['authentication'][]) await t.test(`${mode} installed=${installed} ${authentication}`, () => {
     const item: ProviderStatus = {
@@ -2600,7 +2755,7 @@ test("compact system provider cards use external service evidence without local 
       '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'Tasks' }, secret: { icon: 'Key' } } },
     }, {}, 'ProviderCard')
     try {
-      const elements = app.render('ProviderCard', { item, response, onboarding: false, compact: true, busy: '', models: null, error: '' })
+      const elements = app.render('ProviderCard', { item, response, compact: true, busy: '', models: null, error: '' })
       const summary = elements.find(({ type, props }) => type === 'span' && props.className === 'truncate')
       assert.equal(elementText(summary), mode === 'system' || installed ? '可用' : '未安装', 'the main state follows readiness for system services')
       const diagnostics = elements.find(({ type, props }) => type === 'Details' && props.label === '程序、认证与模型详情')
@@ -2672,7 +2827,7 @@ test("provider cards keep summary readiness, setup and execution details in thei
       '@/components/arc/product-kit': kit,
       '@/components/kit': kit,
     }, {}, name)
-    const props = { item, response, onboarding: false, first: true, busy: '', models: null, error: '' }
+    const props = { item, response, first: true, busy: '', models: null, error: '' }
     try {
       let elements = app.render(name, props)
       if (platform === 'mobile') {
@@ -2859,7 +3014,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: false, source: 'membership' } }, retryNow: () => {}, ...device }) },
     '@vibeface/client/identity/copy.ts': { setUpOnManager },
-    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters },
     '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
     '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
@@ -3032,7 +3187,6 @@ test('both pending input controls retry only a matching safe refusal and keep al
       assert.equal(button('不再发送'), undefined)
       assert.equal(button('关闭提醒'), undefined)
       assert.match(componentText(render()), /送达结果仍未确认/)
-      assert.match(componentText(render()), platform === 'web' ? /此浏览器/ : /此应用/)
       assert.ok(button('确认原设备并查询'))
       shared.connectionOnline = false; assert.equal(button('确认原设备并查询'), undefined); shared.connectionOnline = true
       for (const marker of [{ release_expected_event: 'c'.repeat(64) }, { release_command_id: 'a'.repeat(64) }]) {
@@ -3308,7 +3462,7 @@ test('composers save each pending draft once and let edited drafts save independ
       '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
-      '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters },
+      '@vibeface/client/chat/protocol.ts': { promptIntent, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters },
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
       '@tanstack/react-router': { useNavigate: () => (target: unknown) => { navigations.push(target) } },
@@ -3555,7 +3709,7 @@ test('empty chat starters preserve an editable unsent draft', () => {
   } finally { harness.app.close() }
 })
 
-test('chat task groups stay at their originating message and orphan tasks remain available only in history', () => {
+test('chat tasks stay out of the message list and remain available in the activity drawer', () => {
   const messages = [
     { message_id: 'one', event_hash: 'one', role: 'user', text: '核对项目', created_at_ms: 1 },
     { message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '已开始核对', created_at_ms: 2, in_reply_to: 'one' },
@@ -3566,17 +3720,8 @@ test('chat task groups stay at their originating message and orphan tasks remain
   shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), parityWork({ work_id: 'child', trigger: 'task:root' }), complete('orphan', 'message:missing')] })
   const harness = conversationHarness(() => shared)
   try {
-    const entries = harness.chatEntries()
-    assert.deepEqual(entries.map((entry) => entry.key), ['one', 'task-group:message:one', 'task-group:task:root', 'reply', 'two'])
-    const group = entries.find((entry) => entry.key === 'task-group:message:one')?.node
-    assert.equal(group?.type, 'Details')
-    assert.equal(group?.props.label, '2 个任务 · 已完成')
+    assert.equal(harness.chatEntries().map((entry) => entry.key).join(), 'one,reply,two')
     const elements = harness.render()
-    const cards = elements.filter(({ type }) => typeof type === 'function' && type.name === 'TaskCard')
-    assert.equal(cards.length, 3, 'the orphan cannot create a chat row')
-    const finished = cards.find(({ props }) => (props.task as { id: string }).id === 'sibling')
-    assert.ok(finished)
-    assert.equal(componentText(nestedElements([finished], ['TaskCard']).find(({ type }) => type === 'div')), '已完成 · 查看任务')
     const history = elements.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
     assert.equal(history, undefined, 'an inactive chat never mounts a history portal')
     const active = harness.render({ active: true })
@@ -3584,10 +3729,8 @@ test('chat task groups stay at their originating message and orphan tasks remain
     const chatKey = active.find(({ type }) => type === 'Chat')?.key
     assert.ok(historyKey && chatKey)
     assert.notEqual(historyKey, chatKey, 'history and the retained chat are different siblings during reconciliation')
-    shared.data = parseConversation({ ...context, messages: messages.slice(0, 1), works: shared.data.works })
-    assert.equal(harness.chatEntries()[1].key, 'task-group:message:one', 'a reply arriving never moves the task group')
-    shared.data = parseConversation({ ...context, messages, works: [complete('root'), complete('sibling'), complete('child', 'task:root'), complete('orphan', 'message:missing')] })
-    assert.equal(harness.chatEntries()[2].key, 'task-group:task:root', 'progress changes retain the group key')
+    const drawer = active.find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')
+    assert.equal((drawer?.props.tasks as unknown[]).length, 4, 'every task, including the orphan, is listed in the drawer')
   } finally { harness.app.close() }
 })
 
@@ -3610,8 +3753,13 @@ test('chat task history keeps completed and unknown records while counting only 
     return app.render('TaskHistory', history.props)
   }
   const label = () => render().find(({ type }) => type === 'Button')?.props['aria-label']
+  const badge = () => render().some(({ type }) => type === 'Dot')
+  const status = () => componentText(harness.render({ active: true }).find(({ type }) => type === 'PromptInput')?.props.above)
   try {
-    assert.equal(label(), '执行记录 · 3 待处理')
+    assert.equal(label(), '动态，2 项要处理')
+    assert.equal(badge(), true, 'the unverifiable work needs the person')
+    assert.match(status(), /^2 项要处理待处理$/, 'the failed and unverifiable works count; the open approval is the question pill, not a running task')
+
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
     assert.match(componentText(render()), /已完成/)
@@ -3620,7 +3768,7 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(app.render('TaskIcon', { state: 'completed', stale: false }).some(({ type }) => type === 'CircleCheck'), true)
     shared.answered = { approval: '继续' }
     shared.openWorks = shared.openWorks.filter((work) => work.work_id !== 'failed')
-    assert.equal(label(), '执行记录 · 1 进行中 · 1 待处理', 'answered approvals and closed historical failures stop counting')
+    assert.match(status(), /^1 项要处理 · 1 个任务进行中$/, 'answered approvals and closed historical failures stop counting')
     const trigger = render().find(({ type }) => type === 'Button')
     let restoredFocus = 0
     const triggerRef = trigger?.props.ref as { current: { focus(options?: { preventScroll?: boolean }): void } | null }
@@ -3641,7 +3789,7 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(prevented, true, 'ordinary dismissal explicitly handles the portalled opener')
     assert.equal(restoredFocus, 1, 'ordinary dismissal restores the actual opening button')
     shared.connectionOnline = false
-    assert.equal(label(), '执行记录 · 2 待处理', 'offline active tasks are uncertain instead of counted as running')
+    assert.match(status(), /2 项要处理$/, 'offline active tasks are uncertain and need the person instead of counting as running')
   } finally { app.close(); harness.app.close() }
 })
 
@@ -4677,7 +4825,7 @@ test("question cards send a choice on tap, send written text from the last line,
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
   const tap = async (label: string, props: object = {}) => {
-    const button = render(props).find(({ type, props }) => (type === 'Button' || type === 'Button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
+    const button = render(props).find(({ type, props }) => (type === 'Button' || type === 'button') && (props['aria-label'] === label || componentText(props.children).includes(label)))
     assert.ok(button?.props.onClick, `missing button ${label}`)
     button.props.onClick(); await settleComponent()
   }
@@ -4690,7 +4838,7 @@ test("question cards send a choice on tap, send written text from the last line,
   try {
     let elements = render()
     assert.match(componentText(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
-    assert.deepEqual(elements.filter(({ type, props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
+    assert.deepEqual(elements.filter(({ type }) => type === 'button').map(({ props }) => componentText(props.children)), ['1允许', `2${longChoice}`, '3停下'], 'one numbered row per real choice')
     const input = elements.find(({ type }) => type === 'Textarea')
     assert.equal(input?.props.rows, 1, 'the last line waits for a written answer')
     assert.equal(input?.props['aria-label'], '你的回答')
@@ -4712,7 +4860,7 @@ test("question cards send a choice on tap, send written text from the last line,
     write('新回答')
     workspace.writable = false
     elements = render()
-    assert.equal(elements.filter(({ type }) => type === 'Button' || type === 'Textarea').every(({ props }) => props.disabled === true), true)
+    assert.equal(elements.filter(({ type }) => type === 'Button' || type === 'button' || type === 'Textarea').every(({ props }) => props.disabled === true), true)
     await tap('停下'); await tap('忽略')
     assert.equal(sent.length, count, 'the send handler also enforces read-only state')
     workspace.writable = true
@@ -4720,7 +4868,7 @@ test("question cards send a choice on tap, send written text from the last line,
     assert.deepEqual(plain(sent.at(-1)), [question, ignoredAnswer], 'ignoring sends the fixed answer')
     workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
     elements = render()
-    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal' || type === 'Textarea'), false, 'a pending answer cannot be replaced')
+    assert.equal(elements.some(({ type }) => type === 'button' || type === 'Textarea'), false, 'a pending answer cannot be replaced')
     assert.match(componentText(elements), /没确认送达/)
     const retry = elements.find(({ type, props }) => type === 'Button' && componentText(props.children).includes('再试'))
     assert.ok(retry?.props.onClick)
@@ -4735,7 +4883,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = { q1: '允许' }
     elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
     assert.match(componentText(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
     workspace.pendingAnswers = []
     elements = render()
     assert.match(componentText(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
@@ -4747,7 +4895,7 @@ test("question cards send a choice on tap, send written text from the last line,
     workspace.answered = {}
     elements = render({ question: { ...question, closed: 'request_lost' } })
     assert.match(componentText(elements), /已失效/)
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'Button'), false)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'button'), false)
     await tap('允许', { inbox: true })
     await tap('忽略', { inbox: true })
     assert.deepEqual(toasts.map(({ text }) => text), ['已回答', '已忽略'])
@@ -4772,7 +4920,7 @@ test("a question without choices offers only the answer line and 忽略", () => 
   try {
     const elements = app.render('QuestionCard', { question: { question_id: 'free', text: '需要什么配置？', choices: [], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null } })
     assert.equal(elements.find(({ type }) => type === 'Textarea')?.props.rows, 1)
-    assert.equal(elements.some(({ type,props }) => type === 'Button' && props.className === 'w-full justify-start whitespace-normal'), false)
+    assert.equal(elements.some(({ type }) => type === 'button'), false)
     assert.ok(elements.some(({ type, props }) => type === 'Button' && componentText(props.children).includes('忽略')))
   } finally { app.close() }
 })
@@ -5180,7 +5328,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -5483,41 +5631,50 @@ test('recovery restore clears submitted passwords before waiting and keeps the c
   } finally { app.close() }
 })
 
-test('changing the recovery password keeps what was typed when it fails, and clears it once the new file is made', async () => {
-  let work = pendingResult()
-  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
-  const fields = new Map(['bundle', 'password', 'old_password'].map(name => [name, new Input()]))
-  const passwords = ['password', 'old_password'].map(name => fields.get(name))
+test('changing the recovery password asks for it twice, keeps what was typed when it fails, and clears it once the new file is made', async () => {
+  let work = pendingResult(), replaced = 0
+  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false; focused = false; focus() { this.focused = true } }
+  const fields = new Map(['bundle', 'password', 'old_password', 'confirm_password'].map(name => [name, new Input()]))
+  const passwords = ['password', 'old_password', 'confirm_password'].map(name => fields.get(name))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
-  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => work.promise }
+  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => { replaced++; return work.promise } }
   const app = componentHarness('../identity/recovery-controls.tsx', {
     '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
     '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value, passwordStrength: () => ({ level: 'strong' }) }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
-  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
+  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input }, '', { '@vibeface/client/identity/copy.ts': '../../../../../packages/client/src/identity/copy.ts' })
   const render = () => app.render('RecoveryControls', { only: 'passphrase' })
   const form_ = () => render().find(({ type }) => type === 'form')?.props
   const submit = () => form_()?.onSubmit?.({ preventDefault() {}, currentTarget: form })
   try {
-    render(); submit()
+    render()
+    const again = fields.get('confirm_password'); assert.ok(again)
+    again.value = 'another test-only-value'; submit(); await settleComponent()
+    assert.equal(replaced, 0, 'a retyping that differs seals no file')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '两遍不一致，再输入一遍')
+    assert.ok(again.focused, 'the retyping takes the focus back')
+    form_()?.onChange?.({})
+    assert.equal(render().some(({ props }) => props.error), false, 'a change takes the mismatch away')
+    again.value = 'test-only-value'; submit()
     work.reject(new Error('旧密码不对')); await settleComponent()
-    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps both passwords')
+    assert.equal(replaced, 1)
+    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps every password')
     assert.equal(render().find(({ props }) => props.error)?.props.error, '旧密码不对')
     form_()?.onChange?.({})
     assert.equal(render().some(({ props }) => props.error), false, 'a change takes the old error away')
     work = pendingResult(); submit(); work.resolve(undefined); await settleComponent()
-    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears both passwords')
+    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears every password')
   } finally { app.close() }
 })
 
-test('native chat folds runtime diagnostics and retains result checks without provider availability cards', async () => {
+test('native chat activity keeps runtime diagnostics and result checks out of the message list', async () => {
   let refreshed = 0
   const runtime = workspaceModel.parseTurnRuntime({ provider: 'codex', model: 'submitted-model', reasoning_effort: 'high', generation: 'generation', session_generation: 1, delivery_id: 'delivery', stage: 'record', execution: 'started', attempted_at_ms: 1, switched_from: null, switch_reason: null })
   const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
   const shared = { ...parityShared(), refresh: async () => { refreshed++ }, nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' as const } }] }
-  shared.data = parseConversation({ ...context, messages: [{ message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2 }], scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } })
+  shared.data = parseConversation({ ...context, messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: '做', created_at_ms: 1 }, { message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2, in_reply_to: 'one' }], scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } })
   const extras = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', {
     '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
-    '@vibeface/client/chat/protocol.ts': { promptIntent, canRetryJob, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
+    '@vibeface/client/chat/protocol.ts': { promptIntent, canRetryJob, replyUnsettled, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleTrigger }, '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/workspace/questions.ts': { questionOpen }, '@vibeface/client/lib/errors.ts': errors,
   })
@@ -5525,36 +5682,33 @@ test('native chat folds runtime diagnostics and retains result checks without pr
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }), withTiming: (value: number) => value }, 'uniwind': { withUniwind: (value: unknown) => value },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
   })
-  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { after: Map<string, { key: string; node: HarnessElement }[]>; cards: HarnessElement[] } }
+  type Activity = { todo: HarnessElement[]; runtime: HarnessElement[] }
+  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { failures: Map<string, unknown[]>; activity: Activity; attention: number } }
   try {
     const result = render()
     assert.equal(botReach(shared.nodes), 'unverified')
-    assert.equal(result.cards.length, 0, 'unverified readiness is sendable without a provider card')
-    const row = result.after.get('reply')?.find((row) => row.key === 'runtime:message:one')?.node
-    assert.ok(row)
-    assert.equal(row.type, 'Details')
-    assert.equal(row.props.label, '运行信息')
-    details.render('Details', row.props)
-    assert.doesNotMatch(componentText(details.output), /Codex|submitted-model|提交推理强度|记录结果/)
-    const toggle = details.render('Details', row.props).find(({ props }) => props.accessibilityRole === 'button')
-    assert.deepEqual(JSON.parse(JSON.stringify(toggle?.props.accessibilityState)), { expanded: false })
-    assert.equal(typeof toggle?.props.onPress, 'function')
-    if (typeof toggle?.props.onPress === 'function') toggle.props.onPress()
-    details.render('Details', row.props)
-    assert.match(componentText(details.output), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
+    assert.equal(result.activity.todo.length, 0, 'unverified readiness is sendable without a provider card')
+    assert.equal(result.failures.size, 0, 'runtime diagnostics stay out of the message list')
+    assert.match(componentText(result.activity.runtime), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
+    shared.data.scheduler!.jobs = [{ ...job, state: 'failed', reply_message_id: undefined }]
+    const failed = render()
+    assert.deepEqual([...failed.failures.keys()], ['one'], 'a failed job without a reply gets one line under its message')
+    assert.equal(failed.failures.get('one')?.length, 1)
+    assert.equal(failed.activity.runtime.length, 1, 'its runtime stays on the activity page')
     for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }] satisfies ManagerJob[]) {
       shared.data.scheduler!.jobs = [current]
-      const cards = render().cards
-      assert.equal(cards.length, 1)
-      assert.equal(cards[0].props.title, '这次回复的结果待确认')
-      const action = findActionProps(cards[0].props.actions, '再查一次')?.action
+      const { activity, attention } = render()
+      assert.equal(activity.todo.length, 1)
+      assert.equal(attention, 1)
+      assert.equal(activity.todo[0].props.title, '这次回复的结果待确认')
+      const action = findActionProps(activity.todo[0].props.actions, '再查一次')?.action
       assert.equal(typeof action, 'function')
       if (typeof action === 'function') await action()
     }
     assert.equal(refreshed, 2, 'result reconciliation remains a read-only action')
     shared.data.works = [parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })]
     shared.data.checks = [{ check_id: 'process', conversation_id: 'chat', trigger: 'message:one', attempt_id: 'attempt', detail: '进程还在运行', process_groups: [42], created_at_ms: 1 }]
-    const cards = render().cards
+    const cards = render().activity.todo
     assert.equal(cards.filter(({ type }) => typeof type === 'function' && type.name === 'ConfirmCard').length, 2, 'unknown work and running-process checks stay visible')
   } finally { extras.close(); details.close() }
 })
@@ -5567,10 +5721,10 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
     'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
     'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
-    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+    '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-    '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
     ...dependencies,
   })
 }
@@ -5830,7 +5984,7 @@ test("conversation preserves local input while execution devices are unavailable
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -5867,11 +6021,11 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
   const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
   const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
   let messages: object[] = [ask]
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -5886,11 +6040,11 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
   const question = (question_id: string, closed: string | null) => ({ question_id, conversation_id: "chat", bot: null, severity: "attention", text: "允许吗？", choices: [],
     about: { node: "gateway", agent: "codex", session_id: "s", cwd: "/w", summary: "", request_id: "r" }, author: "gateway", created_at_ms: 2, answer: null, closed })
   let questions = [question("lost", "request_lost")]
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")
@@ -5928,7 +6082,7 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
   } finally { harness.app.close() }
 })
 
-test('merged and in-flight user messages show honest status labels and refresh-only 再查一次', async () => {
+test('merged and in-flight user messages show honest status marks and a refresh-only 再查一次 in the activity drawer', async () => {
   let refreshed = 0, sent = 0
   let connectionOnline = true
   const baseAsk = { message_id: 'm0', event_hash: 'm0', role: 'user' as const, text: 'first', created_at_ms: 0 }
@@ -5941,29 +6095,39 @@ test('merged and in-flight user messages show honest status labels and refresh-o
   })
   let current = build([], [], { report_results: true, message_id: 'pending', text: 'sending', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: parityBot.bot_id }, intent: 'continue', sequence: 1, created_at_ms: 1, delivery: 'submitting' })
   const harness = conversationHarness(() => current)
+  const mark = (messageId: string) => harness.messageTree(messageId).find(({ props }) => props.role === 'img')?.props['aria-label']
+  const requery = () => findActionProps(harness.render({ active: true }).find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')?.props.before, '再查一次')
   try {
-    assert.match(componentText(harness.messageTree('pending')), /正在确认送达/)
+    assert.equal(mark('pending'), '正在确认送达')
     current = build(
       [{ trigger: 'message:m0', state: 'running', message_id: 'm0' }, { trigger: 'message:m1', state: 'queued', message_id: 'm1' }],
       [baseAsk, { message_id: 'm1', event_hash: 'm1', role: 'user', text: 'queued', created_at_ms: 1 }],
     )
-    assert.match(componentText(harness.messageTree('m1')), /已排队/)
+    assert.equal(mark('m1'), '已排队')
     for (const [outcome, label] of [['answered', '关联回合已完成'], ['unfinished', '关联回合未完成'], ['unknown', '补充结果未知']] as const) {
       current = build([{ trigger: 'message:m2', state: 'steered', message_id: 'm2', outcome }], [{ message_id: 'm2', event_hash: 'm2', role: 'user', text: outcome, created_at_ms: 2 }])
-      const tree = harness.messageTree('m2')
-      assert.ok(componentText(tree).includes(label))
-      if (outcome === 'unknown') {
+      assert.equal(mark('m2'), label)
+      assert.equal(findActionProps(harness.messageTree('m2'), '再查一次'), undefined, 'the bubble carries no actions')
+      if (outcome !== 'unknown') assert.equal(requery(), undefined)
+      else {
         refreshed = 0; sent = 0
-        const action = findActionProps(tree, '再查一次')
+        const action = requery()
         assert.ok(action?.action)
         await (action.action as () => Promise<void>)()
         assert.equal(refreshed, 1)
         assert.equal(sent, 0)
         connectionOnline = false
         current = { ...current, connectionOnline }
-        assert.equal(findActionProps(harness.messageTree('m2'), '再查一次')?.disabled, true)
+        assert.equal(requery()?.disabled, true)
       }
     }
+    connectionOnline = true
+    current = build([{ trigger: 'message:m3', state: 'failed', message_id: 'm3', reply_message_id: 'r3' }], [
+      { message_id: 'm3', event_hash: 'm3', role: 'user', text: 'old', created_at_ms: 3 }, { message_id: 'r3', event_hash: 'r3', role: 'assistant', text: 'failed', created_at_ms: 4, in_reply_to: 'm3', status: 'failed' },
+      { message_id: 'm4', event_hash: 'm4', role: 'user', text: 'new', created_at_ms: 5 }, { message_id: 'r4', event_hash: 'r4', role: 'assistant', text: 'done', created_at_ms: 6, in_reply_to: 'm4' },
+    ])
+    assert.equal(harness.render({ active: true }).find(({ type }) => typeof type === 'function' && type.name === 'TaskHistory')?.props.attention, 0, 'an older failed reply raises no attention')
+    assert.equal(requery(), undefined)
   } finally { harness.app.close() }
 })
 
@@ -6680,7 +6844,7 @@ test('native system notification events keep typed destinations and clear naviga
   const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
   type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
   let response: ((value: Response) => void) | undefined
-  let dismissed = 0, forgotten = 0
+  let dismissed = 0, forgotten = 0, logsCleared = 0
   const storage = new Map<string, string>()
   const scheduled: unknown[] = []
   const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
@@ -6695,6 +6859,7 @@ test('native system notification events keep typed destinations and clear naviga
     },
     'react-native-mmkv': { createMMKV: () => ({ getString: (key: string) => storage.get(key), set: (key: string, value: string) => storage.set(key, value), clearAll: () => storage.clear(), getAllKeys: () => [...storage.keys()] }) },
     '@vibeface/secure-native': { lan: {}, secure: {} },
+    '@vibeface/client/lib/web-log.ts': { clearLogs: () => { logsCleared++ } },
     '@vibeface/client/lib/transport.ts': { createTransport: () => ({ forgetClient: async () => { forgotten++ } }) },
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
@@ -6717,6 +6882,7 @@ test('native system notification events keep typed destinations and clear naviga
   assert.deepEqual(opened, [destination], 'erase removes the navigation consumer')
   assert.equal(dismissed, 1)
   assert.equal(forgotten, 1)
+  assert.equal(logsCleared, 1, 'erase clears the phone log buffer')
   unwatch?.()
 })
 

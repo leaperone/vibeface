@@ -219,6 +219,9 @@ pub(crate) fn native_progress(event: &Value) -> Value {
 impl Runtime {
     /// Only locally produced progress enters this ring. Proxied reads use events.send directly.
     pub(crate) fn publish_progress(&self, network: &str, payload: Value) {
+        if let Some(work_id) = payload["work_id"].as_str() {
+            self.work_progressed(work_id);
+        }
         if let Some(payload) = self.record_progress(network, payload) {
             let _ = self.events.send(Update {
                 network_id: network.into(),

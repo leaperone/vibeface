@@ -106,7 +106,7 @@ export function secureKit(secure: SecureApi) {
 const COMMON = new Set(['password', 'passw0rd', 'p@ssw0rd', 'iloveyou', 'sunshine', 'princess', 'football', 'baseball', 'superman', 'welcome', 'letmein', 'monkey', 'dragon', 'master', 'admin', 'qwerty', 'abc123', 'woaini', 'woaini1314', 'vibeface', 'recovery'])
 /** Keyboard and counting runs; a password inside one, either way round, is a pattern, not a secret. */
 const RUNS = ['abcdefghijklmnopqrstuvwxyz', '01234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm', '1qaz2wsx3edc4rfv5tgb', 'qazwsxedcrfvtgbyhn']
-export type PasswordProblem = 'short' | 'common' | 'simple'
+type PasswordProblem = 'short' | 'common' | 'simple'
 export type PasswordStrength = { level: 'weak'; problem: PasswordProblem } | { level: 'fair' | 'strong' }
 /**
  * How hard a new recovery password is to guess offline, by the rule packages/docs/node.md#备份与恢复 states: at least 8

@@ -1,29 +1,38 @@
-import { AuthPage,BusyIcon,FolderPath,InlineError,Panel,Steps } from "@/components/arc/product-kit"
+import { AuthPage,FolderPath,InlineError,Panel,Steps } from "@/components/arc/product-kit"
 import { AiSettings } from "@/features/devices/ai-settings"
+import { pendingBotCopy } from "@/features/workspace/bot-form"
 import { useNavigate } from "@tanstack/react-router"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseNodeSettings } from "@vibeface/client/lib/node.ts"
 import { folderLabels,projectChoices } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
+import type { PendingBot } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Bot,FolderOpen,MessageSquarePlus } from "lucide-react"
-import { useEffect,useState } from "react"
-import { finishOnboarding,setOnboardingStep,useOnboarding } from "./onboarding-flag"
+import { useEffect,useRef,useState } from "react"
+import { finishOnboarding,setOnboardingStep } from "./onboarding-flag"
 
-/** Steps 4 and 5 after creating a network here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
-export function Onboarding() {
+/** Steps 4 and 5 after creating `networkId` here. Skipping step 4 still offers step 5; 待处理 and the composer point back to the device page. */
+export function Onboarding({ networkId, step }: { networkId: string; step: 4 | 5 }) {
   const workspace = useWorkspace()
   const navigate = useNavigate()
-  const step = useOnboarding() ?? 4
-  const [name, setName] = useState("我的 Bot")
   const [busy, setBusy] = useState(false)
-  const [botOn, setBotOn] = useState(false)
+  // Its own request records the creation as pending until answered, so the form keeps what it showed when it was sent.
+  const [sent, setSent] = useState<PendingBot | null>()
+  const pending = sent === undefined ? workspace.pendingBot : sent
+  const [name, setName] = useState(pending?.name ?? "我的 Bot")
+  const [nameError, setNameError] = useState("")
+  const nameInput = useRef<HTMLInputElement>(null)
   const [error, setError] = useState<unknown>(null)
+  // A creation whose answer was lost is retried as it was sent, under its ids; the workspace refuses any other content.
+  useEffect(() => { if (pending) { setName(pending.name); setNameError("") } }, [pending?.bot_id])
   const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "unverified" || botReadiness(node) === "starting")
+  // Also why the create button is disabled; the workspace names only some of the reasons it cannot write.
+  const readOnly = workspace.writable ? "" : workspace.readOnlyNotice || workspace.writeNotice || "正在读取这个节点，稍后就能创建"
   // The first bot works in this computer's first folder; its panel changes it later.
-  const project = projectChoices(workspace.nodes.filter((node) => node.local), () => "")[0]?.project
+  const project = pending ? pending.project : projectChoices(workspace.nodes.filter((node) => node.local), () => "")[0]?.project
   // The folder reads as Settings shows it, `~/…`; the device only says that form in its settings.
   const { ready } = useDevice()
   const [shown, setShown] = useState<Record<string, string> | null>(null)
@@ -35,34 +44,40 @@ export function Onboarding() {
   }, [step, ready])
   const done = () => { finishOnboarding(); void navigate({ to: "/" }) }
   async function create() {
-    setBusy(true); setError(null)
+    setBusy(true); setSent(pending); setError(null)
     try {
-      const bot = await workspace.createBot({ name: name.trim(), instructions: "", project })
+      const bot = await workspace.createBot(pending ? { name: pending.name, instructions: pending.instructions, project: pending.project } : { name: name.trim(), instructions: "", project })
       if (!workspace.isCurrent()) return
       finishOnboarding()
       if (bot) void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } })
     } catch (cause) { if (workspace.isCurrent()) setError(cause) }
-    finally { if (workspace.isCurrent()) setBusy(false) }
+    finally { if (workspace.isCurrent()) { setBusy(false); setSent(undefined) } }
   }
   return <AuthPage header={<Steps step={step} />}>
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-      <p className="text-sm text-secondary">选一项 AI 服务，让 Bot 在这台电脑上回复消息。也可以先跳过，稍后在「设备」中设置。</p>
-      <AiSettings onboarding onBot={setBotOn} />
-      <div className="flex justify-between gap-2 border-t pt-4">
-        <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
-        <Button type="button" className="ms-auto" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
-      </div>
+      <AiSettings onboarding onNext={() => setOnboardingStep(networkId, 5)} />
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-      <p className="text-sm text-secondary">先给它起个名字，再告诉它你想完成的第一件事。{canReply ? null : " 暂时没有设备能回复，也可以先创建，稍后在「设备」中连接或设置。"}</p>
-      <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
-        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></div>
-        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-sm text-secondary"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
+      {pending ? <p id="bot-create-pending" role="status" className="text-sm text-secondary">{pending.submission?.state === "rejected" ? pendingBotCopy.rejected : pendingBotCopy.unconfirmed}</p>
+        : <p className="text-sm text-secondary">{canReply ? "给它起个名字，创建后会打开和它的对话，在那里交代第一件事。" : "给它起个名字，创建后会打开和它的对话。暂时没有设备能回复，也可以先创建，之后在「设置 → 我的设备」中连接或设置。"}</p>}
+      <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (busy) return; if (pending || name.trim()) void create(); else { setNameError("还没填名称"); nameInput.current?.focus() } }}>
+        {/* Held read-only, not disabled, while sending: a field or button that disables under focus drops it to the page. */}
+        <div className="grid gap-1.5 text-sm font-medium"><Input label="名称" ref={nameInput} error={nameError} required maxLength={512} value={name} readOnly={Boolean(pending) || busy} aria-describedby={pending ? "bot-create-pending" : undefined} onChange={(event) => { setName(event.target.value); setNameError("") }} /></div>
+        {project && shown ? <p className="grid gap-1 text-sm">
+          <span className="font-medium">{folderLabels.project}</span>
+          <span className="flex min-w-0 items-center gap-1.5"><FolderOpen aria-hidden="true" className="size-4 shrink-0 text-secondary" /><FolderPath path={project.cwd} shown={shown[project.cwd]} /></span>
+          <span className="text-secondary">之后可在 Bot 的设置里改</span>
+        </p> : null}
         <InlineError error={error} />
-        <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>
-          <div className="flex gap-2">
-            <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
-            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "完成"}</Button>
+        {/* Always mounted so a reason that appears is read out; empty, it takes no room above the footer. */}
+        <div>
+          <p id="bot-create-status" role="status" className="pb-4 text-sm text-secondary empty:pb-0">{readOnly}</p>
+          {/* Wraps on narrow screens, the primary action staying at the end of the last line. */}
+          <div className="flex flex-wrap justify-between gap-2 border-t pt-4">
+            <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(networkId, 4)}>上一步</Button>
+            <div className="ms-auto flex flex-wrap justify-end gap-2">
+              <Button type="button" variant="ghost" disabled={busy} onClick={done}>{pending ? "稍后再试" : "稍后创建"}</Button>
+              <Button type="submit" loading={busy} disabled={!workspace.writable && !busy} aria-describedby={readOnly ? "bot-create-status" : undefined}>{pending ? pendingBotCopy.retry : canReply ? "开始对话" : "完成"}</Button>
+            </div>
           </div>
         </div>
       </form>

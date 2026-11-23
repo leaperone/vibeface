@@ -18,6 +18,7 @@ import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import { deviceIcon } from '@/features/devices/device-icon'
 import type { Question } from '@/data/types'
+import { touchRow } from '@/lib/layout'
 import { cn } from '@/lib/utils'
 
 const looks: Record<Question['severity'], { icon: LucideIcon; tone: Tone }> = {
@@ -87,9 +88,9 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     {question.attention?.kind === 'browser_takeover' ? <Text className="text-sm text-muted">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-base">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
-      {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1"><Icon as={ListChecks} className="size-4 text-muted" /><Text className="text-sm underline">打开所属任务</Text></Pressable></Link> : null}
+      {taskScope ? <Link href={`/task/${taskScope}`} asChild><Pressable accessibilityRole="link" className={cn(touchRow, 'flex-row items-center gap-1 active:opacity-60')}><Icon as={ListChecks} className="size-4 text-muted" /><Text className="text-sm underline">打开所属任务</Text></Pressable></Link> : null}
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
-        <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} className="min-h-11 min-w-0 flex-row items-center gap-1 active:opacity-60">
+        <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} className={cn(touchRow, 'min-w-0 flex-row items-center gap-1 active:opacity-60')}>
           <Icon as={ListChecks} className="size-4 text-muted" />
           <Text numberOfLines={1} className="text-sm text-muted underline">{task.title}</Text>
         </Pressable>
@@ -101,11 +102,11 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     {pending ? <View role="status" className="gap-2">
       <Text className="text-base">{displayAnswer(pending.text)}</Text>
       <Text className="text-sm text-muted">{busy !== null ? '正在发送' : '没确认送达'}</Text>
-      <Button variant="secondary" className="min-h-11 self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
+      <Button variant="secondary" className="self-start" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'retry' }} onPress={() => void send('retry', pending.text)}>
         <Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text>
       </Button>
     </View> : <View className="gap-2">
-      {approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'primary' : 'secondary'} className="min-h-11" accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <>
+      {approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'primary' : 'secondary'} accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <>
         {question.choices.map((choice, index) => <Button variant="ghost" key={index} accessibilityRole="button" accessibilityLabel={choice.label} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
           className={cn(row, 'active:bg-surface-muted', disabled && 'opacity-50')}>
           {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className="w-4 text-center text-muted">{index + 1}</Text>}
@@ -115,12 +116,12 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
           <Textarea maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'}
             className="max-h-40 min-h-11 flex-1 text-base" value={text} maxLength={4000} editable={!disabled}
             multiline textAlignVertical="top" submitBehavior="newline" onChangeText={(value) => { setText(value); setError('') }} />
-          <Button iconOnly className="size-11" accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
+          <Button iconOnly accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
             <Icon as={busy === 'answer' ? LoaderCircle : ArrowUp} />
           </Button>
         </View>
       </>}
-      {ignorable ? <Button variant="ghost" className="min-h-11 self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
+      {ignorable ? <Button variant="ghost" className="self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
         <Icon as={busy === 'ignore' ? LoaderCircle : X} className="text-muted" /><Text className="text-muted">忽略</Text>
       </Button> : null}
     </View>}

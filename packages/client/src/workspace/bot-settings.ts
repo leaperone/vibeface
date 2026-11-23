@@ -83,7 +83,7 @@ export function projectPlace(project: BotProject, owner: string | null | undefin
   return project.target_node === owner ? folder : `${deviceName(project.target_node)} · ${folder}`
 }
 
-export type ProjectChoice = { key: string; project: BotProject; label: string }
+type ProjectChoice = { key: string; project: BotProject; label: string }
 export const projectKey = (project: BotProject) => JSON.stringify([project.target_node, project.cwd])
 
 /** The folders a bot can work in: each folder of an online device that runs bots, named with its device. */

@@ -10,7 +10,7 @@ type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 export type PendingJoin = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; pinned?: JoinPin }
 /** A saved intent is checking until the first matching status arrives from the Node. */
 export type Joining = PendingJoin & { status: 'checking' | JoinRequest['status']; code?: string; admin?: string }
-export type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
+type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 type ApprovalPins = { pins: Map<string, ApprovalPin>; damaged: boolean }
 
 type Genesis = { version: 1; network_id: string; first_client: Member; first_node: Member; signature: string }
@@ -28,7 +28,7 @@ type RecoveryCheckpoint = {
 /** A recovery submitted from here. A wait picked up from the Node may have no local copy of its checkpoint. */
 export type WaitRecord = { entry: ConnectionEntry; networkId: string; genesis: Genesis; rootKey: string; checkpoint?: RecoveryCheckpoint }
 
-export type IdentityRecord<T> = { kind: 'empty' } | { kind: 'unreadable' } | { kind: 'invalid' } | { kind: 'valid'; value: T }
+type IdentityRecord<T> = { kind: 'empty' } | { kind: 'unreadable' } | { kind: 'invalid' } | { kind: 'valid'; value: T }
 
 export function readIdentityRecord<T>(storage: Pick<KeyValue, 'getItem'>, key: string, parse: (value: unknown) => T): IdentityRecord<T> {
   let raw: string | null

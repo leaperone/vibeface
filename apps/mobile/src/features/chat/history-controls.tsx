@@ -24,7 +24,6 @@ export function HistoryControls({ workspace, sections = historySections }: { wor
   const missing = sections.filter((section) => workspace.data && !workspace.data.history[section].complete)
   if (!missing.length) return null
   return <View className="gap-2" accessibilityLabel="尚未读取的记录">
-    <Text className="text-sm text-muted">部分记录尚未读取，可以按需继续加载。</Text>
     {missing.map((section) => workspace.historyLoading.has(section)
       ? <Button key={section} variant="secondary" onPress={() => workspace.cancelHistory(section)}><Text>取消读取{historyLabels[section]}</Text></Button>
       : <Button key={section} variant="secondary" disabled={!workspace.connectionOnline} onPress={() => { setError(''); void workspace.loadHistory(section).catch((caught) => setError(messageOf(caught))) }}><Text>读取更多{historyLabels[section]}</Text></Button>)}

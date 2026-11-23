@@ -106,7 +106,8 @@ export type NodeInfo = {
   observation?: NodeObservation
 }
 export type SelectedNodePath = { kind: "direct" } | { kind: "relay"; url: string }
-export type NodeObservation = { checkedAt: number | null; lastSyncedAt: number | null; path: SelectedNodePath | null }
+/** `rttMs`, `pathChanges`, `disconnects`: the transport to that node as the reporting Node measures it. */
+export type NodeObservation = { checkedAt: number | null; lastSyncedAt: number | null; path: SelectedNodePath | null; rttMs: number | null; pathChanges: number; disconnects: number }
 export type NodeSessionPath = { checkedAt: number } & (
   { kind: "local" } | { kind: "websocket" } | { kind: "quic"; upstreamDeviceId: string; returnPath: SelectedNodePath | null }
 )

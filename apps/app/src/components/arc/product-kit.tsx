@@ -1,7 +1,9 @@
 "use client"
 
 import { terms } from "@/lib/glossary"
+import { useClipboard } from "@/lib/use-clipboard"
 import { cn } from "@/lib/utils"
+import { failureCopyText,failureRef,type FailureRef } from "@vibeface/client/lib/error-ref.ts"
 import { rawError } from "@vibeface/client/lib/errors.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { Alert } from "@vibeface/uiarc/alert/alert.tsx"
@@ -12,7 +14,7 @@ import { Input } from "@vibeface/uiarc/input/input.tsx"
 import SegmentedControl from "@vibeface/uiarc/segmented-control/segmented-control.tsx"
 import { Skeleton as ArcSkeleton } from "@vibeface/uiarc/skeleton/skeleton.tsx"
 import Stepper from "@vibeface/uiarc/stepper/stepper.tsx"
-import { ChevronDown,ChevronRight,CircleAlert,CircleCheck,Eye,EyeOff,Info,LoaderCircle,TriangleAlert,X,type LucideIcon } from "lucide-react"
+import { Check,ChevronDown,ChevronRight,CircleAlert,CircleCheck,Copy,Eye,EyeOff,Info,LoaderCircle,TriangleAlert,X,type LucideIcon } from "lucide-react"
 import { createContext,useCallback,useContext,useEffect,useRef,useState,useSyncExternalStore,type ComponentProps,type CSSProperties,type ReactNode,type Ref } from "react"
 import { createPortal } from "react-dom"
 import styles from "./product-kit.module.css"
@@ -39,7 +41,7 @@ export function EmptyState({ icon: Icon, title, description = "", action, classN
   return <ArcEmptyState icon={<Icon aria-hidden="true" />} title={title} description={description} action={action} className={className} />
 }
 export function Steps({ step }: { step: number }) {
-  return <Stepper current={step - 1} compact label={`第 ${step} 步，共 5 步`} steps={[1,2,3,4,5].map(value => ({ id: String(value), label: `第 ${value} 步` }))} />
+  return <Stepper current={step - 1} compact label={`第 ${step} 步，共 5 步`} steps={["节点名称","恢复密码","恢复文件","运行 Bot","第一个 Bot"].map((label,index) => ({ id: String(index + 1), label }))} />
 }
 export function AuthPage({ header, children }: { header?: ReactNode; children: ReactNode }) {
   return <main className={styles.auth}><div className={styles.authBody}><header><Wordmark large />{header}</header>{children}</div></main>
@@ -76,7 +78,13 @@ export function Skeleton({ className }: { className?: string }) { return <ArcSke
 export function InlineError({ error, action, className }: { error: unknown; action?: { label: string; onClick: () => void }; className?: string }) {
   if (!error) return null
   const raw = rawError(error)
-  return <div className={cn("grid min-w-0 gap-2", className)}><Alert tone="danger" title={messageOf(error)} />{action ? <Button type="button" variant="secondary" className="justify-self-start" onClick={action.onClick}>{action.label}</Button> : null}{raw ? <Details><code>{raw}</code></Details> : null}</div>
+  const failure = failureRef(error)
+  return <div className={cn("grid min-w-0 gap-2", className)}><Alert tone="danger" title={messageOf(error)} />{action || failure ? <div className="flex flex-wrap items-center gap-2">{action ? <Button type="button" variant="secondary" onClick={action.onClick}>{action.label}</Button> : null}{failure ? <FailureRefButton failure={failure} /> : null}</div> : null}{raw ? <Details><code>{raw}</code></Details> : null}</div>
+}
+/** The failed request's number as `#` and eight characters; a press copies it with its time and conversation. */
+function FailureRefButton({ failure }: { failure: FailureRef }) {
+  const clipboard = useClipboard(failure, { onCopied: () => toast("已复制错误编号", { tone: "success" }), onFailed: () => toast("复制失败，请重试。", { tone: "warning" }) })
+  return <Button type="button" variant="ghost" size="sm" className="font-mono tabular-nums" title="复制错误编号" aria-label={`复制错误编号 ${failure.ref}`} onClick={() => void clipboard.copy(failureCopyText(failure))}>{clipboard.copied ? <Check aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}#{failure.ref}</Button>
 }
 export function StatusPill({ tone = "neutral", icon: Icon, children, className }: { tone?: Tone; icon?: LucideIcon; children: ReactNode; className?: string }) {
   return <Badge tone={tone} icon={Icon ? <Icon aria-hidden="true" /> : undefined} className={className}>{children}</Badge>
@@ -127,8 +135,11 @@ let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
 function dismissToast(id: number) { toasts = toasts.filter(item => item.id !== id); emitToasts() }
-export function toast(text: string, options: { tone?: Tone; icon?: LucideIcon; action?: ToastItem["action"]; persist?: boolean } = {}) {
-  const item = { id: ++toastId, text, tone: options.tone ?? "neutral", icon: options.icon, action: options.action }
+/** `cause`: the failure a toast reports; without another action, its error number becomes the copy action. */
+export function toast(text: string, options: { tone?: Tone; icon?: LucideIcon; action?: ToastItem["action"]; persist?: boolean; cause?: unknown } = {}) {
+  const failure = options.action || options.tone !== "danger" ? undefined : failureRef(options.cause ?? text)
+  const action = options.action ?? (failure ? { label: `复制错误编号 #${failure.ref}`, onClick: () => { void navigator.clipboard.writeText(failureCopyText(failure)).then(() => toast("已复制错误编号", { tone: "success" }), () => toast("复制失败，请重试。", { tone: "warning" })) } } : undefined)
+  const item = { id: ++toastId, text, tone: options.tone ?? "neutral", icon: options.icon, action }
   toasts = [...toasts,item].slice(-2); emitToasts()
   if (!options.persist) setTimeout(() => dismissToast(item.id),item.action ? 8000 : 3000)
 }

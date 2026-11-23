@@ -115,6 +115,8 @@ pub enum MaintenanceCommand {
         method: String,
         params: Value,
     },
+    /// Read the Node's health checks: open problems and the last hour's warnings and errors.
+    Health,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -479,7 +481,7 @@ impl MaintenanceResponse {
                         .context("maintenance response has malformed join")?,
                 })
             }
-            MaintenanceCommand::Client { .. } => {
+            MaintenanceCommand::Client { .. } | MaintenanceCommand::Health => {
                 ensure!(
                     raw.status == MaintenanceStatus::Healthy
                         && raw.result.is_some()

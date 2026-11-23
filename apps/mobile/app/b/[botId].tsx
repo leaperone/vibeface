@@ -2,22 +2,22 @@ import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ArrowDown, Bot, Crown, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, ChevronRight, Crown, ListChecks, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, replyUnsettled, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
-import { outcomeUnknown } from '@vibeface/client/lib/errors.ts'
 import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
+import { chatStatusLine } from '@vibeface/client/workspace/labels.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
 import { EmptyState } from '@/components/kit'
@@ -30,7 +30,6 @@ import type { ChatMessage, Conversation } from '@/data/types'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
-import { SendPreparation } from '@/features/chat/send-preparation'
 import { useChatDraft } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
 import { readingPositions } from '@/platform/reading-position'
@@ -38,7 +37,7 @@ import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } f
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
-import { useWide } from '@/lib/layout'
+import { touchRow, useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
 import { mobilePlatform } from '@/platform'
 
@@ -56,11 +55,11 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
 }
 
 /**
- * Questions sit right before the first message written after them, 新消息 above what the badge counted, tasks and changes right after the message that caused
- * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
+ * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
+ * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
  */
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, bot: FaceBot, offline: boolean): Entry[] {
-  const rows: Entry[] = [...extras.first]
+  const rows: Entry[] = []
   const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
@@ -79,17 +78,15 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.time && previous.message.role === message.role
     if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message, time: times.get(message.message_id), grouped })
-    rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
+    rows.push(...(extras.failures.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   }
   rows.push(...chat.rest.map(question))
   const unreadAt = rows.findIndex((row) => ('message' in row ? row.message.message_id : row.key) === chat.unread)
   if (unreadAt >= 0) rows.splice(unreadAt, 0, { key: 'unread', node: <View className="flex-row items-center gap-3"><View className="h-px flex-1 bg-foreground/40" /><Text className="text-sm text-foreground">新消息</Text><View className="h-px flex-1 bg-foreground/40" /></View> })
-  rows.push(...extras.rest)
   if (chat.replying && !chat.messages.some((message) => message.state === 'streaming')) rows.push({
     key: 'activity',
     node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace bot={bot} mood={offline ? 'asleep' : 'thinking'} size={24} /><Text className="text-sm text-muted">{chat.status ?? '思考中'}</Text></Fade>,
   })
-  if (extras.cards.length) rows.push({ key: 'waiting-on-you', node: <View className="gap-3">{extras.cards}</View> })
   return rows.reverse()
 }
 
@@ -103,13 +100,13 @@ export default function ChatScreen() {
   const ios = Platform.OS === 'ios'
   const barHeight = useHeaderHeight()
   const header = ios ? barHeight : 0
-  // iOS sizes a custom title against the whole bar, back button included, so a long name would run under it; the screen's
-  // width less the sidebar and a back button's room on each side keeps it centred and truncated. Android's title slot
-  // already ends where the bar's buttons begin.
+  // iOS sizes a custom title against the whole bar, so a long name or large text ran under the three header buttons; the
+  // screen's width less the sidebar, the back button and that button group keeps it truncated before them. Android's
+  // title slot already ends where the bar's buttons begin.
   const frame = useSafeAreaFrame().width
   const wide = useWide()
   // Compact iPad windows also need leading room for the system window controls.
-  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 200 : 120) : undefined
+  const titleWidth = Platform.OS === 'ios' ? (wide ? frame - 320 : frame) - (Platform.isPad && !wide ? 328 : 248) : undefined
   const background = useCSSVariable('--background')
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
@@ -256,14 +253,15 @@ export default function ChatScreen() {
   // 重试 on the newest reply once it failed or was stopped, as on the web.
   const newest = chat?.messages.at(-1)
   const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
-  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && replyUnsettled(job))
   const retry = asked && live && !blocked && !unknown ? () => live.retryReply(asked) : undefined
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
+  const statusLine = chatStatusLine(extras)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
-      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-pill px-2.5 active:bg-surface-muted/50' : '-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-control px-2 active:bg-surface-muted'} style={{ maxWidth: titleWidth }}>
+      className={ios ? 'min-h-11 shrink flex-row items-center gap-1.5 rounded-pill px-2.5 active:bg-surface-muted/50' : '-mx-2 min-h-12 shrink flex-row items-center gap-2 self-start rounded-control px-2 active:bg-surface-muted'} style={{ maxWidth: titleWidth }}>
       <BotFace bot={bot} mood={mood} size={ios ? 24 : 28} />
       <Text numberOfLines={1} className="shrink font-medium">{bot.name}</Text>
       {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
@@ -273,7 +271,7 @@ export default function ChatScreen() {
   return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
-      headerRight: () => <View className="flex-row"><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
+      headerRight: () => <View className="flex-row"><Link href={`/b/${bot.bot_id}/activity`} asChild><Button variant="ghost" iconOnly accessibilityLabel={extras.attention ? `动态，${extras.attention} 项要处理` : '动态'}><Icon as={ListChecks} className="size-5" />{extras.attention ? <View pointerEvents="none" className="absolute right-2 top-2 size-2 rounded-pill bg-warning" /> : null}</Button></Link><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} className="size-5" /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       headerTransparent: ios,
@@ -332,7 +330,7 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
-        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '聊天记录暂时没读到，可以重试。' : offline ? '这段聊天还没有本地副本，连上后即可读取。' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
         </View> : null) : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
@@ -345,17 +343,22 @@ export default function ChatScreen() {
     <RecoveryAlert top={header} />
     </View></ScreenFaces>
     <KeyboardStickyView pointerEvents={ios ? 'box-none' : undefined} style={ios ? { position: 'absolute', bottom: 0, left: 0, right: 0 } : undefined} offset={{ closed: 0, opened: insets.bottom }}>
-      <View pointerEvents={ios ? 'box-none' : undefined} style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
+      <View pointerEvents={ios ? 'box-none' : undefined} className="bg-background" style={{ paddingBottom: insets.bottom }} onLayout={ios ? (event) => { dockHeight.value = event.nativeEvent.layout.height } : undefined}>
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
-          <Button variant="secondary" iconOnly className="rounded-pill bg-surface " accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
+          <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
+        {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
+          <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
+            <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{statusLine}</Text>
+            <Icon as={ChevronRight} className="size-4 text-muted" />
+          </Pressable>
+        </Link></View> : null}
         <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
         >
-        <SendPreparation state={sendingScope === draftScopeKey ? { kind: draft.files.length ? 'preparing' : 'saving' } : null} />
         {draft.error || draft.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{draft.error || `附件 ${draft.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
-        {chat?.origin.kind === 'cache' ? <Text className="text-sm text-muted">本地副本 · {new Date(chat.origin.savedAt).toLocaleString()} · {live?.conversationLoading ? '正在同步' : offline ? '离线可读' : '等待同步'}</Text> : null}
         {live?.conversationError ? <View className="gap-1"><ErrorText error={live.conversationError} /><Button variant="ghost" size="sm" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取聊天</Text></Button></View> : null}
         {offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">

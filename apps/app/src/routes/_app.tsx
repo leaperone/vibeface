@@ -16,9 +16,11 @@ export const Route = createFileRoute('/_app')({ component: AppLayout })
 function AppLayout() {
   const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect, retryNow, queued } = useDevice()
   const navigate = useNavigate()
-  const onboarding = useOnboarding()
+  const onboarding = useOnboarding(ready?.principal.network_id)
   // Onboarding ends on a pressed button that leaves with it; the workspace that follows takes the focus on its title.
-  const [onboarded] = useState(onboarding !== null)
+  // Its step only counts once connected to the network it was started for, so this is remembered once seen rather than read at mount.
+  const [onboarded, setOnboarded] = useState(false)
+  if (onboarding !== null && !onboarded) setOnboarded(true)
   const returnTo = useRouterState({ select: (state) => state.location.pathname === '/connect' ? null : state.location.href })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
   const routeBot = useRouterState({ select: (state) => /^\/b\/([^/]+)/.exec(state.location.pathname)?.[1] ?? null })
@@ -35,6 +37,6 @@ function AppLayout() {
     else if (target?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id } })
     else void navigate({ to: '/', search: { conversation: id, ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
   }}>
-    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
+    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding networkId={ready.principal.network_id} step={onboarding} /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

@@ -1,4 +1,6 @@
 import '@/platform/polyfills'
+import '@/lib/log-buffer'
+import '@/lib/error-reporting'
 import '../global.css'
 
 import { useLinkingURL } from 'expo-linking'
@@ -99,6 +101,7 @@ function Screens() {
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/context" options={{ title: '上下文和协作' }} />
+            <Stack.Screen name="b/[botId]/activity" options={{ title: '动态' }} />
             <Stack.Screen name="search" options={{ title: '搜索消息' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
             <Stack.Screen name="tasks" options={(props) => ({ title: '任务', ...root, ...viaTab(props) })} />
@@ -115,6 +118,7 @@ function Screens() {
             <Stack.Screen name="settings" options={(props) => ({ title: '设置', ...root, ...viaTab(props) })} />
             <Stack.Screen name="lab" options={{ title: '实验室' }} />
             <Stack.Screen name="logs" options={{ title: '日志' }} />
+            <Stack.Screen name="report" options={{ title: '报告问题', presentation: 'modal', headerLeft: () => <Close /> }} />
             <Stack.Screen name="external-chat" options={{ title: '外部聊天' }} />
             <Stack.Screen name="transfers" options={{ title: '文件传输' }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />

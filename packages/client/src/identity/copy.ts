@@ -225,8 +225,8 @@ export const deviceCopy = {
   waitForCode: '请在新设备上保持加入页面打开，等安全码出现。',
   rejected: (name: string) => `已拒绝「${name}」`,
   addedManager: (name: string) => `已添加「${name}」为管理设备`,
-  /** 可用文件夹: what it is, and during setup that it can wait. */
-  folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
+  /** 可用文件夹: what it is. */
+  folders: 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
   botStatus: { ready: '能运行 Bot', unverified: 'Bot 未验证，可尝试', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot', unknown: '离线，状态未知' },
   /** An offline computer reports nothing, so no bot there is unknown rather than none. */
@@ -279,10 +279,13 @@ export const securityCopy = {
   changedOn: (at: number) => `${new Date(at).toLocaleDateString('zh-CN')} 设置`,
 }
 
-/** The strength line under a new recovery password; `weak` ones are refused. */
+/** The strength line under a new recovery password; `weak` ones are refused. `again`/`mismatch`: its retyping, shared by creating and changing it;
+ *  `mismatch` stays short because an Arc field error does not wrap, and must fit beside the reveal button on a 320px screen. */
 export const passwordCopy = {
   label: { weak: '太弱', fair: '可用', strong: '较强' },
   short: '至少 8 个字符',
   common: '太常见了，换一个',
   simple: '少于 12 个字符时，要混用字母、数字或符号',
+  again: '再输入一遍恢复密码',
+  mismatch: '两遍不一致，再输入一遍',
 }

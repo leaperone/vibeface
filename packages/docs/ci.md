@@ -142,6 +142,8 @@ python3 scripts/check-delivery.py --sandbox
 
 `hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在洛杉矶时间每日 18:00 定时启动客户端批次。批次固定通过 main push CI 的源码和 UTC 小时版本后缀，继续使用 Hourly 渠道。
 
+协调器用 `vibeface-release` GitHub App 的短期 token（仓库变量 `VIBEFACE_RELEASE_APP_ID`、secret `VIBEFACE_RELEASE_APP_PRIVATE_KEY`，仅 contents/workflows 写权限）推送生成的 tag，其余 API 与派发仍用 `GITHUB_TOKEN`；tag 推送触发的发布运行会被复用，不重复派发。
+
 客户端协调器按构建输入和依赖 pin 决定是否创建新 Tag，并跟踪各个组件的发布运行。已有同批次 Tag 时沿用其中记录的 main parent。官网只通过精确 Tag 和 `publish=true` 手动发布。[构建与发布](releasing.md)
 
 手动 `CI / Core` 执行完整扩展检查，不受路径影响，只验证和生成制品。merge queue 执行整个工作区核心检查，不启用慢测试、MSRV 或四平台打包。开发分支 PR 不触发 Core。六条应用发布流程只等待本应用的生产者。本应用的平台失败会阻止完整发布，其他应用失败不会阻塞本应用。
@@ -230,7 +232,7 @@ python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface
 python3 scripts/ci.py check --packages vibeface-core vibeface-control vibeface --msrv 1.91
 ```
 
-MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 Python 3、Node.js、当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
+MSRV 参数应使用当前 `Cargo.toml` 的 `rust-version`。进程专项需要 [源码构建工具](releasing.md#源码构建工具) 中的 Python 和 Node.js 版本（Python 至少 3.11，构建和 CI 脚本用到 `tomllib`），以及当前提交构建的 CLI/Core 程序和真实 JS/WASM 密码学资源。先按 [源码构建步骤](releasing.md#源码构建) 生成资源和制品，然后设置以下路径：
 
 ```sh
 binary=/absolute/path/to/package/vibeface

@@ -98,6 +98,7 @@ fn default_profile() -> Result<PathBuf> {
     Ok(base.join("Vibeface/native-desktop"))
 }
 pub fn run() -> Result<()> {
+    crate::node_log::record_panics();
     let update_cache = default_profile()
         .ok()
         .map(|profile| profile.join("app-updates"));

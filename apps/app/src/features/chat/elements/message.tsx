@@ -1,22 +1,28 @@
 import { BotFace } from '@/components/app/bot-face'
 import { Markdown,PlainText } from '@/components/app/markdown'
 import styles from "@/components/arc/conversation.module.css"
-import { Details } from '@/components/arc/product-kit'
-import { RoutedAction } from "@/components/arc/routed-action"
 import { ActionButton } from '@/features/workspace/present'
 import { messageKey,replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
-import { botModel,failureText,rawError,replyFailure } from '@vibeface/client/lib/errors.ts'
+import { failureText,replyFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { SteerOutcome } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
-import { Bot,CalendarClock,ChevronDown,ChevronUp,CirclePause,CircleQuestionMark,CircleX,Clock,LoaderCircle,Merge,MonitorSmartphone,RotateCcw } from 'lucide-react'
+import { Bot,CalendarClock,ChevronDown,ChevronUp,CirclePause,CircleQuestionMark,CircleX,Clock,LoaderCircle,Merge,RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { Artifact } from './artifact'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
 const mergedLabels: Record<SteerOutcome, string> = { answered: '关联回合已完成', unfinished: '关联回合未完成', unknown: '补充结果未知' }
+
+function deliveryMark(message: ChatMessage) {
+  const label = message.state === 'sending' ? '正在确认送达' : message.state === 'queued' ? '已排队' : message.state === 'merging' ? '已登记为回合补充' : message.state === 'merged' ? mergedLabels[message.merged ?? 'unknown'] : null
+  if (!label) return null
+  const Icon = message.state === 'merged' && (message.merged ?? 'unknown') === 'unknown' ? CircleQuestionMark : message.state === 'merging' || message.state === 'merged' ? Merge : Clock
+  const unknown = Icon === CircleQuestionMark
+  return <span className={`flex items-center gap-1 text-sm ${unknown ? 'text-warning' : 'text-secondary'}`}><span role="img" aria-label={label} title={label}><Icon aria-hidden="true" className="size-3.5" /></span>{unknown ? <span aria-hidden="true">未确认</span> : null}</span>
+}
 
 /** A long message shows its first lines until expanded. */
 function isLong(text: string) {
@@ -43,31 +49,23 @@ export function FoldedText({ text }: { text: string }) {
  * card under its name. `time` shows under the last message of each minute. `schedule` names
  * the schedule whose run produced this reply. `retry` is 重试 after this reply failed or was stopped.
  */
-/** `detail`: the device's own words for a failed reply, folded under its cause. */
+/** `detail`: the device's own words for a failed reply, read for its cause. */
 export function Message({ message, conversationId, schedule, time: shown, retry, detail }: { message: ChatMessage; conversationId?: string; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
-  const { connectionOnline, data, selectedBot, refresh } = useWorkspace()
-  const owner = data?.conversation?.owner
+  const { connectionOnline, selectedBot } = useWorkspace()
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
   const full = when?.toLocaleString('zh-CN')
   const ended = message.state === 'interrupted' ? '已中断' : replyStatusLabel(message.status)
-  // Why it failed, in the reader's words; the original text folds under it on the device that ran it.
   const failed = ended === '失败'
   const cause = failed ? replyFailure(message.failure, detail) : failureText(message.failure)
-  const raw = failed && detail ? rawError(detail) : ''
   const again = retry ? <ActionButton variant="ghost" className="-ms-1" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : null
-  const time = when ? <time dateTime={when.toISOString()} className={shown ? `${user ? 'px-1 ' : ''}text-sm text-secondary` : 'sr-only'}>{shown ?? full}</time> : null
+  const time = when ? <time dateTime={when.toISOString()} className={shown ? 'text-sm text-secondary' : 'sr-only'}>{shown ?? full}</time> : null
+  const mark = user ? deliveryMark(message) : null
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     {message.text ? <div title={full} className={styles.user} data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div> : null}
     {message.attachments?.map((file) => <div key={`${conversationId ?? ''}:${file.hash}`} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} conversationId={conversationId} /></div>)}
-    {message.state === 'sending' ? <span role="status" className="px-1 text-sm text-secondary">正在确认送达</span>
-      : message.state === 'queued' ? <span role="status" className="flex items-center gap-1 px-1 text-sm text-secondary"><Clock aria-hidden="true" className="size-3.5" />已排队</span>
-      : message.state === 'merging' ? <span role="status" className="flex items-center gap-1 px-1 text-sm text-secondary"><Merge aria-hidden="true" className="size-3.5" />已登记为回合补充</span>
-      : message.state === 'merged' && (!message.merged || message.merged === 'unknown') ? <div className="flex max-w-[85%] flex-wrap items-center justify-end gap-x-2 gap-y-1 text-sm sm:max-w-[75%]">
-        <span role="status" className="flex items-center gap-1 text-warning"><CircleQuestionMark aria-hidden="true" className="size-3.5 shrink-0" />{mergedLabels.unknown}</span>
-        <ActionButton variant="ghost" disabled={!connectionOnline} action={refresh}>再查一次</ActionButton>
-      </div>
-      : message.state === 'merged' ? <span role="status" className="flex items-center gap-1 px-1 text-sm text-secondary"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'unknown']}</span> : time}
+    {/* Always mounted so a delivery state that appears later is announced. */}
+    <span aria-live="polite" className="flex items-center gap-1 px-1">{mark}{time}</span>
   </div>
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-sm text-secondary">
@@ -96,11 +94,8 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
       <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
       {cause ? <span className="text-secondary">{cause}</span> : null}
       {again}
-      {/* The failure text points at the device's AI settings, which the device running this chat holds, unless the bot's own model caused it. */}
-      {owner && !botModel(detail) ? <RoutedAction variant="ghost" className="-ms-1" to="/devices/$deviceId" params={{ deviceId: owner }} search={{ bot: selectedBot?.bot_id }}><MonitorSmartphone aria-hidden="true" />检查设备</RoutedAction> : null}
     </span>
       : ended ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-secondary"><span className="flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />{ended}</span>{cause ? <span>{cause}</span> : null}{again}</span> : null}
-    {raw ? <Details className="-mt-1">{raw}</Details> : null}
     {time}
   </div>
 }

@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Worker } from 'node:worker_threads'
-import { MAX_BATCH, MAX_RECORD_BYTES, createReporter, failureFields, fit, pageIds, type WebRecord } from './web-log.ts'
+import { MAX_BATCH, MAX_RECORD_BYTES, createBufferedReporter, createReporter, failureFields, fit, pageIds, wellFormed, type WebRecord } from './web-log.ts'
 
 const size = (record: WebRecord) => new TextEncoder().encode(JSON.stringify(record)).length
 
 test('records shrink to what the device accepts', () => {
   const huge = fit({ level: 'error', event: 'web.uncaught', message: '错'.repeat(5000), fields: { stack: 'x'.repeat(9000) } })
   assert.ok(size(huge) <= MAX_RECORD_BYTES)
-  assert.equal(size(huge), 6228, 'UTF-8 bytes retain the existing message reduction')
-  assert.deepEqual(huge.fields, { truncated: true })
+  assert.ok(size(huge) > MAX_RECORD_BYTES * 0.8, 'UTF-8 bytes shrink only as far as needed')
+  assert.deepEqual(Object.keys(huge.fields ?? {}), ['truncated', 'stack'], 'the start of the stack stays')
+  assert.match(String(huge.fields?.stack), /^x+…$/)
+  assert.ok(huge.message.endsWith('…'))
   const small = { level: 'info', event: 'web.action', message: 'ok', fields: { label: '导出' } } as const
   assert.deepEqual(fit(small), small)
 })
@@ -135,4 +137,220 @@ test('page ids come from the conversation query and the task path', () => {
   assert.deepEqual(pageIds({ pathname: '/b/bot-1/work/w-9', search: '?conversation=c-1' }), { conversation_id: 'c-1', work_id: 'w-9' })
   assert.deepEqual(pageIds({ pathname: '/settings', search: '?conversation=../x' }), { conversation_id: undefined, work_id: undefined })
   assert.deepEqual(pageIds({ pathname: '/b/bot-1/work/%zz', search: '' }), { conversation_id: undefined, work_id: undefined })
+})
+
+const memory = () => {
+  const saved = new Map<string, string>()
+  return { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => { saved.set(key, value) } }
+}
+
+test('the phone keeps numbered records until the device accepts them, across restarts and unknown results', async () => {
+  const storage = memory()
+  let clock = 1_000
+  const timers: Array<() => void> = []
+  const options = { now: () => clock, later: (run: () => void) => { timers.push(run) } }
+  const first = createBufferedReporter(storage, options)
+  for (let index = 0; index < 3; index++) first.report({ level: 'info', event: 'mobile.connection', message: `${index}` })
+  assert.equal(createBufferedReporter(storage, options).pending(), 0, 'a burst is saved once, a moment later')
+  timers.splice(0).forEach(run => run())
+  const reopened = createBufferedReporter(storage, options)
+  assert.equal(reopened.pending(), 3, 'a restart keeps unsent records')
+  const sent: unknown[][] = []
+  let answer: 'unknown' | 'limited' | 'ok' = 'unknown'
+  reopened.connect(async (records, source) => {
+    assert.equal(source, 'mobile')
+    sent.push(records.map(record => [record.fields?.client_seq, record.fields?.client_ts_ms]))
+    if (answer === 'unknown') throw new Error('连接超时。')
+    if (answer === 'limited') throw Object.assign(new Error('too many log records; try again in a minute'), { responded: true, code: 'log_rate_limited' })
+  })
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true }, 'an unknown result keeps them')
+  answer = 'limited'
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true })
+  assert.deepEqual(await reopened.send(), { sent: 0, left: 3, connected: true }, 'a refused budget waits a minute')
+  answer = 'ok'
+  clock += 60_000
+  assert.deepEqual(await reopened.send(), { sent: 3, left: 0, connected: true })
+  const numbered = [[1000, 1000], [1001, 1000], [1002, 1000]]
+  assert.deepEqual(sent, [numbered, numbered, numbered], 'the same numbers go again')
+  timers.splice(0).forEach(run => run())
+  assert.equal(createBufferedReporter(storage, options).pending(), 0, 'accepted records leave storage')
+})
+
+test('the phone keeps a batch the device answered with anything but an invalid record', async () => {
+  let clock = 0
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.connection', message: 'a' })
+  let refusal: { message: string; code?: string } = { message: 'the Node is updating; try again shortly' }
+  reporter.connect(async () => { throw Object.assign(new Error(refusal.message), { responded: true, code: refusal.code }) })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'maintenance keeps it')
+  refusal = { message: 'this device is not a member' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'a lost permission keeps it')
+  refusal = { message: 'too many log records; try again in a minute' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'the words alone are not a rate limit')
+  refusal = { message: 'send between 1 and 20 log records at a time', code: 'log_rejected' }
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 0, connected: true }, 'an invalid batch is dropped')
+})
+
+test('a rate-limited batch waits a minute before it goes again', async () => {
+  let clock = 0
+  const waits: number[] = []
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: (_run, ms) => { waits.push(ms) } })
+  reporter.report({ level: 'info', event: 'mobile.connection', message: 'a' })
+  let calls = 0
+  reporter.connect(async () => {
+    calls++
+    if (clock < 60_000) throw Object.assign(new Error('slow down'), { responded: true, code: 'log_rate_limited' })
+  })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
+  assert.ok(waits.includes(60_000), 'the next try is a minute away')
+  clock = 59_999
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'not sent again within the minute')
+  assert.equal(calls, 1)
+  clock = 60_000
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true })
+})
+
+test('a skipped batch above the phone numbering is numbered again and resent; one below it was written', async () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 10, later: () => {} })
+  for (const message of ['a', 'b']) reporter.report({ level: 'info', event: 'mobile.action', message })
+  const sent: unknown[] = []
+  let written = 500
+  reporter.connect(async records => {
+    const seqs = records.map(record => record.fields?.client_seq as number)
+    sent.push(seqs)
+    if (seqs[0]! <= written) return { accepted: 0, skipped: seqs.length, max_seq: written }
+    written = seqs[seqs.length - 1]!
+    return { accepted: seqs.length }
+  })
+  assert.deepEqual(await reporter.send(), { sent: 2, left: 0, connected: true })
+  assert.deepEqual(sent, [[10, 11], [501, 502]], 'new numbers above what the device wrote')
+  written = 600
+  sent.length = 0
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'c' })
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true })
+  assert.deepEqual(sent, [[503], [601]], 'the next number continues above the last renumbering')
+  let lost = true
+  reporter.connect(async records => {
+    const seq = records[records.length - 1]!.fields?.client_seq
+    // The device wrote it, but the answer was lost.
+    if (lost) { lost = false; throw new Error('连接超时。') }
+    return { accepted: 0, skipped: records.length, max_seq: seq }
+  })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'd' })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
+  assert.deepEqual(await reporter.send(), { sent: 1, left: 0, connected: true }, 'a resend the device already wrote leaves')
+})
+
+test('a partly skipped batch numbered below the device is renumbered; what the device wrote is not sent again', async () => {
+  const reporter = createBufferedReporter(memory(), { now: () => 10, later: () => {} })
+  for (const message of ['a', 'b', 'c', 'd', 'e']) reporter.report({ level: 'info', event: 'mobile.action', message })
+  // The device already wrote up to 12 from this phone, before its numbering went back.
+  let last = 12
+  const written: string[] = []
+  const batches: number[][] = []
+  reporter.connect(async records => {
+    const seqs = records.map(record => record.fields?.client_seq as number)
+    batches.push(seqs)
+    const fresh = records.filter(record => (record.fields?.client_seq as number) > last)
+    written.push(...fresh.map(record => record.message))
+    last = Math.max(last, ...seqs)
+    const skipped = records.length - fresh.length
+    return skipped ? { accepted: fresh.length, skipped, max_seq: last } : { accepted: fresh.length }
+  })
+  assert.deepEqual(await reporter.send(), { sent: 5, left: 0, connected: true })
+  assert.deepEqual(batches, [[10, 11, 12, 13, 14], [15, 16, 17]])
+  assert.deepEqual(written, ['d', 'e', 'a', 'b', 'c'], 'every record is written once')
+})
+
+test('a fatal record with a long stack is saved at once and keeps fatal', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'error', event: 'mobile.uncaught', message: 'TypeError: boom', fields: { fatal: true, stack: 'at f\n'.repeat(3000) } })
+  const saved = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  assert.equal(saved.pending(), 1)
+  const stored = JSON.parse(storage.getItem('vibeface.log-buffer')!).records[0].fields
+  assert.equal(stored.fatal, true)
+  assert.equal(stored.truncated, true)
+  assert.ok(String(stored.stack).startsWith('at f\nat f'))
+})
+
+test('saving now writes what the save delay would', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'tap' })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 0)
+  reporter.save()
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 1)
+})
+
+test('a fatal error is saved at once; other records wait for the short save delay', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 1, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'tap' })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 0)
+  reporter.report({ level: 'error', event: 'mobile.uncaught', message: 'boom', fields: { fatal: true } })
+  assert.equal(createBufferedReporter(storage, { now: () => 1, later: () => {} }).pending(), 2)
+})
+
+test('the phone keeps the newest 300 and stays within 120 records a minute', async () => {
+  let clock = 0
+  const reporter = createBufferedReporter(memory(), { now: () => clock, later: () => {} })
+  for (let index = 0; index < 310; index++) reporter.report({ level: 'info', event: 'mobile.action', message: `${index}` })
+  assert.equal(reporter.pending(), 300)
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 300, connected: false })
+  let count = 0
+  reporter.connect(async records => { count += records.length })
+  assert.deepEqual(await reporter.send(), { sent: 120, left: 180, connected: true })
+  clock += 60_000
+  assert.deepEqual(await reporter.send(), { sent: 120, left: 60, connected: true })
+  assert.equal(count, 240)
+})
+
+const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+test('a cut never splits an emoji and lone surrogates become U+FFFD', () => {
+  assert.equal(wellFormed('a\uD83Db\uDC00😀'), 'a�b�😀')
+  for (let pad = 0; pad < 8; pad++) {
+    const fitted = fit({ level: 'error', event: 'web.uncaught', message: 'x'.repeat(pad) + '😀'.repeat(4000),
+      fields: { stack: 'y'.repeat(pad) + '🙂'.repeat(3000) } })
+    assert.ok(size(fitted) <= MAX_RECORD_BYTES)
+    assert.doesNotMatch(fitted.message, lone)
+    assert.doesNotMatch(String(fitted.fields?.stack), lone)
+  }
+  const cleaned = fit({ level: 'info', event: 'web.action', message: 'a\uD83D', fields: { stack: '\uDC00', nested: { list: ['\uD800x'] } } })
+  assert.deepEqual(cleaned, { level: 'info', event: 'web.action', message: 'a�', fields: { stack: '�', nested: { list: ['�x'] } } })
+  const intact: WebRecord = { level: 'info', event: 'web.action', message: '😀' }
+  assert.equal(fit(intact), intact)
+})
+
+test('a batch the device refused leaves sent_max where it was; an unknown result raises it', async () => {
+  const storage = memory()
+  const timers: Array<() => void> = []
+  // Only the save delay runs; retries wait for an explicit send.
+  const options = { now: () => 10, later: (run: () => void, ms: number) => { if (ms === 500) timers.push(run) } }
+  const reporter = createBufferedReporter(storage, options)
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'a' })
+  const sentMax = () => { timers.splice(0).forEach(run => run()); return JSON.parse(storage.getItem('vibeface.log-buffer')!).sent_max }
+  let answer: Error = Object.assign(new Error('the Node is updating; try again shortly'), { responded: true })
+  reporter.connect(async () => { throw answer })
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true })
+  assert.equal(sentMax(), 0, 'maintenance wrote nothing')
+  answer = Object.assign(new Error('slow down'), { responded: true, code: 'log_rate_limited' })
+  await reporter.send()
+  assert.equal(sentMax(), 0, 'a rate limit wrote nothing')
+  const unknown = createBufferedReporter(storage, options)
+  unknown.connect(async () => { throw new Error('连接超时。') })
+  await unknown.send()
+  assert.equal(sentMax(), 10, 'the device may have written it')
+})
+
+test('records reported after clearing survive a restart', () => {
+  const storage = memory()
+  const reporter = createBufferedReporter(storage, { now: () => 5, later: () => {} })
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'before' })
+  reporter.clear()
+  reporter.report({ level: 'info', event: 'mobile.action', message: 'after' })
+  reporter.save()
+  assert.equal(createBufferedReporter(storage, { now: () => 5, later: () => {} }).pending(), 1)
 })

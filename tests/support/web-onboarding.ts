@@ -12,9 +12,10 @@ export async function createPersonalNetwork({ screen }: WebOnboardingPage, name:
   await screen.getByRole('button', '下一步').click();
 }
 
-/** Submit the recovery password and leave the recovery-file step ready for download. */
+/** Submit the recovery password, entered twice, and leave the recovery-file step ready for download. */
 export async function continueRecoverySetup({ screen }: WebOnboardingPage): Promise<void> {
   await screen.getByLabel(/^恢复密码/).fill(secrets.get('recoveryPassword'));
+  await screen.getByLabel('再输入一遍恢复密码').fill(secrets.get('recoveryPassword'));
   await screen.getByRole('button', '下一步').click();
 }
 

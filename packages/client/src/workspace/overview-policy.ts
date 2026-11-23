@@ -1,3 +1,4 @@
+import { questionInboxKey } from "./questions.ts"
 import { cardState } from "./labels.ts"
 import { workspaceActivities } from "./activities.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "./model.ts"
@@ -20,6 +21,7 @@ type OverviewInputs = {
   checks: readonly PendingCheck[]
   jobs?: readonly WorkspaceActivityJob[]
   overview?: WorkspaceOverview | null
+  dismissedQuestions?: ReadonlySet<string>
   answered?: Readonly<Record<string, string>>
   read: boolean
   connected: boolean
@@ -57,7 +59,10 @@ function pruneTerminalChecks(
 /** Keep the complete snapshot available for counts and let each screen apply its selection. */
 export function prepareOverviewInputs(input: OverviewInputs) {
   const local = overviewFromWorkspace(input)
-  const overview = input.overview ?? local
+  const { overview: remote, dismissedQuestions } = input
+  const overview = remote && dismissedQuestions?.size
+    ? { ...remote, questions: remote.questions.filter((q) => !dismissedQuestions.has(questionInboxKey(q.conversation_id, q.question_id))) }
+    : remote ?? local
   const works = openWorksFromOverview(overview, input.openWorks)
   const checks = input.terminalCheckPolicy === "web-filtered"
     ? pruneTerminalChecks(input.checks, works, [...local.tasks, ...overview.tasks], [...input.nodes])

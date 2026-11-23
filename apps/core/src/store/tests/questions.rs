@@ -460,6 +460,33 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     let signed = Some(answer_signature(&net, "c", "q-2", "继续")?);
     store.accept_answer(&net.a, &net.network, "q-2", "继续", signed, 3)?;
     assert_eq!(unanswered(&store, &net)?, vec!["q-1", "q-3"]);
+    let receipt = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::NotificationAcked {
+            notification_id: "q-1".into(),
+            client_id: QUESTION_INBOX_CLIENT.into(),
+            attestation: None,
+        },
+    )?;
+    store.append_event(&net.a, &net.network, "c", receipt, vec![], 4)?;
+    assert!(!store.closed_in_inbox(&net.network, "q-1")?);
+    assert_eq!(
+        unanswered(&store, &net)?,
+        vec!["q-1", "q-3"],
+        "a list receipt does not answer the question"
+    );
+    assert_eq!(
+        store.dismissed_inbox_questions(&net.network)?,
+        vec![json!({"conversation_id":"c","question_id":"q-1"})],
+        "only the scoped ordinary question receives the list receipt"
+    );
+    let mut replica = super::super::test_support::store(&net)?;
+    sync(&store, &mut replica, &net)?;
+    assert_eq!(
+        replica.dismissed_inbox_questions(&net.network)?,
+        store.dismissed_inbox_questions(&net.network)?
+    );
     let pending = store.unanswered_questions(&net.network)?;
     assert!(pending.iter().all(|q| q["conversation_id"] != Value::Null));
     let chat = store.conversation_questions(&net.network, "c")?;

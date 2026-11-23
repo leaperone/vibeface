@@ -65,6 +65,8 @@ enum Action {
     Serve(Serve),
     /// Show this Node's status and known peers.
     Status(Access),
+    /// Show this Node's health checks and the last hour's warnings and errors.
+    Health(Access),
     /// Watch Node and peer status in a read-only terminal interface.
     Tui(Tui),
     /// Get the browser URL or control local browser access.
@@ -795,6 +797,7 @@ async fn run_cli() -> Result<()> {
             Ok(())
         }
         Some(Action::Status(options)) => status(options).await,
+        Some(Action::Health(options)) => health(options).await,
         Some(Action::Tui(options)) => tui::run(options.data_dir).await,
         Some(Action::Access(options)) => access(options).await,
         Some(Action::Join(options)) => join(options).await,
@@ -933,10 +936,12 @@ async fn status(options: Access) -> Result<()> {
         }
         for peer in inspected.peers.iter().flatten() {
             println!(
-                "Peer: {} ({}) {}, {}",
+                "Peer: {} ({}) {}, {}, {}, {}",
                 peer.name,
                 peer.device_id,
                 peer.reachability(),
+                peer.path_label(),
+                peer.rtt(),
                 plain_sync_description(peer.synced_ms, now_ms())
             );
         }
@@ -948,6 +953,43 @@ async fn status(options: Access) -> Result<()> {
         inspected.status == vibeface_control::inspection::NodeStatus::Running,
         "node is not reachable through its private maintenance socket"
     );
+    Ok(())
+}
+
+async fn health(options: Access) -> Result<()> {
+    let socket = inspect_socket(&options.data_dir).await?;
+    let health = maintenance::request(&socket, MaintenanceCommand::Health)
+        .await?
+        .client_result()?;
+    if options.json {
+        println!("{}", serde_json::to_string(&health)?);
+        return Ok(());
+    }
+    let now = now_ms();
+    let ago = |at: &Value| {
+        at.as_i64().map_or("not yet".into(), |at| {
+            format!("{}s ago", now.saturating_sub(at).max(0) / 1000)
+        })
+    };
+    println!("Checked: {}", ago(&health["checked_at_ms"]));
+    let problems = health["problems"].as_array().cloned().unwrap_or_default();
+    if problems.is_empty() {
+        println!("Problems: none");
+    }
+    for problem in &problems {
+        println!(
+            "Problem: {} {} since {}: {}",
+            problem["check"].as_str().unwrap_or_default(),
+            problem["subject"].as_str().unwrap_or_default(),
+            ago(&problem["since_ms"]),
+            problem["detail"].as_str().unwrap_or_default()
+        );
+    }
+    for level in ["error", "warn"] {
+        for (event, count) in health["last_hour"][level].as_object().into_iter().flatten() {
+            println!("Last hour: {level} {event} x{count}");
+        }
+    }
     Ok(())
 }
 

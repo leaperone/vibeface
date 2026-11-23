@@ -371,3 +371,52 @@ fn a_steer_target_waiting_for_reconciliation_is_not_treated_as_active() -> Resul
     assert!(!store.steering_jobs()?.iter().any(|job| job.trigger == m2));
     Ok(())
 }
+
+#[test]
+fn a_users_message_does_not_steer_into_a_health_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    bot_conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    let now = 10_000;
+    let super::super::bot_settings::PrimaryReminder::Written(reminder) =
+        store.remind_primary_bot(&net.a, &net.network, "health-k-1", "检查 Node", now)?
+    else {
+        panic!("the owner writes the reminder")
+    };
+    let BotChange::Schedule { schedule_id, .. } = reminder.change else {
+        panic!("reminder")
+    };
+    let at = now + 60_000;
+    store.admit_due_schedules(&net.a, &net.network, at + 5)?;
+    let health = store
+        .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("health job")?;
+    assert_eq!(
+        health.job.trigger,
+        crate::scheduling::schedule_trigger(&schedule_id, at)
+    );
+    // The scope keeps the user's messages out of the read-only health turn.
+    assert!(matches!(
+        health.job.scope,
+        crate::scheduling::SessionScope::Routine { .. }
+    ));
+    let attempt = health.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &health.job.trigger, &attempt)?;
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Default::default(),
+    )?;
+
+    say(&mut store, &net, "m1", true)?;
+    assert!(
+        store
+            .steer_candidates(&net.network, &local, "boot")?
+            .is_empty(),
+        "the user's message waits for its own full turn"
+    );
+    Ok(())
+}

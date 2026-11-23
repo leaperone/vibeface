@@ -24,6 +24,8 @@ CLI/npm 共用版本。版本语法为 `X.Y.Z`、`X.Y.Z-rc.N`、`X.Y.Z-hourly.YY
 
 `hourly.yml` 在 UTC 每小时 17 分、main push CI 成功后或手动运行时对账 Core。`daily.yml` 仅在 `America/Los_Angeles` 每日 18:00 定时启动客户端发布，并跟随夏令时。构建和发布可能稍后完成。每个批次按通过 main push CI 的源码与 UTC 小时版本后缀发布，继续使用 Hourly 分发渠道。Web App、CLI/npm、Desktop 和 Mobile（APK 与 iOS）按构建输入或依赖 pin 的变化发布，无变化时复用完整 Release。
 
+协调器用 `vibeface-release` GitHub App 的短期 token（仓库变量 `VIBEFACE_RELEASE_APP_ID`、secret `VIBEFACE_RELEASE_APP_PRIVATE_KEY`，仅 contents/workflows 写权限）推送生成的 tag，其余 API 与派发仍用 `GITHUB_TOKEN`；tag 推送触发的发布运行会被复用，不重复派发。
+
 CLI 锁定批次截止时最新完整发布且验证通过的 Hourly Core，以及本批次选定的 Web App。Desktop 锁定选定的 CLI。每日协调器观察这些精确组件 Release，可跨小时继续依赖构建。已有同批次 Tag 时以其中记录的 main parent 继续对账。官网仅手动发布。
 
 生成提交只有一个 main parent，只改所选版本、必要的 Cargo.lock 本地包或 Mobile build number，以及 `releases/cli.json`/`releases/desktop.json` 的精确依赖 pin。`scripts/hourly.py` 会重建 Git tree 校验来源，不改变 main。每个应用每 UTC 小时最多一个 Tag；已有 Tag 只能对账和补派发，不覆盖。

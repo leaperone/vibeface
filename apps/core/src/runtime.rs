@@ -35,6 +35,7 @@ mod cursor;
 mod execution_directory;
 mod executor;
 mod followup;
+mod health;
 mod input_receipts;
 mod manager_control;
 mod observation;
@@ -56,6 +57,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
+pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool};
 pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
@@ -71,6 +73,10 @@ struct NodeObservation {
     checked_at_ms: Option<i64>,
     last_synced_at_ms: Option<i64>,
     path: Option<crate::net::SelectedPath>,
+    /// The same link facts as `maintenance::PeerHealth`.
+    rtt_ms: Option<u32>,
+    path_changes: u32,
+    disconnects: u32,
 }
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
@@ -380,6 +386,7 @@ pub struct Runtime {
     rejoin: tokio::sync::Notify,
     /// Budget of records browsers and local processes may add to the log.
     pub(crate) log_intake: crate::logging::RateLimit,
+    health: std::sync::Mutex<health::HealthState>,
 }
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     let s = v[key]
@@ -652,6 +659,7 @@ impl Runtime {
             node_join: std::sync::Mutex::new(None),
             rejoin: tokio::sync::Notify::new(),
             log_intake: Default::default(),
+            health: std::sync::Mutex::new(health::HealthState::new(now_ms())),
         };
         node.start_authority_projection_timer()?;
         for token in node.relay_tokens() {
@@ -933,6 +941,7 @@ impl Runtime {
         self.start_schedule_delivery();
         self.start_observation_worker();
         self.start_triage();
+        self.start_health();
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         self.store
@@ -1293,6 +1302,9 @@ impl Runtime {
                                 checked_at_ms: Some(now_ms()),
                                 last_synced_at_ms: None,
                                 path: None,
+                                rtt_ms: None,
+                                path_changes: 0,
+                                disconnects: 0,
                             },
                         );
                     }
@@ -1316,18 +1328,25 @@ impl Runtime {
                         None
                     };
                     let live = answer.is_some();
-                    let path = if include_observation {
-                        answer
-                            .as_ref()
-                            .and_then(|(_, connection)| crate::net::selected_path(connection))
-                    } else {
-                        None
-                    };
+                    // The path and its round-trip time, both of the connection that answered.
+                    let (path, rtt_ms) = answer
+                        .as_ref()
+                        .filter(|_| include_observation)
+                        .and_then(|(_, connection)| crate::net::selected_link(connection))
+                        .map_or((None, None), |(path, rtt)| (Some(path), Some(rtt)));
                     let (_, last_synced_at_ms) = self.peer_sync_status(&member.device_id);
+                    let counts = self
+                        .net
+                        .get()
+                        .map(|net| net.link_counts(&member.device_id))
+                        .unwrap_or_default();
                     let observation = NodeObservation {
                         checked_at_ms: attempted.then(now_ms),
                         last_synced_at_ms,
                         path,
+                        rtt_ms,
+                        path_changes: counts.path_changes,
+                        disconnects: counts.disconnects,
                     };
                     (
                         live,
@@ -1547,10 +1566,78 @@ impl Runtime {
                 .await?;
                 Ok(json!({"dismissed":true}))
             }
+            Ok(BusinessCommand::DismissQuestion(_)) => {
+                ensure!(access.is_user(), "only clients hide questions from 待处理");
+                let scope = scope.context("conversation_id is required")?;
+                let question_id = id(input, "question_id")?;
+                let query_network = network.to_owned();
+                let query_scope = scope.clone();
+                let query_question = question_id.clone();
+                let question = self
+                    .store
+                    .call("dismiss_question_check", move |store| {
+                        store.question(&query_network, &query_question)
+                    })
+                    .await?;
+                let Some(question) = question else {
+                    return Ok(json!({"dismissed":false}));
+                };
+                ensure!(
+                    question["conversation_id"] == query_scope,
+                    "问题不属于这个对话"
+                );
+                let open = question["answer"].is_null() && question["closed"].is_null();
+                if !open {
+                    return Ok(json!({"dismissed":false}));
+                }
+                let attention = question["attention"]["kind"].as_str();
+                let approval_choice = question["choices"].as_array().is_some_and(|choices| {
+                    choices
+                        .iter()
+                        .any(|choice| choice.get("action").is_some_and(|action| !action.is_null()))
+                });
+                ensure!(
+                    question["about"]["request_id"].is_null()
+                        && !matches!(attention, Some("approval" | "browser_takeover"))
+                        && !approval_choice,
+                    "挂起的审批不能从待处理中清除"
+                );
+                let notification_id = question_id;
+                let readback_id = notification_id.clone();
+                let query_network = network.to_owned();
+                let already = self
+                    .store
+                    .call("dismiss_question_readback", move |store| {
+                        store.notification_acked(
+                            &query_network,
+                            &readback_id,
+                            QUESTION_INBOX_CLIENT,
+                        )
+                    })
+                    .await?;
+                if already {
+                    return Ok(json!({"dismissed":true}));
+                }
+                self.append(
+                    network,
+                    &query_scope,
+                    EventBody::NotificationAcked {
+                        notification_id,
+                        client_id: QUESTION_INBOX_CLIENT.into(),
+                        attestation: Some(attestation(input)?),
+                    },
+                )
+                .await?;
+                Ok(json!({"dismissed":true}))
+            }
             Ok(BusinessCommand::Ack(_)) => {
                 ensure!(access.is_user(), "only clients acknowledge notifications");
                 let notification = id(input, "notification_id")?;
                 let client = id(input, "client_id")?;
+                ensure!(
+                    client != QUESTION_INBOX_CLIENT,
+                    "reserved question inbox receipt"
+                );
                 let query_network = network.to_owned();
                 let query_client = client.clone();
                 let pending = self

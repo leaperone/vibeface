@@ -1,4 +1,3 @@
-import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 "use client"
 
 import { BotFace } from "@/components/app/bot-face"
@@ -14,6 +13,8 @@ import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { answerLabel,approvalTask,attentionLabel,declined,ignoredAnswer,questionMeta,questionParts,settledAnswer,sharedProject } from "@vibeface/client/workspace/questions.ts"
 import type { Question,Severity } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
+import buttonStyles from "@vibeface/uiarc/button/button.module.css"
+import { Textarea } from "@vibeface/uiarc/textarea/textarea.tsx"
 import { ChevronRight,CircleAlert,CircleCheck,CircleSlash,CircleX,FolderOpen,Info,Laptop,ListChecks,MessageCircleQuestionMark,RotateCw,SendHorizontal,TriangleAlert,X,type LucideIcon } from "lucide-react"
 import { useRef,useState,type ReactNode } from "react"
 
@@ -112,13 +113,14 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     </p> : <div className="grid gap-2">
       {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? "primary" : "secondary"} disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
         {question.choices.length ? <div role="group" aria-label="选一个回答" className="grid min-w-0 gap-2">
-          {question.choices.map((choice, index) => <Button variant="ghost" key={index} type="button" className="w-full justify-start whitespace-normal" disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
-            <span aria-hidden="true" className="w-4 shrink-0 text-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
+          {/* Arc's button keeps its label on one centered line, so a choice uses its classes on a plain button to wrap from the start. */}
+          {question.choices.map((choice, index) => <button key={index} type="button" className={`${buttonStyles.button} ${buttonStyles.ghost} -mx-2 h-auto justify-start! whitespace-normal! px-2! py-2! text-start`} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
+            <span aria-hidden="true" className="flex w-4 shrink-0 justify-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
             <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{choice.label}</span>
-          </Button>)}
+          </button>)}
         </div> : null}
         <div className="flex min-w-0 items-end gap-2">
-          <Textarea label="你的回答" aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-w-0 flex-1 resize-none [field-sizing:content] disabled:cursor-not-allowed disabled:opacity-50" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+          <div className="min-w-0 flex-1"><Textarea label="你的回答" aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-h-11! resize-none! [field-sizing:content]" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} /></div>
           <Button type="button" size="md" className="shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
         </div>
       </>}

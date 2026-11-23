@@ -50,7 +50,7 @@ export function TasksOverview() {
   const pendingChecks = attention.filter((item): item is Extract<InboxItem, { kind: "confirm" }> => item.kind === "confirm").map((item) => item.check)
   const prepared = prepareOverviewInputs({
     openWorks: workspace.openWorks, bots: workspace.bots, questions: openQuestions, nodes: workspace.nodes, checks: pendingChecks,
-    overview: workspace.overview, jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
+    overview: workspace.overview, dismissedQuestions: workspace.dismissedQuestions, jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
     answered: workspace.answered, read, connected: workspace.connectionOnline, terminalCheckPolicy: "web-filtered",
   })
   const overview = prepared.overview

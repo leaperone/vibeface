@@ -32,6 +32,8 @@ macro_rules! coordination_tools {
             Remind => ("remind", Wake),
             MessageBot => ("message_bot", Wake),
             FetchUrl => ("fetch_url", Read),
+            ReadLogs => ("read_logs", Read),
+            ReadHealth => ("read_health", Read),
             ListBots => ("list_bots", Read),
             ReadBot => ("read_bot", Read),
             CreateBot => ("create_bot", Settings),

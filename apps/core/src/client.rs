@@ -730,9 +730,18 @@ async fn serve_session_with_heartbeat(
                     Message::Binary(bytes) => {
                         if let Some(plaintext) = channel.open_record(&bytes)? {
                             partial_started = None;
-                            let request: WireRequest = serde_json::from_slice(&plaintext).context("invalid client request")?;
-                            let request = request.decode()?;
-                            if let Some(response) = calls.accept(&node, &session, &authority, request)? {
+                            let request = serde_json::from_slice::<WireRequest>(&plaintext)
+                                .context("invalid client request")
+                                .and_then(WireRequest::decode);
+                            let response = match request {
+                                Ok(request) => calls.accept(&node, &session, &authority, request)?,
+                                Err(error) => {
+                                    let response = undecodable_request(&plaintext, &error).ok_or(error)?;
+                                    calls.reserve(&response.id)?;
+                                    Some(response)
+                                }
+                            };
+                            if let Some(response) = response {
                                 send_value(&mut socket, &mut channel, &response).await?;
                             }
                         } else { partial_started.get_or_insert_with(Instant::now); }
@@ -903,14 +912,22 @@ async fn dispatch_inner(
         }
         ClientCommand::Log(params) => {
             let params = params.into_value();
-            let accepted = crate::logging::submit(
+            let source = match params.get("source").map(|source| source.as_str()) {
+                None | Some(Some("web")) => crate::logging::Source::Web,
+                Some(Some("mobile")) => crate::logging::Source::Mobile,
+                _ => {
+                    return Err(crate::logging::Refused::rejected(
+                        "log source is web or mobile",
+                    ));
+                }
+            };
+            crate::logging::submit(
                 &node.log_intake,
                 &session.device_id,
-                crate::logging::Source::Web,
+                source,
                 &params["records"],
                 crate::clock::now_ms(),
-            )?;
-            Ok(json!({"accepted":accepted}))
+            )
         }
         ClientCommand::Logs(params) => {
             let params = params.into_value();
@@ -2476,6 +2493,28 @@ fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Resul
     )
     .with_context(|| format!("invalid {key}"))
 }
+/// The answer to a request that does not decode, such as params with a lone surrogate, so only
+/// that request fails and the channel stays; `None` when it has no valid ID to answer. A `log`
+/// batch gets `log_rejected`, so the sender drops it instead of sending it again.
+fn undecodable_request(plaintext: &[u8], error: &anyhow::Error) -> Option<Response> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        id: String,
+        #[serde(default)]
+        method: Option<Value>,
+    }
+    let envelope: Envelope = serde_json::from_slice(plaintext).ok()?;
+    valid_business_id(&envelope.id).then(|| Response {
+        id: envelope.id,
+        result: Value::Null,
+        error: Some(format!("{error:#}")),
+        code: Some(if envelope.method == Some(json!("log")) {
+            crate::logging::Refused::REJECTED
+        } else {
+            "invalid_request"
+        }),
+    })
+}
 fn validate_request(request: &WireRequest) -> Result<()> {
     ensure!(valid_business_id(&request.id), "invalid request ID");
     ensure!(
@@ -3488,14 +3527,43 @@ mod tests {
         let mut browser = test_session(member.device_id()?);
         let oversized =
             json!({"level":"info","message":"x".repeat(crate::logging::MAX_RECORD_BYTES)});
-        assert!(
+        let refused =
             dispatch_wire_fixture(&node, &mut browser, "log", json!({"records":[oversized]}))
                 .await
-                .is_err()
+                .expect_err("an oversized record is refused");
+        assert_eq!(
+            concurrency::error_code(&refused),
+            Some(crate::logging::Refused::REJECTED)
         );
         assert_eq!(
             dispatch_wire_fixture(&node, &mut browser, "log", json!({"records":[record]})).await?,
             json!({"accepted":1})
+        );
+        let phone = json!({"level":"info","event":"mobile.connection","message":"ready","fields":{"client_seq":1}});
+        for source in [json!("node"), json!("desktop"), json!(1)] {
+            let refused = dispatch_wire_fixture(
+                &node,
+                &mut browser,
+                "log",
+                json!({"records":[phone],"source":source}),
+            )
+            .await
+            .expect_err("only web and mobile");
+            assert_eq!(
+                concurrency::error_code(&refused),
+                Some(crate::logging::Refused::REJECTED),
+                "{source}"
+            );
+        }
+        let declared = json!({"records":[phone],"source":"mobile"});
+        assert_eq!(
+            dispatch_wire_fixture(&node, &mut browser, "log", declared.clone()).await?,
+            json!({"accepted":1})
+        );
+        assert_eq!(
+            dispatch_wire_fixture(&node, &mut browser, "log", declared).await?,
+            json!({"accepted":0,"skipped":1,"max_seq":1}),
+            "a resent sequence number is skipped"
         );
         assert!(
             dispatch_wire_fixture(&node, &mut browser, "logs", json!({}))
@@ -5840,6 +5908,31 @@ mod tests {
             business_params(&unknown).value(),
             &json!({"request":{"action":{"response":{"client_id":"business-data"}}}})
         );
+    }
+
+    #[test]
+    fn an_undecodable_request_is_answered_without_closing_the_channel() {
+        let error = anyhow::anyhow!("invalid client request");
+        // `JSON.stringify` writes a lone surrogate as an escape serde_json refuses.
+        let log = br#"{"id":"r1","method":"log","params":{"records":[{"message":"\ud83d"}]}}"#;
+        assert!(serde_json::from_slice::<WireRequest>(log).is_err());
+        let answer = undecodable_request(log, &error).expect("answered");
+        assert_eq!(
+            (answer.id.as_str(), answer.code),
+            ("r1", Some(crate::logging::Refused::REJECTED))
+        );
+        let other = br#"{"id":"r2","method":"info","params":{"x":"\udc00"}}"#;
+        assert_eq!(
+            undecodable_request(other, &error).unwrap().code,
+            Some("invalid_request")
+        );
+        let invalid = br#"{"id":"r3","method":"info","params":1}"#;
+        assert_eq!(
+            undecodable_request(invalid, &error).unwrap().code,
+            Some("invalid_request")
+        );
+        assert!(undecodable_request(br#"{"id":"","method":"info"}"#, &error).is_none());
+        assert!(undecodable_request(b"not json", &error).is_none());
     }
 
     #[test]

@@ -768,7 +768,7 @@ impl Delivery {
                         .execute(
                             self,
                             &format!("budget-{budget_id}/withdraw-{}", snapshot.earned),
-                            chain::Call::Budget(Box::new(budget::BudgetAction::Withdraw {
+                            chain::Call::Budget(Box::new(budget_codec::BudgetAction::Withdraw {
                                 budget_id: parse_word(&budget_id)?,
                             })),
                             &record.provider_gas_cap,

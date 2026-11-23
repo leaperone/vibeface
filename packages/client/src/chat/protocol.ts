@@ -1,7 +1,7 @@
 import { botReadiness, inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
-import { failureText } from '../lib/errors.ts'
+import { failureText, outcomeUnknown } from '../lib/errors.ts'
 import { providerNames } from '../lib/node.ts'
 import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
@@ -24,7 +24,7 @@ export function canSend(input: SendGate): boolean {
   return Boolean(input.hasConversation && input.loaded && !input.busy)
 }
 /** Whether any device can run the bot now: `starting` while one comes up, `offline` when the only ones that could are away, `none` when none is set up to. */
-export type BotReach = 'ready' | 'unverified' | 'starting' | 'needs_setup' | 'offline' | 'none'
+type BotReach = 'ready' | 'unverified' | 'starting' | 'needs_setup' | 'offline' | 'none'
 /** A device that only needs setup is fixable now, so it comes before one that is offline. */
 export function botReach(nodes: NodeInfo[]): BotReach {
   if (nodes.some((node) => botReadiness(node) === 'ready')) return 'ready'
@@ -36,6 +36,8 @@ export function botReach(nodes: NodeInfo[]): BotReach {
 export const botCanSend = (reach: BotReach) => reach === 'ready' || reach === 'unverified'
 
 export const canRetryJob = (job: ManagerJob) => job.retryable === true && job.runtime?.execution === 'not_started' && !job.pending_check && job.state === 'failed'
+/** A reply whose outcome is unknown or still being checked may have done its work: it is checked, never retried. */
+export const replyUnsettled = (job: ManagerJob) => outcomeUnknown(job.failure?.kind, job.failure?.detail) || Boolean(job.pending_check) || job.state === 'reconciling'
 export function runtimeLabel(runtime: TurnRuntime): string {
   const model = runtime.model ? `提交模型 ${runtime.model}` : 'AI 服务默认模型，实际模型未确认'
   const effort = runtime.reasoning_effort ? `提交推理强度 ${runtime.reasoning_effort}` : '推理强度由 AI 服务决定'
