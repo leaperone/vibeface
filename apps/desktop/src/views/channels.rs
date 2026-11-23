@@ -386,6 +386,7 @@ impl Desktop {
                         summary,
                         thread_id,
                         turn_id,
+                        ..
                     } => {
                         row = row
                             .child(format!("工作进度 · {phase:?}"))
