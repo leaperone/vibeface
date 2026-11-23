@@ -698,8 +698,7 @@ async fn sends_reach_the_users_own_codex_only_for_threads_found_there() -> Resul
 }
 
 #[tokio::test]
-async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unknown() -> Result<()>
-{
+async fn invalid_dispatch_paths_are_definite_refusals_but_root_io_stays_unknown() -> Result<()> {
     use crate::work::{RequestedWorkKind, WorkRequest, WorkSpec};
     with_node(async |node, admin, dir| {
         with_agent(&node);
@@ -721,7 +720,7 @@ async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unkn
         };
         for (call_ref, cwd, roots, definite) in [
             ("outside-root", dir.clone(), vec![allowed.clone()], true),
-            ("missing-path", allowed.join("not-created"), vec![allowed.clone()], false),
+            ("missing-path", allowed.join("not-created"), vec![allowed.clone()], true),
             ("missing-root", dir.clone(), vec![missing_root.clone()], false),
             ("unmatched-and-missing-root", dir.clone(), vec![allowed.clone(), missing_root.clone()], false),
         ] {
@@ -740,7 +739,11 @@ async fn outside_root_dispatch_is_a_definite_refusal_but_missing_path_stays_unkn
             };
             assert_eq!(error.is::<AdmissionRejected>(), definite, "{call_ref}: {error:#}");
             if definite {
-                assert_eq!(error.to_string(), "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots");
+                if call_ref == "missing-path" {
+                    assert!(error.to_string().starts_with("execution path is invalid:"));
+                } else {
+                    assert_eq!(error.to_string(), "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots");
+                }
             } else {
                 assert_eq!(error.downcast_ref::<std::io::Error>().context("original filesystem failure")?.kind(), std::io::ErrorKind::NotFound);
             }

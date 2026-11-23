@@ -176,17 +176,26 @@ impl Runtime {
         settings: &WorkDispatchSettings,
     ) -> Result<()> {
         if spec.thread.is_none() || !spec.cwd.is_empty() {
-            CanonicalExecutionPath::resolve(Path::new(&spec.cwd))
-                .context("execution path does not exist")?
-                .authorize(&settings.roots)
-                .map_err(|error| match error {
-                    // Dispatch historically leaves these failures retryable.
-                    DirectoryAuthorizationError::NotDirectory
-                    | DirectoryAuthorizationError::Metadata(_) => {
-                        anyhow::anyhow!("execution path must be a directory")
-                    }
-                    error => error.into(),
-                })?;
+            ensure!(
+                Path::new(&spec.cwd).is_absolute(),
+                AdmissionRejected::new("execution path must be an absolute directory")
+            );
+            let path = CanonicalExecutionPath::resolve(Path::new(&spec.cwd)).map_err(|error| {
+                AdmissionRejected::new(format!("execution path is invalid: {error}"))
+            })?;
+            path.authorize(&settings.roots).map_err(|error| match error {
+                DirectoryAuthorizationError::OutsideRoots => AdmissionRejected::new(
+                    "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots",
+                )
+                .into(),
+                DirectoryAuthorizationError::NotDirectory => {
+                    AdmissionRejected::new("execution path must be a directory").into()
+                }
+                DirectoryAuthorizationError::UnresolvedRoot(error) => {
+                    anyhow::Error::new(error).context("configured execution root cannot be resolved")
+                }
+                DirectoryAuthorizationError::Metadata(error) => error.into(),
+            })?;
         }
         let conversation = store
             .conversation(network, &spec.conversation)?
@@ -371,6 +380,27 @@ impl Runtime {
             .store
             .tool_transaction("work.accept_dispatch", move |store| {
                 let network = call_network.as_str();
+                if request.cwd.is_empty() && request.thread.is_none() {
+                    request.cwd = store
+                        .bot_for_conversation(network, &request.conversation)?
+                        .and_then(|bot| {
+                            bot.project
+                                .filter(|project| project.target_node == request.target)
+                                .map(|project| project.cwd)
+                        })
+                        .or_else(|| {
+                            settings
+                                .manager
+                                .as_ref()
+                                .map(|manager| manager.workspace.display().to_string())
+                        })
+                        .ok_or_else(|| {
+                            ExecFailure::new(
+                                FailureKind::NoBot,
+                                "this device has no bot workspace for the task",
+                            )
+                        })?;
+                }
                 if let Some(existing) = store.accepted_work(network, &request)? {
                     Ok(existing)
                 } else {
@@ -1656,7 +1686,7 @@ mod directory_tests {
             Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
                 .unwrap_err();
         assert_eq!(file_error.to_string(), "execution path must be a directory");
-        assert!(!file_error.is::<AdmissionRejected>());
+        assert!(file_error.is::<AdmissionRejected>());
         assert!(!file_error.is::<std::io::Error>());
 
         request.cwd = directory.to_str().context("outside")?.into();
@@ -1677,9 +1707,23 @@ mod directory_tests {
         let missing =
             Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
                 .unwrap_err();
-        assert!(!missing.is::<AdmissionRejected>());
-        assert!(missing.is::<std::io::Error>());
-        assert_eq!(missing.to_string(), "execution path does not exist");
+        assert!(missing.is::<AdmissionRejected>());
+        assert!(!missing.is::<std::io::Error>());
+        assert!(
+            missing
+                .to_string()
+                .starts_with("execution path is invalid:")
+        );
+
+        request.cwd = "relative/path".into();
+        let relative =
+            Runtime::authorize_dispatch(&store, "network", &request, WorkKind::Task, &settings)
+                .unwrap_err();
+        assert!(relative.is::<AdmissionRejected>());
+        assert_eq!(
+            relative.to_string(),
+            "execution path must be an absolute directory"
+        );
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }

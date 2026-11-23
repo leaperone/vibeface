@@ -1449,6 +1449,13 @@ impl Runtime {
                 "a remote task uses the target Bot's model; omit model or dispatch locally with an execution provider"
             );
         }
+        let requested_cwd = optional("cwd");
+        if let Some(cwd) = &requested_cwd {
+            ensure!(
+                std::path::Path::new(cwd).is_absolute(),
+                "cwd must be an absolute path; omit it to use the target Node's Bot workspace"
+            );
+        }
         let request = WorkRequest {
             work_id,
             conversation: scope.into(),
@@ -1460,8 +1467,8 @@ impl Runtime {
             model: requested_model,
             // A thread's directory is only informational and may be unknown.
             cwd: match &thread {
-                Some(_) => optional("cwd").unwrap_or_default(),
-                None => field(args, "cwd")?.into(),
+                Some(_) => requested_cwd.unwrap_or_default(),
+                None => requested_cwd.unwrap_or_default(),
             },
             title: field(args, "title")?.chars().take(120).collect(),
             prompt: field(args, "prompt")?.into(),
