@@ -173,7 +173,9 @@ function inbox(signal: AbortSignal | undefined, timeoutMs: number, onClose: (err
 
 /** A WebSocket to a Gateway, which forwards to the Node `connect` names, or to the local page's own Node. */
 async function socketCarrier(url: string, connect: string | null, signal: AbortSignal | undefined, onClose: (error: Error) => void, timeoutMs: number, onQueued?: (position: number) => void): Promise<Carrier> {
-  const socket = new WebSocket(url)
+  // React Native sends its default native Origin; the public Node only allows the official app origin.
+  const WebSocketWithOptions = WebSocket as unknown as new (url: string, protocols?: string | string[], options?: unknown) => WebSocket
+  const socket = new WebSocketWithOptions(url, undefined, { headers: { origin: 'https://app.vibeface.dev' } })
   socket.binaryType = 'arraybuffer'
   const frames = inbox(signal, timeoutMs, onClose, () => socket.close(), onQueued)
   socket.addEventListener('message', (event: MessageEvent) => {
