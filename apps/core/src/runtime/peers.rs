@@ -2523,10 +2523,6 @@ impl Runtime {
 }
 
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
-pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
-    staging_room_for(dir, size, true)
-}
-
 pub(super) fn staging_room_for(dir: &Path, size: u64, new_object: bool) -> Result<()> {
     let mut objects = 0;
     let mut bytes = size;
