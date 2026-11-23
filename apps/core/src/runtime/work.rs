@@ -1567,6 +1567,7 @@ impl Runtime {
         let target_node = self.identity.device_id()?;
         // A send steered into a running turn shares it with the work that started it.
         for record in works {
+            self.observe_work_tools(&record.work_id, &event);
             self.publish_progress(
                 network,
                 json!({"type":"native_progress","conversation_id":record.conversation,"work_id":record.work_id,
