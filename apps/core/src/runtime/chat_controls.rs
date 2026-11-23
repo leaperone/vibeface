@@ -60,7 +60,9 @@ impl Runtime {
         let mut value = serde_json::to_value(&work)?;
         value["target"] = json!(target);
         value["source_events"] = json!(sources);
-        Ok(json!({"work":value,"subagents":subagents,"coverage":{"source":"shared_history","complete":false}}))
+        Ok(
+            json!({"work":value,"subagents":subagents,"coverage":{"source":"shared_history","complete":false}}),
+        )
     }
 
     async fn require_attachment_scope(&self, access: &Access, scope: &str) -> Result<()> {
