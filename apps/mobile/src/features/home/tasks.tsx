@@ -47,7 +47,7 @@ export function TasksScreen() {
     questions: openQuestions,
     nodes: lookup.nodes,
     checks: pendingChecks,
-    overview: shared?.overview,
+    overview: shared?.overview, dismissedQuestions: shared?.dismissedQuestions,
     answered: shared?.answered ?? {},
     connected: Boolean(shared?.connectionOnline),
     read,
