@@ -1218,6 +1218,15 @@ function sessionHandoff(value: unknown): SessionHandoff {
 export function parseQuestions(value: unknown): Question[] {
   return list(record(value).questions).map(question)
 }
+export function parseQuestionInbox(value: unknown): { questions: Question[]; dismissedQuestions: ReadonlySet<string> } {
+  const data = record(value)
+  const dismissedQuestions = new Set<string>()
+  for (const item of list(data.dismissed_questions ?? [])) {
+    const row = record(item)
+    dismissedQuestions.add(JSON.stringify([text(row.conversation_id), text(row.question_id)]))
+  }
+  return { questions: list(data.questions).map(question), dismissedQuestions }
+}
 /** The answer that stands for this question, whether this browser's or one written first. */
 export function parseAnswer(value: unknown, questionId: string): AnswerResult {
   const data = record(value), message = record(data.message), status = data.status

@@ -1,5 +1,5 @@
 import { Link, type Href } from 'expo-router'
-import { Bot, CheckCheck, ChevronRight, CircleAlert, CircleX, Copy, EyeOff, LoaderCircle, Settings, X, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bot, CheckCheck, ChevronRight, CircleAlert, CircleX, Copy, EyeOff, ListChecks, LoaderCircle, Settings, X, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
 import Animated from 'react-native-reanimated'
@@ -14,6 +14,7 @@ import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { fixOnDevice, fixOnDeviceLabel } from '@vibeface/client/workspace/labels.ts'
 import type { Question } from '@vibeface/client/workspace/types.ts'
+import { questionInboxDismissible } from '@vibeface/client/workspace/questions.ts'
 import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
 import { move } from '@/lib/motion'
@@ -42,6 +43,7 @@ export function PendingSection() {
   const inputs = items.flatMap((item) => item.kind === 'undelivered' ? [item.message] : [])
   const { busy, error, status, run } = useRun()
   const wide = useWide()
+  const questions = items.flatMap((item) => item.kind === 'question' && !item.done && !shared?.pendingAnswers?.some((pending) => pending.question_id === item.question.question_id) && questionInboxDismissible(item.question) ? [item.question] : [])
   // Groups order by the newest question each bot has shown here. Answered questions leave the list, so the time is kept
   // and only rises: answering never reshuffles the groups, and only a new question lifts its bot to the top.
   const latest = useRef(new Map<string, number>()).current
@@ -53,9 +55,16 @@ export function PendingSection() {
   }
   const open = [...groups].sort(([a], [b]) => latest.get(b)! - latest.get(a)!).map(([, questions]) => questions)
   const attention = items.filter((item): item is Extract<InboxItem, { kind: 'attention' }> => item.kind === 'attention')
+  const clearQuestions = async () => {
+    const snapshot = [...questions]
+    if (!shared || !snapshot.length) return
+    await run('questions', async () => {
+      for (const question of snapshot) await shared.dismissQuestion(question)
+    }, `已从待处理中移除 ${snapshot.length} 个问题。`)
+  }
   if (!items.length) return null
   return <View className="gap-3">
-    <Text role="heading" className="px-1 text-lg font-medium">待处理</Text>
+    <View className="flex-row flex-wrap items-center justify-between gap-2"><Text role="heading" className="px-1 text-lg font-medium">待处理</Text>{questions.length && shared ? <Button variant="secondary" disabled={!shared.writable || busy !== null} accessibilityLabel={`移出待处理（${questions.length}）`} onPress={() => void clearQuestions()}><Icon as={ListChecks} /><Text>移出待处理（{questions.length}）</Text></Button> : null}</View>
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} /> : null)}
     {inputs.length ? <View className="gap-3"><Text role="heading" className="px-1 text-sm font-medium text-muted">待确认</Text>{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-sm">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
     {attention.length ? <Text role="heading" className="mt-3 px-1 text-sm font-medium text-muted">更新</Text> : null}

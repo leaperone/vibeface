@@ -64,6 +64,17 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.equal(inboxItems(unverified).some((item) => item.kind === 'setup'), false, 'unverified login does not require setup')
 })
 
+test('a synced list receipt hides only its ordinary question and leaves approvals and new questions visible', () => {
+  const state = source(false)
+  const held = question('held')
+  held.about = { ...held.about, request_id: 'request' }
+  held.attention = { kind: 'approval', device_id: 'node' }
+  state.workspace.questions = [question('old'), held, question('new')]
+  state.workspace.questions[2].created_at_ms = 2
+  state.workspace.dismissedQuestions = new Set(['["c","old"]'])
+  assert.deepEqual(inboxItems(state).filter((item) => item.kind === 'question').map((item) => item.question.question_id), ['new', 'held'])
+})
+
 test('a different pending recovery gets a fresh confirmation card', () => {
   const current = source(true)
   const recovery = { checkpoint: 'first', effective_at_ms: 1, members: [] }

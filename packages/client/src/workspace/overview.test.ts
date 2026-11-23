@@ -461,3 +461,14 @@ test("overview preparation retains cross-Bot checks for the screen to select", (
     ["attention:overview-check:remote-check", "remote-chat"],
   ])
 })
+
+test("a stale overview cannot put removed inbox questions back on the task page", () => {
+  const old = question(), fresh = { ...old, question_id: "fresh" }
+  const overview = overviewFromWorkspace({ openWorks: [], bots: [], questions: [old, fresh], nodes: [] })
+  for (const terminalCheckPolicy of ["web-filtered", "mobile-inclusive"] as const) {
+    const prepared = prepareOverviewInputs({ openWorks: [], bots: [], questions: [fresh], nodes: [], checks: [], overview,
+      dismissedQuestions: new Set([JSON.stringify([old.conversation_id, old.question_id])]), terminalCheckPolicy, read: true, connected: true })
+    assert.deepEqual(prepared.overview.questions.map(q => q.question_id), ["fresh"])
+    assert.equal(prepared.activities.groups.attention.length, 1)
+  }
+})

@@ -171,6 +171,29 @@ impl Store {
         )
     }
 
+    /// List-only receipts for ordinary questions are shared by every member device.
+    pub fn dismissed_inbox_questions(&self, network: &str) -> Result<Vec<Value>> {
+        let mut statement = self.connection.prepare(
+            "SELECT q.conversation_id,q.question_id FROM questions q
+             JOIN notification_acks a ON a.network_id=q.network_id
+                 AND a.notification_id=q.question_id
+                 AND a.client_id=?2
+             LEFT JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id
+             WHERE q.network_id=?1 AND q.closed IS NULL AND m.message_id IS NULL
+                 AND json_extract(q.body,'$.about.request_id') IS NULL
+                 AND coalesce(json_extract(q.body,'$.attention.kind'),'question')='question'
+                 AND NOT EXISTS (SELECT 1 FROM json_each(q.body,'$.choices') choice WHERE json_type(choice.value,'$.action') IS NOT NULL)
+             ORDER BY q.rank",
+        )?;
+        let rows = statement
+            .query_map(
+                params![network, crate::model::QUESTION_INBOX_CLIENT],
+                |row| Ok(json!({"conversation_id": row.get::<_, String>(0)?, "question_id": row.get::<_, String>(1)?})),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// One conversation's questions with their answers, in chat order.
     pub fn conversation_questions(&self, network: &str, scope: &str) -> Result<Vec<Value>> {
         questions_from(

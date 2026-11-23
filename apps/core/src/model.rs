@@ -890,6 +890,8 @@ impl BotChange {
 
 /// The `client_id` of an ack that closes a failed work in 待处理; see `NotificationAcked`.
 pub const INBOX_CLIENT: &str = "inbox";
+/// List-only question receipts are separate from failed-work acknowledgements.
+pub const QUESTION_INBOX_CLIENT: &str = "inbox-question";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

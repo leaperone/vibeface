@@ -2735,13 +2735,16 @@ impl Runtime {
 
     pub(super) async fn questions(&self, access: &Access) -> Result<Value> {
         let network = access.network_id().to_owned();
-        let questions = self
+        let (questions, dismissed_questions) = self
             .store
             .read("triage.questions", move |store| {
-                store.unanswered_questions(&network)
+                Ok((
+                    store.unanswered_questions(&network)?,
+                    store.dismissed_inbox_questions(&network)?,
+                ))
             })
             .await?;
-        Ok(json!({"questions":questions}))
+        Ok(json!({"questions":questions, "dismissed_questions":dismissed_questions}))
     }
 
     /// The user's answer, signed by their device, to a question in any chat.

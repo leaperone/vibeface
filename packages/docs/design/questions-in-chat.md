@@ -17,6 +17,7 @@
 - 每个问题只有一个回答 ID，由问题 ID 派生。网页、Grok 或重试写的回答都是这一个 ID，所以“已回答”是一个事实。普通问题只排一次后续轮，live 请求只保存一项控制。两端同时写下不同文字时 rank 小者胜，输方把自己的回答换成“已由另一端回答：<胜者文字>”，不让它悄悄消失。回答的 `author` 不是本设备时（另一台设备签名的回答，或 Grok 经入口电脑写下的回答），网页和手机也显示“已由另一端回答”，卡片重新挂载后不丢；只有输掉竞争时才用警告样式。
 - Grok 经现有 webhook 发件箱收到同一个问题，经现有 `POST /api/decision` 回答，落成聊天里的同一条回答。任一侧回答后，提问方 Node 再经发件箱通知 Grok 已回答。
 - 任务页的待处理分区列出全部会话里未回答的问题，可以就地回答，并能跳到对应聊天。
+- 待处理页可批量移除当前可见的普通未回答问题；这只写入按网络、会话和问题 ID 区分的同步私有列表回执，不回答、不改聊天、不关闭问题，也不处理挂起审批。单卡“忽略”仍是给 Bot 的“忽略”回答，两者独立。
 
 ## 2. 会话归属
 
@@ -135,6 +136,7 @@ Agent 侧（CLI → `/api/triage`）：
 用户侧 RPC：
 
 - `questions`：全网未回答问题，含所属会话与 Bot 名。
+- `dismiss_question { conversation_id, question_id, attestation }`：只为普通未回答问题写入待处理的私有列表回执；回执按网络、会话和问题 ID 区分并同步到其他设备，不能回答、关闭或改变聊天。
 - `answer { question_id, text, attestation }`：写回答消息。普通问题按原目标准入 Answer 轮或转交调度 Node；挂起的原生请求走独立控制队列，基础审批不新建普通 Answer 轮。同一问题已有不同回答时返回已有回答，`status = "already_answered"`。
 - `conversation` 快照新增 `questions`（含回答）和 `sessions`（归给本 Bot 的外来会话 `{node, agent, session_id, cwd, summary, muted, created_at_ms}`）。
 - `bots` 返回 `primary`，即主 Bot 的会话 ID，没有 Bot 时为 `null`。

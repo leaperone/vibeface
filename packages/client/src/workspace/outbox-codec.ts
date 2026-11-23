@@ -8,7 +8,7 @@ import { attachmentLimit, parseInputReceipt, parseWorkspaceCommandNotSaved } fro
 import { parseAttestation, parseWriteRequest, writeBody, writeKeySuffix, ownerBody, type WriteMethod } from './write-request.ts'
 import { inputTargetKey } from '../chat/protocol.ts'
 
-const methods: readonly WriteMethod[] = ['message', 'workspace_command', 'control_memory', 'ack', 'create_bot', 'delete_bot', 'set_primary_bot', 'set_bot_project', 'set_bot_avatar', 'control_schedule', 'set_owner', 'dismiss_work', 'answer', 'resolve']
+const methods: readonly WriteMethod[] = ['message', 'workspace_command', 'control_memory', 'ack', 'create_bot', 'delete_bot', 'set_primary_bot', 'set_bot_project', 'set_bot_avatar', 'control_schedule', 'set_owner', 'dismiss_work', 'dismiss_question', 'answer', 'resolve']
 function fail(): never { throw new OutboxCorruptError() }
 const own = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key)
 function keys(data: Record<string, unknown>, required: string[], optional: string[] = []) {

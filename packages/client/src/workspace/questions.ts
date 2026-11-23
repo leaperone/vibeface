@@ -4,6 +4,9 @@ import type { BotRecord, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } fr
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
 
+/** Stable key for the private, network-synchronised 待处理 receipt. */
+export const questionInboxKey = (conversationId: string, questionId: string) => JSON.stringify([conversationId, questionId])
+
 /** The message the Node writes for an answer, exactly as this browser signs it. */
 export function answerBody(questionId: string, text: string) {
   return { type: "message_posted", message_id: answerId(questionId), role: "user", text, report_results: true, answers: questionId }
@@ -38,6 +41,13 @@ export const answerLabel = (answer: string) => answer.trim() === ignoredAnswer ?
 
 /** Nobody answered it and the device that asked did not close it. */
 export const questionOpen = (question: Question) => question.answer === null && question.closed === null
+
+/** Only ordinary questions can be removed from the list without changing the chat or request state. */
+export const questionInboxDismissible = (question: Question) => questionOpen(question)
+  && question.about.request_id === undefined
+  && question.attention?.kind !== 'approval'
+  && question.attention?.kind !== 'browser_takeover'
+  && question.choices.every((choice) => choice.action === undefined)
 
 /** Still waiting on the person: open, and answered neither from this device (`answered`) nor in the chat (`folded`). */
 export const awaitsAnswer = (question: Question, answered: Readonly<Record<string, string>>, folded?: ReadonlyMap<string, string>) =>

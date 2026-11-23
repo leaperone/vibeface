@@ -21,6 +21,7 @@ impl Action {
             | Self::Schedule { .. }
             | Self::SetOwner { .. }
             | Self::DismissWork { .. }
+            | Self::DismissQuestion { .. }
             | Self::Unanswered { .. }
             | Self::Answer { .. }
             | Self::CreateBot { .. }
@@ -78,6 +79,7 @@ enum RpcPolicy {
     ControlSchedule {},
     SetOwner {},
     DismissWork {},
+    DismissQuestion {},
     ReplyUnanswered {},
     DismissUnanswered {},
     Answer {},
@@ -133,6 +135,7 @@ pub(super) fn stored_policy(operation: &Operation) -> Result<ActionPolicy> {
                     | RpcPolicy::ControlSchedule {}
                     | RpcPolicy::SetOwner {}
                     | RpcPolicy::DismissWork {}
+                    | RpcPolicy::DismissQuestion {}
                     | RpcPolicy::ReplyUnanswered {}
                     | RpcPolicy::DismissUnanswered {}
                     | RpcPolicy::Answer {}
