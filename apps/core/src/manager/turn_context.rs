@@ -101,6 +101,7 @@ impl<'a> TurnExecutionContext<'a> {
             self.config.tool_cli.as_deref(),
             &self.config.custom_tools,
             &self.config.instructions,
+            self.config.restricted,
         )
     }
 
