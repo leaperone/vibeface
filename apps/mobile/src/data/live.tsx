@@ -149,7 +149,8 @@ function Live({ children }: { children: ReactNode }) {
   const cached = useMemo(() => localConversations.all({ networkId, deviceId: me ?? '' }), [networkId, me, data, shared.generation])
   // The open conversation shows what the workspace holds, so its stored copy is not projected only to be replaced.
   const replaced = data && conversationId && (shared.dataOrigin === 'cache' || shared.dataOrigin === 'network') ? conversationId : null
-  const conversations: Record<string, Conversation> = Object.fromEntries(cached.filter((record) => record.conversationId !== replaced).map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
+  const cachedConversations = useMemo(() => Object.fromEntries(cached.filter((record) => record.conversationId !== replaced).map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)])), [cached, replaced, shared.pendingMessages])
+  const conversations: Record<string, Conversation> = { ...cachedConversations }
   if (data && conversationId && shared.dataOrigin === 'cache') conversations[conversationId] = cachedConversation({ networkId, deviceId: me ?? '', conversationId, savedAt: cached.find((record) => record.conversationId === conversationId)?.savedAt ?? Date.now(), payload: data }, shared.pendingMessages)
   // Live progress re-renders this far more often than the conversation itself changes.
   const shown = useMemo(() => {

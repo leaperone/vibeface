@@ -30,12 +30,13 @@ import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { DropdownMenu } from '@vibeface/uiarc/dropdown-menu/dropdown-menu.tsx'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
-import { useEffect,useRef,useState,type ReactNode,type RefObject } from 'react'
+import { useEffect,useMemo,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
 import type { ChatMessage } from './elements/message'
 import { HistoryControls } from './history-controls'
 
+const emptyList: never[] = []
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
@@ -81,7 +82,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== selectedTarget || draftRef.current.intent !== selectedIntent || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: selectedTarget, intent: selectedIntent, conversationId }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
-  const jobs = data?.scheduler?.jobs ?? []
+  const jobs = data?.scheduler?.jobs ?? emptyList
   const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const checks = pendingChecks(data, workspace.nodes, conversationId)
@@ -114,16 +115,16 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   })
   const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && !(task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)) && (taskActive(task.state) || task.state === 'awaiting_children')).length
 
-  const changes = data?.changes ?? []
-  const placedChanges = placeChanges(data?.messages ?? [], changes)
+  const changes = data?.changes ?? emptyList
+  const placedChanges = useMemo(() => placeChanges(data?.messages ?? [], changes), [data?.messages, changes])
 
   // Questions sit where they were asked; an answer shows inside its question.
-  const questions = data?.questions ?? []
-  const folded = foldAnswers(data?.messages ?? [], questions)
-  const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
-  const timeline = chatTimeline(data?.messages ?? [], [
+  const questions = data?.questions ?? emptyList
+  const folded = useMemo(() => foldAnswers(data?.messages ?? [], questions), [data?.messages, questions])
+  const merged = useMemo(() => new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome])), [jobs])
+  const timeline = useMemo(() => chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-  ], merged)
+  ], merged), [data?.messages, questions, workspace.answered, folded, merged])
 
   // 重试 sits on the newest reply when it failed or was stopped; it reads the conversation again first and words what it sends by what the reply may have done.
   const newest = data?.messages.at(-1)

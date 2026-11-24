@@ -7,6 +7,7 @@ type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "
 
 /** Only actual unread replies; completion is separate from any verification stated inside them. */
 export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readonly ManagerJob[], fresh: ReadonlySet<string>) {
+  if (!fresh.size) return []
   const seen = new Set<string>()
   return messages.filter((message) => {
     if (message.role !== 'assistant' || !fresh.has(message.event_hash) || seen.has(message.event_hash)) return false
