@@ -66,7 +66,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
-  const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
+  const [selectedMainTarget, setSelectedTarget] = useState('main')
+  const selectedTarget = routeRoutine ? `routine:${routeRoutine}` : selectedMainTarget
   const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
   const [activityOpen, setActivityOpen] = useState(false)
   // The control that opened the activity drawer gets focus back, or the header button once it is gone, unless a link in it navigated away.
@@ -225,7 +226,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // This screen stays mounted, hidden, on other routes, so leaving this chat or route closes the drawer and drops its focus return.
   useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
-  useEffect(() => { setSendError(null); setFiles([]); setSelectedIntent(null); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
+  useEffect(() => { setSendError(null); setFiles([]); setSelectedIntent(null); setSelectedTarget('main') }, [conversationId])
+  useEffect(() => { if (routeRoutine) setSelectedTarget('main'); setSelectedIntent(null) }, [routeRoutine])
   const location = useHistoryLocation({ workspace, active, focus: routeRoutine ? null : routeMessage, found: entries.some((entry) => entry.key === routeMessage || 'message' in entry && entry.message.message_id === routeMessage) })
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
@@ -252,7 +254,9 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   }
   const chooseInput = (target: string, intent: InputIntent | null) => {
     if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.generation !== generation) return
+    if (target !== selectedTarget && savingDrafts.current.has(draft)) { setSendError(new Error('草稿正在保存，完成后再切换目标。')); return }
     setSelectedTarget(target); setSelectedIntent(intent)
+    if (routeRoutine && target !== selectedTarget && bot) void navigate({ to: '/b/$botId', params: { botId: bot.bot_id }, search: {}, replace: true }).catch(setSendError)
   }
   const setText = (value: string) => setDrafts((current) => { const next = new Map(current).set(conversationId, value); draftStorage.writeStorage(draftKey, Object.fromEntries(next)); return next })
 
@@ -339,7 +343,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" onClick={() => setSelectedTarget('main')}>改回主聊天</Button></p> : null}
+        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main', null)}>改回主聊天</Button></p> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>

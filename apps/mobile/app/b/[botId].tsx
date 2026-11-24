@@ -148,7 +148,8 @@ export default function ChatScreen() {
   const intentMenuOwner = useRef(intentMenu)
   intentMenuOwner.current = intentMenu
   const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
-  const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
+  const [selectedMainTarget, setSelectedTarget] = useState('main')
+  const selectedTarget = routine ? `routine:${routine}` : selectedMainTarget
   const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
   const draftScopeKey = JSON.stringify(draftScope)
   const draft = useChatDraftOwner(draftScope)
@@ -157,7 +158,8 @@ export default function ChatScreen() {
   const savingDrafts = useRef(new Set<string>())
   const currentScope = useRef(draftScopeKey)
   currentScope.current = draftScopeKey
-  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null); setIntentMenu(null) }, [id, routine])
+  useEffect(() => { setSelectedTarget('main'); setSelectedIntent(null); setIntentMenu(null) }, [id])
+  useEffect(() => { if (routine) setSelectedTarget('main'); setSelectedIntent(null); setIntentMenu(null) }, [routine])
   const [routeFocused, setRouteFocused] = useState(false)
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; setRouteFocused(true); const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; setRouteFocused(false); intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
@@ -263,8 +265,11 @@ export default function ChatScreen() {
     const text = latestDraft.current.view().text
     latestDraft.current.changeText(`${text ? `${text}\n\n` : ''}> ${message.text.replace(/\n/g, '\n> ')}\n\n`)
   }, [])
-  const readAttachment = useCallback<ReadAttachment>((attachment, offset) => latestLive.current
-    ? latestLive.current.readArtifactBytes(attachment.hash, offset, id) : Promise.reject(new Error('连上后可读取')), [id])
+  const readAttachment = useCallback<ReadAttachment>((attachment, offset) => {
+    const current = latestLive.current
+    if (!current || !current.isCurrent() || current.generation !== liveGeneration || current.conversationId !== id) return Promise.reject(new Error('对话或连接已切换，请从原记录重新打开附件。'))
+    return current.readArtifactBytes(attachment.hash, offset, id)
+  }, [id, liveGeneration, workspace.networkId, workspace.deviceId])
   const attachmentScope = useMemo(() => JSON.stringify([workspace.networkId, workspace.deviceId, id]), [workspace.networkId, workspace.deviceId, id])
   const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
   // 重试 on the newest reply once it failed or was stopped, as on the web.
@@ -290,6 +295,7 @@ export default function ChatScreen() {
   const changeTarget = async (inputTarget: string) => {
     const scope = draftScopeKey
     const current = () => routeActive.current && currentScope.current === scope && latestLive.current?.generation === liveGeneration
+    if (savingDrafts.current.has(scope)) throw new Error('草稿正在保存，完成后再切换目标。')
     const snapshot = await draft.flush()
     if (!current()) return
     if (snapshot.text || snapshot.files.length) {
@@ -308,7 +314,10 @@ export default function ChatScreen() {
         })
       } finally { lease.release() }
     }
-    if (current()) { setSelectedTarget(inputTarget); setSelectedIntent(null) }
+    if (current()) {
+      setSelectedTarget(inputTarget); setSelectedIntent(null)
+      if (routine && inputTarget !== selectedTarget) router.setParams({ routine: undefined, notification: undefined, message: undefined })
+    }
   }
   const intentOptions = [
     ...inputIntents.map((item) => ({ text: item.label, action: () => setSelectedIntent(item.intent) })),
@@ -382,7 +391,7 @@ export default function ChatScreen() {
     }} />
     <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
-    {routine ? <RoutineRecord workspace={live} botId={bot.bot_id} conversationId={id} trigger={routine} notificationId={notification ?? null} /> : <FlatList
+    {routine ? <RoutineRecord workspace={live} botId={bot.bot_id} conversationId={id} trigger={routine} notificationId={notification ?? null} attachmentScope={attachmentScope} readAttachment={read} /> : <FlatList
       key={id}
       ref={list}
       data={rows}
@@ -471,7 +480,7 @@ export default function ChatScreen() {
           {sendError ? <ErrorText error={sendError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
-            <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
+            <Button variant="ghost" size="sm" onPress={() => { void changeTarget('main').catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) }}><Text>改回主聊天</Text></Button>
           </View> : null}
         </> : null}
         </DraftComposer>
@@ -481,12 +490,12 @@ export default function ChatScreen() {
 }
 
 
-function RoutineRecord({ workspace, botId, conversationId, trigger, notificationId }: { workspace: ReturnType<typeof useLive>; botId: string; conversationId: string; trigger: string; notificationId: string | null }) {
+function RoutineRecord({ workspace, botId, conversationId, trigger, notificationId, attachmentScope, readAttachment }: { workspace: ReturnType<typeof useLive>; botId: string; conversationId: string; trigger: string; notificationId: string | null; attachmentScope: string; readAttachment: ReadAttachment | undefined }) {
   const record = useNotificationRecord({ workspace, conversationId, target: { kind: 'routine', bot_id: botId, trigger }, notificationId })
   const bot = workspace?.bots.find((bot) => bot.bot_id === botId)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-32" accessibilityLabel="原例行记录">
     <Text role="heading" className="text-sm font-medium">{scheduleName(trigger, workspace?.data?.bot_settings, workspace?.data?.changes)}</Text>
-    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : bot ? <Message message={record.content.message} bot={bot} offline={!workspace?.connectionOnline} attachmentScope={JSON.stringify([conversationId, trigger])} /> : null : <Text role="status" className="text-sm text-muted">{record.text}</Text>}
+    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : bot ? <Message message={record.content.message} bot={bot} offline={!workspace?.connectionOnline} attachmentScope={attachmentScope} readAttachment={readAttachment} /> : null : <Text role="status" className="text-sm text-muted">{record.text}</Text>}
     {record.kind === 'failed' ? <Button variant="secondary" onPress={record.retry}><Text>重新读取原记录</Text></Button> : null}
   </ScrollView>
 }

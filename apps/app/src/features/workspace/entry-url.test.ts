@@ -49,6 +49,7 @@ import { notificationOpenings } from '../../../../../apps/mobile/src/platform/no
 import type { NotificationDestination } from '@vibeface/client/lib/platform.ts'
 import { hookHarness, moduleLoader } from '../../lib/test-harness.ts'
 import { cn } from '../../lib/utils.ts'
+import { attachmentSize, validAttachment, downloadAttachment } from '../../../../../apps/mobile/src/platform/chat-attachments.ts'
 import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-drafts.ts'
 import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
 import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
@@ -3007,7 +3008,7 @@ function findActionProps(node: unknown, label: string): Record<string, unknown> 
   return undefined
 }
 
-function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}, search: Record<string, string> = {}) {
+function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}, search: Record<string, string> = {}, navigate: (target: unknown) => Promise<void> = async () => {}) {
   const chatGlobals = {
     setInterval: () => 1, clearInterval() {},
     matchMedia: () => ({ matches: false }),
@@ -3019,7 +3020,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     },
   }
   const app = componentHarness('../chat/conversation-screen.tsx', {
-    '@tanstack/react-router': { useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname: '/b/bot', search } }) },
+    '@tanstack/react-router': { useNavigate: () => navigate, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname: '/b/bot', search } }) },
     '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) },
     '@/lib/glossary': { terms: { inbox: { label: '待处理', icon: 'InboxIcon' }, undelivered: { icon: 'UndeliveredIcon' }, approval: { icon: 'ApprovalIcon' } } },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
@@ -5755,6 +5756,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
     'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
     '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatUpdates, messageTimes: () => new Map() },
+    '@vibeface/client/lib/node.ts': { messageOf, providerNames },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
     '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
@@ -7269,4 +7271,111 @@ test('focused history does not restart a failure after an empty scan advanced it
     assert.equal(reads, 1)
     assert.equal(render().kind, 'failed')
   } finally { app.close() }
+})
+
+
+test('leaving routine view clears its route and preserves the next Web send draft and target', async () => {
+  for (const action of ['改回主聊天', '回到主聊天', '补充：核对项目']) {
+    const search: Record<string, string> = { routine: 'schedule:check:1000', notification: 'notice', message: 'question:q-routine' }
+    const sends: { text: string; files: unknown; options: InputOptions }[] = []
+    const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, view: 'chat', sendMessage: async (text: string, files: unknown, _sent: unknown, options: InputOptions) => { sends.push({ text, files, options }); return true } }
+    shared.data = parseConversation({ ...context, works: [parityWork()] })
+    const app = conversationHarness(() => shared, {}, search, async (value) => { const target = workspaceModel.record(value); assert.deepEqual(JSON.parse(JSON.stringify(target.search)), {}); for (const key of Object.keys(search)) delete search[key] })
+    const composer = () => app.composer()
+    try {
+      assert.ok(app.render().some(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord'))
+      const change = composer()?.onChange, attach = composer()?.onFiles; assert.ok(typeof change === 'function' && typeof attach === 'function')
+      change('切回后保留的草稿'); const files = [{ name: 'draft.txt', arrayBuffer: async () => new Uint8Array([1, 2]).buffer }]; attach(files)
+      if (action === '改回主聊天') { const click = app.render().find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onClick; assert.ok(typeof click === 'function'); click() }
+      else { const menu = app.render().find(({ type }) => type === 'DropdownMenu'); const items = workspaceModel.record(menu?.props).items; assert.ok(Array.isArray(items)); const choice = items.map(workspaceModel.record).find((item) => item.label === action)?.onSelect; assert.ok(typeof choice === 'function'); choice() }
+      await settleComponent(); const elements = app.render()
+      assert.deepEqual(search, {})
+      assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord'), false)
+      assert.ok(elements.some(({ type }) => type === 'Chat'))
+      assert.equal(composer()?.value, '切回后保留的草稿'); assert.equal(composer()?.files, files)
+      const send = composer()?.onSubmit; assert.ok(typeof send === 'function'); send(); await settleComponent()
+      assert.equal(sends[0]?.text, '切回后保留的草稿'); assert.equal(sends[0]?.files, files)
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), action.startsWith('补充：') ? { kind: 'work', work_id: 'work' } : { kind: 'bot_main', bot_id: 'bot' })
+    } finally { app.app.close() }
+  }
+})
+
+test('native routine exit preserves scoped drafts and attachments and clears route state before the next send', async () => {
+  for (const os of ['ios', 'android']) for (const action of ['改回主聊天', '回到主聊天', '补充：核对项目']) {
+    const route: { botId: string; routine?: string; notification?: string; message?: string } = { botId: 'bot', routine: 'schedule:check:1000', notification: 'notice', message: 'question:q-routine' }
+    const sends: { text: string; names: string[]; options: InputOptions }[] = []
+    const shared = { ...parityShared(), fresh: new Set<string>() }; shared.data = parseConversation({ ...context, works: [parityWork()] })
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = { origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
+    const workspace = { networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat: conversation }, members: [], actions: { open() {}, async send(_id: string, text: string, files: { name: string }[], options: InputOptions) { sends.push({ text, names: files.map((file) => file.name), options }); return true } } }
+    class File { uri: string; constructor(uri: string) { this.uri = uri } async arrayBuffer() { return new Uint8Array([1, 2]).buffer } }
+    const app = nativeChatHarness(os, { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => route, useRouter: () => ({ setParams: (params: typeof route) => Object.assign(route, params) }) }, 'expo-file-system': { File }, '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } })
+    const composer = () => app.render('default').find(({ type }) => type === 'Composer')!.props
+    const choose = () => {
+      if (action === '改回主聊天') { const click = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onPress; assert.ok(typeof click === 'function'); click() }
+      else { const target = workspaceModel.record(workspaceModel.record(composer().target).props).onPress; assert.ok(typeof target === 'function'); target(); const click = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onPress; assert.ok(typeof click === 'function'); click() }
+    }
+    try {
+      const mainScope = { networkId: 'network', deviceId: 'phone', conversationId: 'chat', inputTarget: 'main' }
+      const existing = await app.drafts.write(mainScope, { text: '原主聊天草稿', files: [] })
+      const change = composer().onChange, attach = composer().onPickFiles; assert.ok(typeof change === 'function' && typeof attach === 'function')
+      change('例行中的新草稿'); attach([{ uri: 'file:///draft.txt', name: 'draft.txt', size: 2, mimeType: 'text/plain', async arrayBuffer() { return new Uint8Array([1, 2]).buffer }, async text() { return 'ok' }, dispose() {} }]); await settleComponent()
+      if (!action.startsWith('补充：')) {
+        choose(); await settleComponent()
+        assert.equal(route.routine, 'schedule:check:1000', 'a destination draft keeps the original routine view and target')
+        assert.equal(composer().value, '例行中的新草稿')
+        assert.match(String(app.render('default').find(({ type }) => type === 'ErrorText')?.props.error), /目标已有草稿/)
+        await app.drafts.clear(mainScope, existing)
+      }
+      choose(); await settleComponent(); const elements = app.render('default')
+      assert.equal(route.routine, undefined); assert.equal(route.notification, undefined); assert.equal(route.message, undefined)
+      assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord'), false)
+      assert.ok(elements.some(({ type }) => type === 'FlatList'))
+      assert.equal(composer().value, '例行中的新草稿'); const selected = composer().files; assert.ok(Array.isArray(selected)); assert.equal(selected.length, 1)
+      const send = composer().onSend; assert.ok(typeof send === 'function'); send(); await settleComponent()
+      assert.equal(sends[0]?.text, '例行中的新草稿'); assert.deepEqual(sends[0]?.names, ['draft.txt'])
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), action.startsWith('补充：') ? { kind: 'work', work_id: 'work' } : { kind: 'bot_main', bot_id: 'bot' })
+    } finally { app.close() }
+  }
+})
+
+
+test('routine attachment clicks download uncached bytes in the original conversation and isolate network caches', { timeout: 5000 }, async () => {
+  const bytes = new TextEncoder().encode('routine attachment')
+  const file = { hash: await byteCodec.sha256Hex(bytes), size: bytes.length, name: 'result.txt' }
+  const message = { message_id: 'routine-result', event_hash: 'event', role: 'assistant', text: '例行结果附件', created_at_ms: 1, attachments: [file] }
+  const reads: { network: string; conversationId: string | undefined; hash: string; offset: number }[] = []
+  const workspace = { networkId: 'network-a', deviceId: 'phone', bots: [parityBot], conversations: {}, members: [], actions: { open() {} } }
+  const shared = { ...parityShared(), readNotificationRecord: async () => ({ kind: 'message' as const, message }), async readArtifactBytes(hash: string, offset: number, conversationId?: string) { reads.push({ network: workspace.networkId, conversationId, hash, offset }); return { bytes, next_offset: null, size: bytes.length } } }
+  const screen = nativeChatHarness('ios', { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', routine: 'schedule:check:1000', notification: 'notice' }) }, '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } })
+  const record = componentHarness('../../../../../apps/mobile/app/b/[botId].tsx', { '@vibeface/client/workspace/bot-settings.ts': { scheduleName }, 'uniwind': { withUniwind: (value: unknown) => value } }, {}, 'RoutineRecord')
+  const caches = new Map<string, Uint8Array>(), opened: string[] = []
+  let completed = pendingResult()
+  const attachment = componentHarness('../../../../../apps/mobile/src/features/chat/attachments.tsx', {
+    '@/platform/chat-attachments': { attachmentSize, validAttachment },
+    '@/platform/native-chat-attachments': { async localAttachment(scope: string, selected: typeof file, read?: Parameters<typeof downloadAttachment>[1]) {
+      if (!caches.has(scope)) { if (!read) throw new Error('尚未下载'); caches.set(scope, await downloadAttachment(selected, read)) }
+      return { uri: `file:///fixture/${scope}`, image: false, mimeType: 'text/plain' }
+    }, async shareAttachment(local: { uri: string }) { opened.push(local.uri); completed.resolve(undefined) } },
+  }, {}, 'MessageAttachment')
+  const props = () => screen.render('default').find(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord')!.props
+  const contents = async () => { const product = props(); record.render('RoutineRecord', product); await settleComponent(); const output = record.render('RoutineRecord', product).find(({ type }) => type === 'Message'); assert.ok(output); return output.props }
+  try {
+    let oldRead: unknown = null
+    for (const network of ['network-a', 'network-b']) {
+      workspace.networkId = network; if (network === 'network-b') shared.generation++
+      const product = await contents()
+      assert.equal(product.attachmentScope, JSON.stringify([network, 'phone', 'chat']))
+      assert.ok(typeof product.readAttachment === 'function')
+      if (network === 'network-a') oldRead = product.readAttachment
+      else { assert.ok(typeof oldRead === 'function'); await assert.rejects(oldRead(file, 0), /连接已切换/); assert.equal(reads.length, 1, 'an old route callback cannot read the new network') }
+      const shown = attachment.render('MessageAttachment', { file, scope: product.attachmentScope, read: product.readAttachment })
+      const click = shown.find(({ props }) => String(props.accessibilityLabel).startsWith('打开附件'))?.props.onPress
+      assert.ok(typeof click === 'function'); completed = pendingResult(); click(); await completed.promise
+      assert.equal(reads.length, network === 'network-a' ? 1 : 2)
+      assert.equal(reads.at(-1)?.network, network); assert.equal(reads.at(-1)?.conversationId, 'chat')
+      assert.equal(reads.at(-1)?.hash, file.hash); assert.equal(reads.at(-1)?.offset, 0)
+    }
+    assert.equal(caches.size, 2, 'the same attachment in two networks has separate verified copies')
+    assert.equal(opened.length, 2)
+  } finally { screen.close(); record.close(); attachment.close() }
 })
