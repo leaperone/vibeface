@@ -1926,6 +1926,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const react = {
     ...hooks.react,
     lazy: () => 'Lazy', Suspense: 'Suspense',
+    memo: (component: unknown) => component,
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useLayoutEffect: hooks.react.useEffect,
@@ -3857,7 +3858,12 @@ function taskOverviewHarness(
   })
   return {
     app,
-    render: () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen'),
+    render: () => {
+      const elements = app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+      // The native rows come from the list's renderItem, which no renderer calls here.
+      for (const { props } of elements.filter(({ type }) => type === 'FlatList')) (props.data as unknown[]).forEach((item, index) => (props.renderItem as (info: unknown) => unknown)({ item, index }))
+      return elements
+    },
     cardName: platform === 'web' ? 'TaskOverviewCard' : 'TaskRow',
     mastheadName: platform === 'web' ? 'TaskRunSummary' : 'MobileMasthead',
   }
