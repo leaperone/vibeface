@@ -22,6 +22,8 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
   }
   const pending = unsaved.get(key)
   const owner = { scope, snapshot, text: pending?.typed() ? pending.text : snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>(), timer: null as ReturnType<typeof setTimeout> | null, typed: () => true }
+  // Adopted typing is still unwritten: it keeps its erase lease and is written like any other typing.
+  if (owner.text !== snapshot.text && pending) { owner.typed = pending.typed; owner.timer = setTimeout(() => draft.save(), saveDelay) }
   let view: DraftView = { snapshot, text: owner.text, files: owner.files, error: failure }
   const listeners = new Set<() => void>()
   const setView = (next: DraftView | ((previous: DraftView) => DraftView)) => {
