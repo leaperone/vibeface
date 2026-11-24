@@ -68,6 +68,10 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       ]} />
     </> : null}
     {empty === 'unreachable' && !bots.length ? null : <OfflineBar className="mx-1 mb-2 mt-1" />}
+    {shared?.error ? <View className="mx-1 mb-2 gap-1">
+      <ErrorText error={shared.error.text} />
+      {shared.error.retry ? <Button variant="ghost" size="sm" className="self-start" onPress={shared.error.retry}><Icon as={RotateCw} /><Text>重试</Text></Button> : null}
+    </View> : null}
     {waiting ? <Item key="pending" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/tasks" replace={replace} asChild>
         <Pressable accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-panel border px-3 py-2.5 active:bg-surface-muted', device.pendingRecovery ? 'border-danger-border bg-danger-subtle' : 'border-warning-border bg-warning-subtle', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>

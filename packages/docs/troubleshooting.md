@@ -58,7 +58,8 @@ Node 每分钟检查以下问题。连续两轮都发现才算问题出现，只
 | `work_stalled` | `work.stalled`（warn） | `work.recovered` | 运行中的工作超过 10 分钟没有任何进展事件，带 `work_id`、`conversation_id` |
 | `work_looping` | `work.looping`（warn） | `work.loop_ended` | 运行中的 Codex 工作在最近 5 分钟连续完成 6 次相同调用和相同结果，或连续 6 次明确工具失败；普通进度不会清除证据。重复通知不计数，换轮或窗口过期后重置。只保存有界摘要，参数和原始结果不进入健康状态或日志；不自动中断或重试 |
 | `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 在 10 秒内没有回应只读探测；不重启、不重发。App Server 未连接时这一轮不检查，保持上一轮的结论 |
-| `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 对端可连通但最近一次同步完成已超过 10 分钟，带 `peer` |
+| `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 本机与对端的连接还在，或最近一次同步成功，但超过 10 分钟没有完成同步，带 `peer`。连接还在而每次同步都失败、启动以来一次都没同步成功的对端也算；连接断开且同步失败的对端按离线处理，不算。10 分钟从最近一次同步成功、本机第一次看到这次连接和最近一次附件进展中最晚的那个算起，所以重新连上或下载大附件时仍有完整的 10 分钟 |
+| `job_stalled` | `job.stalled`（warn） | `job.recovered` | 一轮回复在排队、steer、领取、取消或对账中停在同一状态超过 30 分钟，从本机第一次看到它处于这个状态时算起，带 `job`（`会话 ID:trigger`）、`conversation_id`。运行中的一轮由运行超时和工作检查负责，不在此列；有轮次在运行时排队等待不算，在等待处理项的、健康提醒自己的一轮也不算 |
 
 循环检测比较 Codex 命令、MCP 和动态工具的完整调用与结果；文件变更只统计明确失败。缺少完整结果或本机证据超过 64 KiB 时不比较相等，仍可统计明确失败。其他 Provider 保留原有停滞检查。
 
@@ -66,11 +67,11 @@ Node 每分钟检查以下问题。连续两轮都发现才算问题出现，只
 
 输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
 
-新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`。只读沙箱只防误写，不是安全边界：Shell 仍能读本机文件、访问网络（Node 工具经本机回环调用），也能连本机的 Node 维护 socket 和 Codex App Server socket 间接写入，挡不住日志内容里的提示注入；Bot 线程已被其他订阅者加载时，网页搜索和 Shell 环境可能沿用线程原有设置，只有沙箱每轮下发；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。没有主 Bot、未开启 **运行 Bot** 或本机不可写时只记日志。
+新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`。只读沙箱只防误写，不是安全边界：Shell 仍能读本机文件、访问网络（Node 工具经本机回环调用），也能连本机的 Node 维护 socket 和 Codex App Server socket 间接写入，挡不住日志内容里的提示注入；Bot 线程已被其他订阅者加载时，网页搜索和 Shell 环境可能沿用线程原有设置，只有沙箱每轮下发；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。提醒没写成时（被上限挡住、没有主 Bot、未开启 **运行 Bot**、本机不可写、不是调度主 Bot 的 Node 或写入失败），问题还在就每轮再试，直到写成或问题消失；只有第一次尝试记 `health.handoff_limited`、`health.no_primary_bot`、`health.not_owner` 或 `health.handoff_failed`，之后的重试只记 debug。
 
 其他设备的 Node 只能为主 Bot 写本人消息引出的设置改动，没有不冒充本人就能让主 Bot 开始一轮的路径，所以它们发现的问题只记 `health.not_owner`，不占上限名额。要处理这类问题，在那台设备上看 `vibeface health`，或连接它导出诊断包。
 
-`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次，且这条提醒最后一次变更仍是 Node 写的那次、仍是一次性提醒；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_logs` 一次最多返回 32000 字节，每条的说明截到前 2000 个字符，过大的 `fields` 换成 `{truncated: true, prefix}`；更早的记录放不下时结果带 `truncated: true` 和不透明的 `cursor`，带同样的筛选条件把它作为下次调用的 `cursor` 接着往前读，同一毫秒的记录也不重不漏。时钟回拨后写入的记录多于一次读取的窗口时，回拨前那些时间更晚的记录可能读不到。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
+`read_logs` 和 `read_health` 只提供给主 Bot，并且只在两种轮次可用：管理设备上本人发的消息开启的轮次，或本机 Node 写的健康提醒开启的轮次，且这条提醒最后一次变更仍是 Node 写的那次、仍是一次性提醒；其他轮次调用会被拒绝。它们读的都是执行这一轮的设备自己的日志和健康状态，不能读其他设备的：Node 之间没有读取对端日志的通道。`read_logs` 一次最多返回 32000 字节，每条的说明截到前 2000 个字符，过大的 `fields` 换成 `{truncated: true, prefix}`；匹配的记录多于 `limit` 或更早的记录放不下时结果带 `truncated: true` 和不透明的 `cursor`，带同样的筛选条件把它作为下次调用的 `cursor` 接着往前读，同一毫秒的记录也不重不漏。时钟回拨后写入的记录多于一次读取的窗口时，回拨前那些时间更晚的记录可能读不到。`read_health` 里每台对端只给连通情况和最近同步时间，与 `nodes` 工具给 Agent 的口径一致，不含路径、往返时间和断线统计。
 
 Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原因。`status` 经数据目录里的私有维护 socket 查询，不需要网络，也不需要安装服务。
 
@@ -101,7 +102,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 同一个日志还收这些来源的记录：
 
-- 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话。失败的请求（`web.rpc_failed`）的 `message` 是页面显示给人看的文案，`fields.code` 是 Node 返回的错误码，`fields.cause` 是 Node 或连接层的原始错误文本（最多 500 字符），没有或与文案相同时省略；
+- 浏览器上报未捕获的错误、未处理的 Promise 拒绝、失败的请求和设置等操作，只发给当前连接的那台 Node，要求已加入的设备或本机会话。记录只在页面内存里排队，最多 100 条；发送失败时这一批留在队首，5 秒后（`log_rate_limited` 时一分钟后）随下一条记录再发，重新连上时立即补发，只有 `log_rejected` 才丢弃；结果未知后重发的记录在 Node 上可能出现两次。浏览器和手机掉线后重连的前三轮（启动时的首次连接也算一轮）里，每个没连上的入口记一条 `connection.attempt_failed`，`fields` 有连接方式 `path`、目标 `node`、访问地址、耗时 `elapsed_ms`、第几轮 `attempt`、通道是否已打开 `opened` 和错误码。失败的请求（`web.rpc_failed`）的 `message` 是页面显示给人看的文案，`fields.code` 是 Node 返回的错误码，`fields.cause` 是 Node 或连接层的原始错误文本（最多 500 字符），没有或与文案相同时省略；
 - 手机 App 上报同样的记录（`mobile.uncaught`、`mobile.unhandled_rejection` 等），另记连接阶段的每次变化（`mobile.connection`，`fields` 有 `from`、`to`、连接方式 `path`、目标 `node`、访问地址和断开原因，不含凭证），来源是 `mobile`，`fields.device_id` 同样取认证这条通道的设备。手机先把记录写进本机存储，最多保留最新 300 条，App 重启或崩溃后仍在；每条带 `fields.client_seq`（递增编号）和 `fields.client_ts_ms`（手机上产生的时间），`ts_ms` 仍是 Node 收到的时间。连上 Node 后自动按批补发，Node 确认收下才从手机删去；结果未知（如超时），或 Node 因维护、权限等与这批记录无关的原因拒绝时保留，稍后重发，Node 跳过编号不大于该设备已写入最大编号的记录，所以不会重复。只有 Node 说记录本身无效（`log_rejected`）时这一批才丢弃。有记录被跳过时，Node 回跳过的条数 `skipped`（总是这一批最前面的几条）和写完这一批后的最大编号 `max_seq`。手机在本机存储里记着发出过的最大编号，被跳过的记录都不大于它时就是重发，这一批算送达；有被跳过的记录大于它，或 `max_seq` 不小于手机的下一个编号时，说明手机编号倒退了（如本机存储损坏后重来），Node 这次写下的记录从手机删去，其余保留的记录从 `max_seq + 1` 起重新编号再发，不会把没写入的记录当作已送达。补发遵守下面的额度，超出额度（`log_rate_limited`）时等一分钟再续传。新记录约半秒后写入本机存储；致命崩溃的记录立即写入，过大的记录截短时仍保留 `fields.fatal` 和堆栈开头一段，所以堆栈很长时也立即写入。App 转入后台或失去焦点时，把还在等这半秒的记录立即写入。**设置**的**问题排查**里点**发送日志到节点**立即补发，显示已发送的条数；没连上时连上后自动发送。**报告问题**发出前也先补发，最多等 3 秒；补发的记录在手机当前连接的那台 Node 上，主 Bot 的 `read_logs` 只读它执行那一轮所在 Node 的日志，且要那一轮由管理设备上本人发的消息开启，所以手机连的不是那台 Node 时，主 Bot 读不到这些记录，要在那台 Node 上看。Node 明确回答没写入（维护、额度、权限等）时，这一批不计入发出过的最大编号；只有结果未知时才计入，所以结果未知之后手机编号又倒退时，被跳过的记录仍可能当作重发而算送达。记录里的孤立代理字符在上报前换成 U+FFFD，截短不切开表情等成对字符；Node 解析不了的单个请求只回错误（`log` 回 `log_rejected`，其他回 `invalid_request`），不断开通道。Node 只在内存里记编号，重启时正在发送的那一批可能重复一次；
 - 协调 Agent 和命令行用 `vibeface log <level> <message> [--conversation ID] [--work ID] [--thread ID]` 写一条；`vibeface codex call` 自动记下结果，`vibeface codex send` 与 `dispatch_work` 一样由 Node 记下工作事件；
 - `vibeface update check` 和 `update apply`（含自动更新）像 `vibeface log` 一样经运行中的 Node 记下检查和应用的结果，来源是 `cli`；连不上 Node 时这条结果只在更新器自己的输出里；
