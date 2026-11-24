@@ -179,7 +179,19 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 })
 
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
-  const drainOutbox = async () => { await new Promise(resolve => setTimeout(resolve, 50)) }
+  // Outbox reads verify upload hashes with crypto.subtle on the thread pool, so a fixed sleep alone
+  // races those digests on a loaded runner. Settling also waits until no digest is in flight.
+  const subtle = globalThis.crypto.subtle, digest = subtle.digest
+  let digesting = 0
+  subtle.digest = ((...args: Parameters<SubtleCrypto['digest']>) => {
+    digesting++
+    return digest.apply(subtle, args).finally(() => { digesting-- })
+  }) as SubtleCrypto['digest']
+  t.after(() => { subtle.digest = digest })
+  const drainOutbox = async () => {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    while (digesting) await new Promise(resolve => setTimeout(resolve, 1))
+  }
   const settleComponent = drainOutbox
   const hooks = hookHarness(true), { react, afterRender } = hooks
   const stored = new Map<string, string>()
