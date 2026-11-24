@@ -3866,6 +3866,37 @@ fn post_reply_from(
     Ok(true)
 }
 
+/// The schedule definition this attempt actually admitted, independent of later edits.
+fn recurring_at_basis(connection: &Connection, network: &str, job: &SchedulerJob) -> Result<bool> {
+    let Some((schedule_id, _)) = parse_schedule_trigger(&job.trigger) else {
+        return Ok(false);
+    };
+    let mut query = connection.prepare("SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND kind='bot_changed' AND effective=1 ORDER BY lamport DESC,author DESC,seq DESC")?;
+    let mut rows = query.query(params![network, job.conversation_id])?;
+    while let Some(row) = rows.next()? {
+        let signed: SignedEvent = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let event: Event = serde_json::from_str(&signed.canonical_body)?;
+        if event.seq > job.basis.get(&event.author).copied().unwrap_or(0) {
+            continue;
+        }
+        if let EventBody::BotChanged {
+            change:
+                BotChange::Schedule {
+                    schedule_id: id,
+                    after,
+                    ..
+                },
+            ..
+        } = event.body
+            && id == schedule_id
+        {
+            return Ok(after
+                .is_some_and(|schedule| schedule.depth == 0 && schedule.every_minutes.is_some()));
+        }
+    }
+    Ok(false)
+}
+
 /// Ends the job and writes its bot reply in one transaction. Partial text of a stopped or
 /// interrupted turn is kept with its status.
 #[expect(
@@ -3889,11 +3920,44 @@ fn end_job_from(
         .context("scheduler attempt missing")?
         .clone();
     let attempt_id = attempt.id.clone();
-    ensure!(
-        !matches!(outcome, JobOutcome::NoChange)
-            || (matches!(job.scope, SessionScope::Routine { .. }) && text.trim().is_empty()),
-        "no-change outcome only applies to empty routine replies"
-    );
+    let explicit_no_change = crate::scheduling::routine_no_change(text);
+    let mut outcome = outcome;
+    let mut quiet_failure = None;
+    if matches!(outcome, JobOutcome::NoChange)
+        || matches!(outcome, JobOutcome::Completed) && explicit_no_change
+    {
+        let routine = job.kind == TriggerKind::Schedule
+            && matches!(job.scope, SessionScope::Routine { .. })
+            && recurring_at_basis(connection, network, &job)?;
+        let mut blocked = !session.shown.staged_memories.is_empty()
+            || super::reduce::works_from(connection, network, &job.conversation_id)?
+                .iter()
+                .any(|work| work.trigger == job.trigger);
+        let mut questions = connection.prepare(
+            "SELECT q.question_id FROM questions q WHERE q.network_id=?1 AND q.conversation_id=?2 AND q.closed IS NULL AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id)",
+        )?;
+        let unanswered = questions.query_map(params![network, job.conversation_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for question in unanswered {
+            blocked |= matches!(super::scope_projection::question_input_target_from(
+                connection, network, &job.conversation_id, &question?,
+            )?, Some(crate::workspace::InputTarget::Routine { trigger, .. }) if trigger == job.trigger);
+        }
+        if routine && explicit_no_change && !blocked {
+            outcome = JobOutcome::NoChange;
+        } else {
+            outcome = JobOutcome::Failed(ExecFailure::new(
+                FailureKind::Rejected,
+                "invalid no-change result: requires a recurring routine with no work, saved changes or pending decisions",
+            ));
+            if explicit_no_change || text.trim().is_empty() {
+                quiet_failure =
+                    Some("本次检查未提供有效结果。已有工作和待决定事项仍保留在动态中。");
+            }
+        }
+    }
+    let text = quiet_failure.unwrap_or(text);
     if let Some(context) = session
         .shown
         .context
