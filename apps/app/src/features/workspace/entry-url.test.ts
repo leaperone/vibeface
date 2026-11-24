@@ -1424,7 +1424,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
-        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
+        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
@@ -1599,7 +1599,8 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(mainSaves.length, optionStart + 2, 'returning to Main cannot duplicate its still-pending input')
         routine = pendingRoutine
         chat.render('default'); chat.render('default')
-        composer()?.onChange?.('当前例行任务草稿'); await settleComponent()
+        // Typing is written after a short delay; leaving the foreground writes it at once, before the earlier revision settles.
+        composer()?.onChange?.('当前例行任务草稿'); chat.appState('background'); chat.appState('active'); await settleComponent()
         changingOptions.resolve(new Uint8Array([13, 14, 15]).buffer)
         await Promise.all(mainSaves.slice(optionStart)); await settleComponent(); mobile()
         assert.equal(composer()?.value, '当前例行任务草稿')
@@ -1915,6 +1916,7 @@ type ComponentFixture = {
   module: Record<string, unknown>
   readonly drafts: ReturnType<typeof createChatDrafts>
   ownsDraftFile(uri: string): boolean
+  appState(state: string): void
 }
 
 function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '', realModules: Record<string, string> = {}): ComponentFixture {
@@ -1965,6 +1967,9 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       } })) }
     },
   }
+  // Drafts write pending typing when the app leaves the foreground; `appState` sends that change.
+  const appStateListeners = new Set<(state: string) => void>()
+  const appState = { currentState: 'active', addEventListener: (_type: 'change', listener: (state: string) => void) => { appStateListeners.add(listener); return { remove: () => { appStateListeners.delete(listener) } } } }
   const nativePureModules = new Set(['@/lib/use-selection-owner', '@/features/chat/use-chat-draft', '@/platform/reading-position', '@/platform/chat-location', '@/platform/workspace-history', '@/platform/viewport-read', '@/platform/native-workspace-history-cache'])
   const useFocusEffect = (run: () => (() => void) | void) => {
     const index = hooks.next(), previous = focusEffects.get(index)
@@ -2019,7 +2024,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const identity = dependencies[specifier] as { useDevice?: () => object } | undefined
       return { ...identity, useDevice: () => ({ connectionGeneration: () => 0, ...identity?.useDevice?.() }) }
     }
-    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), retain: async (uri: string) => ({ uri }), ownedFile: (file: { uri: string }) => ({ ...file, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0), dispose() {} }), release() {}, releasePicker() {} } }
+    if (specifier === '@/platform/files') return dependencies[specifier] ?? { privateFiles: { run: async (operation: (current: () => boolean) => Promise<unknown>) => operation(() => true), lease: () => () => true, retain: async (uri: string) => ({ uri }), ownedFile: (file: { uri: string }) => ({ ...file, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0), dispose() {} }), release() {}, releasePicker() {} } }
+    if (specifier === 'react-native') { const native = dependencies[specifier]; return native ? { AppState: appState, ...native as object } : new Proxy(ui, { get: (target, name) => name === 'AppState' ? appState : Reflect.get(target, name) }) }
     if (specifier === '@/platform') return { mobilePlatform: { storage: platformStorage }, ...dependencies[specifier] as object }
     if (specifier === '@tanstack/react-router') return { Link: 'Link', useNavigate: () => () => {}, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: {} } }), ...dependencies[specifier] as object }
     return specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, useRouter: () => nativeRouter, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
@@ -2039,6 +2045,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       const component = module.exports[name]
       assert.ok(typeof component === 'function')
       output = component(props)
+      // The chat's composer and starters read the draft themselves, so typing re-renders only them; render them here too.
+      if (path.endsWith('/app/b/[botId].tsx')) for (const element of [...elements]) if (typeof element.type === 'function' && ['DraftComposer', 'Starters'].includes(element.type.name)) element.type(element.props)
       afterRender.splice(0).forEach(run => run())
       if (name === 'ScopedWorkspaceScreen') {
         const child = elements.find(element => typeof element.type === 'function' && ['ScopedWorkspaceContent', 'OfflineWorkspaceHistory'].includes(element.type.name))
@@ -2061,6 +2069,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     module: module.exports,
     get drafts() { return scopedChild?.app.drafts ?? chatDrafts },
     ownsDraftFile: uri => scopedChild ? scopedChild.app.ownsDraftFile(uri) : retainedDraftFiles.has(uri),
+    appState(state) { scopedChild?.app.appState(state); appState.currentState = state; for (const listener of [...appStateListeners]) listener(state) },
   }
 }
 
@@ -5682,31 +5691,42 @@ test('native chat activity keeps runtime diagnostics and result checks out of th
   const job: ManagerJob = { scope: { kind: 'main' }, trigger: 'message:one', message_id: 'one', reply_message_id: 'reply', state: 'completed', runtime }
   const shared = { ...parityShared(), refresh: async () => { refreshed++ }, nodes: [{ ...parityNode, capabilities: { ...parityNode.capabilities, manager_state: 'unverified' as const } }] }
   shared.data = parseConversation({ ...context, messages: [{ message_id: 'one', event_hash: 'one', role: 'user', text: '做', created_at_ms: 1 }, { message_id: 'reply', event_hash: 'reply', role: 'assistant', text: '完成', created_at_ms: 2, in_reply_to: 'one' }], scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } })
-  const extras = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', {
+  const workDependencies = {
     '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/chat/protocol.ts': { promptIntent, canRetryJob, replyUnsettled, runtimeLabel }, '@vibeface/client/workspace/model.ts': workspaceModel,
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleTrigger }, '@vibeface/client/workspace/labels.ts': taskLabels,
     '@vibeface/client/workspace/questions.ts': { questionOpen }, '@vibeface/client/lib/errors.ts': errors,
-  })
+  }
+  // The status line and the activity page read the same work through separate hooks, each with its own hook slots.
+  const summary = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', workDependencies)
+  const activityPage = componentHarness('../../../../../apps/mobile/src/features/chat/work.tsx', workDependencies)
   const details = componentHarness('../../../../../apps/mobile/src/components/kit.tsx', {
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }), withTiming: (value: number) => value }, 'uniwind': { withUniwind: (value: unknown) => value },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
   })
-  type Activity = { todo: HarnessElement[]; runtime: HarnessElement[] }
-  const render = () => { extras.render('useChatExtras', 'chat'); return extras.output as { failures: Map<string, unknown[]>; activity: Activity; attention: number } }
+  type Row = { key: string; node: HarnessElement }
+  type Activity = { todo: Row[]; runtime: Row[] }
+  const render = () => {
+    summary.render('useChatSummary', 'chat'); activityPage.render('useChatActivity', 'chat')
+    const { failures, attention } = summary.output as { failures: Map<string, unknown[]>; attention: number }
+    const activity = activityPage.output as Activity
+    return { failures, attention, activity: { todo: activity.todo.map(({ node }) => node), runtime: activity.runtime.map(({ node }) => node) } }
+  }
+  // The live store replaces its snapshot on every change, which is what the summary's memo keys on.
+  const setJobs = (jobs: ManagerJob[]) => { const data = shared.data; assert.ok(data?.scheduler); shared.data = { ...data, scheduler: { ...data.scheduler, jobs } } }
   try {
     const result = render()
     assert.equal(botReach(shared.nodes), 'unverified')
     assert.equal(result.activity.todo.length, 0, 'unverified readiness is sendable without a provider card')
     assert.equal(result.failures.size, 0, 'runtime diagnostics stay out of the message list')
     assert.match(componentText(result.activity.runtime), /Codex · 提交模型 submitted-model · 提交推理强度 high · 记录结果/)
-    shared.data.scheduler!.jobs = [{ ...job, state: 'failed', reply_message_id: undefined }]
+    setJobs([{ ...job, state: 'failed', reply_message_id: undefined }])
     const failed = render()
     assert.deepEqual([...failed.failures.keys()], ['one'], 'a failed job without a reply gets one line under its message')
     assert.equal(failed.failures.get('one')?.length, 1)
     assert.equal(failed.activity.runtime.length, 1, 'its runtime stays on the activity page')
     for (const current of [{ ...job, state: 'reconciling' }, { ...job, state: 'failed', pending_check: true }] satisfies ManagerJob[]) {
-      shared.data.scheduler!.jobs = [current]
+      setJobs([current])
       const { activity, attention } = render()
       assert.equal(activity.todo.length, 1)
       assert.equal(attention, 1)
@@ -5716,11 +5736,11 @@ test('native chat activity keeps runtime diagnostics and result checks out of th
       if (typeof action === 'function') await action()
     }
     assert.equal(refreshed, 2, 'result reconciliation remains a read-only action')
-    shared.data.works = [parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })]
-    shared.data.checks = [{ check_id: 'process', conversation_id: 'chat', trigger: 'message:one', attempt_id: 'attempt', detail: '进程还在运行', process_groups: [42], created_at_ms: 1 }]
-    const cards = render().activity.todo
+    shared.data = { ...shared.data, works: [parityWork({ state: 'unverified', outcome: 'unverified', failure_reason: '无法证明结果' })], checks: [{ check_id: 'process', conversation_id: 'chat', trigger: 'message:one', attempt_id: 'attempt', detail: '进程还在运行', process_groups: [42], created_at_ms: 1 }] }
+    const { activity: { todo: cards }, attention } = render()
     assert.equal(cards.filter(({ type }) => typeof type === 'function' && type.name === 'ConfirmCard').length, 2, 'unknown work and running-process checks stay visible')
-  } finally { extras.close(); details.close() }
+    assert.equal(attention, cards.length, 'the status line counts every card the activity page asks the person about')
+  } finally { summary.close(); activityPage.close(); details.close() }
 })
 
 function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
@@ -5734,7 +5754,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     '@vibeface/client/chat/protocol.ts': { promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-    '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
+    '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
     ...dependencies,
   })
 }
