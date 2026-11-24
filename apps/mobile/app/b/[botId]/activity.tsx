@@ -1,7 +1,7 @@
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { ListChecks } from 'lucide-react-native'
 import { useCallback, useRef, useState } from 'react'
-import { SectionList, View } from 'react-native'
+import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { EmptyState } from '@/components/kit'
@@ -9,9 +9,6 @@ import { Button } from '@/components/arc/button'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
 import { useChatActivity, type Row } from '@/features/chat/work'
-import { cn } from '@/lib/utils'
-
-const Gap = () => <View className="h-3" />
 
 /** Everything about a bot's chat besides its messages: what needs the person, inputs on their way, tasks, changes and runtimes. */
 export default function BotActivity() {
@@ -46,12 +43,12 @@ export default function BotActivity() {
   const sections = ([['要处理', activity.todo], ['发送中', activity.sending], ['任务', activity.tasks], ['最近改动', activity.changes], ['运行信息', activity.runtime]] satisfies [string, Row[]][])
     .filter(([, data]) => data.length).map(([key, data]) => ({ key, data }))
   if (!sections.length) return <>{title}<EmptyState icon={ListChecks} title="暂无动态" className="flex-1 justify-center" /></>
-  return <>
+  // ponytail: plain ScrollView; a virtualized list would unmount a half-typed note in a card scrolled far away.
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-8 p-4 pb-10">
     {title}
-    <SectionList sections={sections} keyExtractor={(row) => row.key} stickySectionHeadersEnabled={false}
-      renderSectionHeader={({ section }) => <Text role="heading" className={cn('pb-3 text-sm font-medium text-muted', section !== sections[0] && 'pt-8')}>{section.key}</Text>}
-      renderItem={({ item }) => <>{item.node}</>} ItemSeparatorComponent={Gap}
-      renderScrollComponent={(props) => <KeyboardAwareScrollView {...props} bottomOffset={24} />}
-      keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center p-4 pb-10" />
-  </>
+    {sections.map(({ key, data }) => <View key={key} className="gap-3">
+      <Text role="heading" className="text-sm font-medium text-muted">{key}</Text>
+      {data.map((row) => <View key={row.key}>{row.node}</View>)}
+    </View>)}
+  </KeyboardAwareScrollView>
 }
