@@ -134,7 +134,7 @@ export default function ChatScreen() {
   currentScope.current = draftScopeKey
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null); setIntentMenu(null) }, [id, routine])
   const routeActive = useRef(false)
-  useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; close?.() } }, [id, live?.generation]))
+  useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId)
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
@@ -315,7 +315,7 @@ export default function ChatScreen() {
   </Link>
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
-    {intentMenu?.key === intentMenuKey ? <Modal transparent visible animationType="fade" onRequestClose={() => setIntentMenu(null)}>
+    {intentMenu?.key === intentMenuKey ? <Modal transparent visible animationType="fade" onRequestClose={() => { intentMenuOwner.current = null; setIntentMenu(null) }}>
       <View className="flex-1 justify-end bg-background/90 p-4" style={{ paddingBottom: insets.bottom + 16 }}>
         <PopoverPanel accessibilityViewIsModal className="max-h-[75%] w-full max-w-3xl self-center gap-2">
           <Text role="heading" numberOfLines={2} className="px-2 py-2 font-medium">{targetOption.label}</Text>
@@ -323,7 +323,7 @@ export default function ChatScreen() {
             if (!routeActive.current || currentScope.current !== draftScopeKey || latestLive.current?.generation !== liveGeneration || intentMenuOwner.current !== intentMenu) return
             intentMenuOwner.current = null; setIntentMenu(null); option.action()
           }}><Text className="min-w-0 shrink">{option.text}</Text></Button>)}</ScrollView>
-          <Button variant="secondary" onPress={() => setIntentMenu(null)}><Text>取消</Text></Button>
+          <Button variant="secondary" onPress={() => { intentMenuOwner.current = null; setIntentMenu(null) }}><Text>取消</Text></Button>
         </PopoverPanel>
       </View>
     </Modal> : null}

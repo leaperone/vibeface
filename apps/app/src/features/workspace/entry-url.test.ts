@@ -7043,6 +7043,8 @@ test('native input menu exposes all three actions on Android and iOS and rejects
       composer()
       if (typeof old === 'function') old()
       assert.equal(composer().sendLabel, '稍后处理', 'the old menu cannot act after a connection generation changes')
+      open(); app.render('default'); app.blur()
+      assert.equal(app.render('default').some(({ type }) => type === 'Modal'), false, 'leaving the chat dismisses its global native modal')
     } finally { app.close() }
   }
 })
