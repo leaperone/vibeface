@@ -1240,9 +1240,16 @@ fn interrupt_frame() -> Value {
         "request":{"subtype":"interrupt"}})
 }
 
-/// A health reminder's turn denies every tool it is not given: no edits, no other commands, no
-/// web.
-const HEALTH_PERMISSIONS: &str = r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(vibeface tool:*)","Read","Grep","Glob"]}}"#;
+/// A health reminder's turn denies what it is not given beyond the user's own settings: it reads
+/// and searches files and runs the scoped CLI as the guide writes it, quoted or not.
+fn health_settings(cli: Option<&Path>) -> String {
+    let mut allow = vec!["Read".to_owned(), "Grep".into(), "Glob".into()];
+    if let Some(cli) = cli {
+        allow.push(format!("Bash({} tool:*)", manager::tool_executable(cli)));
+        allow.push(format!("Bash({} tool:*)", cli.to_string_lossy()));
+    }
+    json!({"permissions":{"defaultMode":"dontAsk","allow":allow}}).to_string()
+}
 
 /// How one `claude -p` process starts.
 struct Launch<'a> {
@@ -1255,8 +1262,8 @@ struct Launch<'a> {
     effort: Option<&'a str>,
     guide: Option<Arc<Guide>>,
     env: &'a BTreeMap<String, String>,
-    /// A health reminder's turn: it reads files and calls `vibeface tool`, nothing else.
-    restricted: bool,
+    /// A health reminder's turn: its `health_settings`, in place of bypassing permissions.
+    health: Option<String>,
 }
 
 /// A running `claude -p`: its pipes and process tree.
@@ -1275,10 +1282,9 @@ impl Launch<'_> {
         command
             .args(["-p", "--input-format", "stream-json", "--output-format"])
             .args(["stream-json", "--verbose", "--replay-user-messages"])
-            .args(if self.restricted {
-                ["--settings", HEALTH_PERMISSIONS]
-            } else {
-                ["--permission-mode", "bypassPermissions"]
+            .args(match &self.health {
+                Some(settings) => ["--settings", settings.as_str()],
+                None => ["--permission-mode", "bypassPermissions"],
             })
             .arg(if self.resume {
                 "--resume"
@@ -1474,7 +1480,9 @@ where
         effort: config.reasoning_effort.as_deref(),
         guide,
         env: &env,
-        restricted: config.restricted,
+        health: config
+            .restricted
+            .then(|| health_settings(config.tool_cli.as_deref())),
     };
     report.enter(ProviderStage::Launch);
     let mut process = launch
@@ -2016,7 +2024,7 @@ impl Executor for Claude {
                 }),
                 guide: None,
                 env: &env,
-                restricted: false,
+                health: None,
             };
             let mut process = match launch.spawn() {
                 Ok(process) => process,
@@ -3283,6 +3291,7 @@ pub(super) mod tests {
         let (record, _) = recorder();
         let mut config = bot_config(&place, record);
         config.restricted = true;
+        config.tool_cli = Some("/opt/a b/vibeface".into());
         let (_, never) = tokio::sync::watch::channel(false);
         bot_turn(&place, &config, "hello", None, never).await.0?;
         let log = place.log();
@@ -3293,10 +3302,20 @@ pub(super) mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(!argv.contains(&"bypassPermissions"), "{argv:?}");
+        let settings: Value = serde_json::from_str(
+            argv[argv
+                .iter()
+                .position(|arg| *arg == "--settings")
+                .context("settings")?
+                + 1],
+        )?;
+        assert_eq!(settings["permissions"]["defaultMode"], "dontAsk");
         assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--settings", HEALTH_PERMISSIONS]),
-            "{argv:?}"
+            settings["permissions"]["allow"]
+                .as_array()
+                .context("allow")?
+                .contains(&json!("Bash('/opt/a b/vibeface' tool:*)")),
+            "the rule matches the guide's command: {settings}"
         );
         Ok(())
     }
@@ -3424,7 +3443,7 @@ pub(super) mod tests {
             effort: None,
             guide: None,
             env: &BTreeMap::new(),
-            restricted: false,
+            health: None,
         }
         .spawn();
         let Err(failure) = result else {
@@ -3479,7 +3498,7 @@ time.sleep(0.05)
             effort: None,
             guide: None,
             env: &env,
-            restricted: false,
+            health: None,
         }
         .spawn()?;
         let processes = Processes::new(place.dir.join(PIDFILE));
@@ -3569,7 +3588,7 @@ time.sleep(0.05)
             effort: None,
             guide: None,
             env: &env,
-            restricted: false,
+            health: None,
         }
         .spawn()?;
         processes.track(unrelated.child.token(), bin)?;

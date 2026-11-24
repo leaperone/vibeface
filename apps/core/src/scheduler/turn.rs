@@ -581,6 +581,7 @@ impl TurnAttempt {
                         config.tool_cli.as_deref(),
                         &config.custom_tools,
                         &stable.rendered,
+                        crate::runtime::health_turn(&job.trigger),
                     )
                     .len()
                         + 2

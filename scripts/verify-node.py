@@ -1700,7 +1700,6 @@ def fixture_codex(arguments):
 
 
 READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history", "read_logs", "read_health"}
-# ponytail: tools an older published npm baseline may lack; its turn accepts their absence only. Empty once every baseline has them.
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config", "workspace_command"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
