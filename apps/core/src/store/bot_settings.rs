@@ -1379,10 +1379,6 @@ impl Store {
         Ok((record, true))
     }
 
-    /// A one-time reminder the Node sets for the primary bot, as its own `remind` would, a minute
-    /// from `at`. Only the Node that schedules the primary bot writes it: no other Node may
-    /// write that bot's `BotChanged` without the user's message. `key` names it, so the same key
-    /// writes it once.
     /// The Node that schedules the primary bot, when there is one.
     pub(crate) fn primary_bot_owner(&self, network: &str) -> Result<Option<String>> {
         let Some(scope) = super::bots::primary_bot_from(&self.connection, network)? else {
@@ -1391,6 +1387,10 @@ impl Store {
         Ok(super::conversation_from(&self.connection, network, &scope)?.and_then(|c| c.owner))
     }
 
+    /// A one-time reminder the Node sets for the primary bot, as its own `remind` would, a minute
+    /// from `at`. Only the Node that schedules the primary bot writes it: no other Node may
+    /// write that bot's `BotChanged` without the user's message. `key` names it, so the same key
+    /// writes it once.
     pub fn remind_primary_bot(
         &mut self,
         identity: &crate::crypto::LocalIdentity,

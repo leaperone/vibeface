@@ -732,14 +732,21 @@ fn record(problem: &Problem, began: bool) {
 }
 
 /// The turn the primary bot gets for a new problem.
-fn handoff_note(problem: &Problem, device: &str) -> String {
+fn handoff_note(problem: &Problem, device: &str, member: bool) -> String {
     let conversation = problem
         .conversation_id
         .as_ref()
         .map(|id| format!("，会话 {id}"))
         .unwrap_or_default();
+    let tools = if member {
+        format!(
+            "这是另一台成员设备报告的问题：给 read_health 和 read_logs 传 node: \"{device}\" 读那台设备的日志和健康状态。"
+        )
+    } else {
+        "这两个工具默认读取执行这一轮的设备自己的日志和健康状态。".to_owned()
+    };
     format!(
-        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。这两个工具只读取执行这一轮的设备自己的日志和健康状态，这一轮不在设备 {device} 上执行时不可用。这一轮不能派发或控制工作，也不能设提醒或给其他 bot 发消息；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
+        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。{tools}这一轮不能派发或控制工作，也不能设提醒或给其他 bot 发消息；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
         problem.check.title(),
         problem.check.began(),
         problem.subject,
@@ -1080,7 +1087,9 @@ impl Runtime {
                 "a member Node reports a problem");
             first_keys.insert(problem.found_on(&device));
         }
-        let unhanded = self.health.lock().expect("health").unhanded();
+        let mut unhanded = self.health.lock().expect("health").unhanded();
+        // This Node's own first, so a member's batch does not use up the limits before them.
+        unhanded.sort_by_key(|(key, _)| key.device.is_some());
         for (key, problem) in unhanded {
             let first = first_keys.contains(&key);
             match self.hand_to_primary_bot(&key, &problem, now, first).await {
@@ -1145,7 +1154,7 @@ impl Runtime {
         };
         let (key, note) = (
             handoff_key(problem, &device, now),
-            handoff_note(problem, &device),
+            handoff_note(problem, &device, problem_key.device.is_some()),
         );
         let identity = self.identity.clone();
         let reminded = {
@@ -1259,17 +1268,19 @@ impl Runtime {
                     );
                     let answer = tokio::time::timeout(PEER_HEALTH_TIMEOUT, request).await;
                     let problems = match answer {
-                        Ok(Ok(answer)) => {
-                            serde_json::from_value::<Vec<Problem>>(answer["problems"].clone())
-                                .map(|problems| {
-                                    problems
-                                        .into_iter()
-                                        .take(MAX_SHARED_PROBLEMS)
-                                        .filter_map(Problem::bounded)
-                                        .collect()
+                        // One record this version cannot read, as a newer check, is skipped alone.
+                        Ok(Ok(answer)) => Some(
+                            answer["problems"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .take(MAX_SHARED_PROBLEMS)
+                                .filter_map(|problem| {
+                                    serde_json::from_value::<Problem>(problem.clone()).ok()
                                 })
-                                .ok()
-                        }
+                                .filter_map(Problem::bounded)
+                                .collect(),
+                        ),
                         Ok(Err(error)) => {
                             tracing::debug!(peer = peer.device_id, %error,
                                 "a member Node did not share its problems");
@@ -1285,6 +1296,18 @@ impl Runtime {
             .into_iter()
             .collect();
         self.health.lock().expect("health").update_remote(answers)
+    }
+
+    /// Whether `device` is the Node that schedules the primary bot.
+    pub(super) async fn schedules_primary_bot(&self, network: &str, device: &str) -> Result<bool> {
+        let network = network.to_owned();
+        let owner = self
+            .store
+            .read("health.primary_owner", move |store| {
+                store.primary_bot_owner(&network)
+            })
+            .await?;
+        Ok(owner.as_deref() == Some(device))
     }
 
     /// `health_problems` for a member Node: this Node's open problems, bounded.
@@ -1698,7 +1721,12 @@ mod tests {
             handoff_key(&problem(Check::WorkStalled, "a", 0), device, 1),
             handoff_key(&problem(Check::WorkStalled, "a", 0), "device-2", 1)
         );
-        assert!(handoff_note(&problem(Check::WorkStalled, "a", 0), device).contains(device));
+        assert!(handoff_note(&problem(Check::WorkStalled, "a", 0), device, false).contains(device));
+        assert!(
+            handoff_note(&problem(Check::WorkStalled, "a", 0), "device-2", true)
+                .contains("node: \"device-2\""),
+            "a member's problem says how to read that device"
+        );
     }
 
     #[test]

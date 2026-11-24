@@ -447,11 +447,12 @@ impl Runtime {
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
             Tool::ReadLogs | Tool::ReadHealth => {
                 let mut args = args.clone();
-                let node = args
-                    .as_object_mut()
-                    .and_then(|args| args.remove("node"))
-                    .and_then(|node| node.as_str().map(str::to_owned))
-                    .filter(|node| self.identity.device_id().ok().as_ref() != Some(node));
+                let node = match args.as_object_mut().and_then(|args| args.remove("node")) {
+                    None => None,
+                    Some(Value::String(node)) => Some(node),
+                    Some(_) => anyhow::bail!("node must be a member Node's device ID"),
+                }
+                .filter(|node| self.identity.device_id().ok().as_ref() != Some(node));
                 let kind = if tool == Tool::ReadLogs {
                     "read_logs"
                 } else {

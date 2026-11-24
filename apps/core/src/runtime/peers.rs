@@ -749,6 +749,11 @@ impl Runtime {
         .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
+            "health_problems" | "read_logs" | "read_health"
+                if !self.schedules_primary_bot(network, origin).await? =>
+            {
+                bail!("only the Node that schedules the primary bot reads another Node's health")
+            }
             "health_problems" => Ok(self.shared_problems()),
             // A member Node's primary bot diagnosing this one; the logs are already redacted.
             "read_logs" => {
