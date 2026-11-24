@@ -30,7 +30,7 @@ import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { DropdownMenu } from '@vibeface/uiarc/dropdown-menu/dropdown-menu.tsx'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
-import { useEffect,useRef,useState,type ReactNode,type RefObject } from 'react'
+import { useEffect,useMemo,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
 import type { ChatMessage } from './elements/message'
@@ -115,15 +115,15 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && !(task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)) && (taskActive(task.state) || task.state === 'awaiting_children')).length
 
   const changes = data?.changes ?? []
-  const placedChanges = placeChanges(data?.messages ?? [], changes)
+  const placedChanges = useMemo(() => placeChanges(data?.messages ?? [], changes), [data?.messages, changes])
 
   // Questions sit where they were asked; an answer shows inside its question.
   const questions = data?.questions ?? []
-  const folded = foldAnswers(data?.messages ?? [], questions)
+  const folded = useMemo(() => foldAnswers(data?.messages ?? [], questions), [data?.messages, questions])
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
-  const timeline = chatTimeline(data?.messages ?? [], [
+  const timeline = useMemo(() => chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-  ], merged)
+  ], merged), [data?.messages, questions, workspace.answered, folded, jobs])
 
   // 重试 sits on the newest reply when it failed or was stopped; it reads the conversation again first and words what it sends by what the reply may have done.
   const newest = data?.messages.at(-1)
