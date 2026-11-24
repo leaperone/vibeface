@@ -47,7 +47,7 @@ Vibeface 用独立设备密钥和签名授权管理个人网络，并验证与�
 
 新任务的真实目录必须通过执行 Node 的 `roots` 检查。Bot 的项目偏好本身不授予路径权限。这个检查只覆盖新任务的目录选择，不构成操作系统沙箱，也不约束 Agent 对宿主机的全部访问。
 
-协调 Agent 的 Shell 和文件工具可以访问宿主机。Codex 使用 `danger-full-access`，Claude Code 使用 `bypassPermissions`，它们可以读写文件和运行命令。例外是健康提醒开启的一轮：Codex 用只读沙箱、关闭网页搜索，但 Shell 仍能读文件、联网，并经本机 socket 间接写入，只读沙箱不构成安全边界；其他产品不变，见[看健康检查](troubleshooting.md#看健康检查)。对已有原生会话的续接也有自己的目录规则。Node 工具令牌对网络和聊天的限制，不会把这些宿主工具变成只读工具。
+协调 Agent 的 Shell 和文件工具可以访问宿主机。Codex 使用 `danger-full-access`，Claude Code 使用 `bypassPermissions`，它们可以读写文件和运行命令。例外是健康提醒开启的一轮：Codex 用只读沙箱、关闭网页搜索，但 Shell 仍能读文件、联网，并经本机 socket 间接写入，只读沙箱不构成安全边界；Claude Code 不再跳过权限，只允许读文件、搜索和 `vibeface tool`，其他工具一律拒绝；opencode、pi 和 Cursor 不变，见[看健康检查](troubleshooting.md#看健康检查)。对已有原生会话的续接也有自己的目录规则。Node 工具令牌对网络和聊天的限制，不会把这些宿主工具变成只读工具。
 
 只在你愿意交给 Agent 操作的系统用户和设备上启用它。具体接入和工作登记规则见 [Bot 与任务执行](bot-and-execution.md) 及 [Node 使用文档](node.md#创建机器人并处理结果)。
 

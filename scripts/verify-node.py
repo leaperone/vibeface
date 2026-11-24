@@ -1701,7 +1701,6 @@ def fixture_codex(arguments):
 
 READ_TOOLS = {"nodes", "context", "history_search", "history_read", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot", "list_sessions", "workspace_state", "workspace_history", "read_logs", "read_health"}
 # ponytail: tools an older published npm baseline may lack; its turn accepts their absence only. Empty once every baseline has them.
-UNRELEASED_TOOLS = {"read_logs", "read_health"}
 WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config", "workspace_command"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
@@ -1896,8 +1895,6 @@ def fixture_manager(run, initial, bot):
         require(isinstance(page["next"], int) and page["next"] > offset,
                 "tool discovery has a forward-only bounded cursor")
         offset = page["next"]
-    if (run / "fixture-baseline-tools").exists():
-        expected_tools -= UNRELEASED_TOOLS - catalog
     require(catalog == expected_tools, "dynamic discovery exposes exactly this turn's authorized domain tools")
     for name in sorted(expected_tools):
         schema = tool("tool_describe", {"tool": name})
@@ -5128,11 +5125,7 @@ def npm_service_acceptance(options):
             require(release_archive.files(vendor, ("FILES.sha256",)) == expected_files,
                     "every installed baseline vendor byte matches the immutable published package")
             shutil.copy2(vendor / "scripts/install-node-service.sh", cleanup_script)
-            (run / "fixture-baseline-tools").touch()
-            try:
-                conversation, attachment, digest, messages, invocation_count = create_history("NPM")
-            finally:
-                (run / "fixture-baseline-tools").unlink(missing_ok=True)
+            conversation, attachment, digest, messages, invocation_count = create_history("NPM")
             require(invocation_count == 1, "one controlled fixture call creates the message history")
             update = json.loads(command([binary, "update", "status", "--data-dir", node.directory]).stdout)
             require(update["distribution"] == "npm" and update["automatic"] is False,

@@ -1240,6 +1240,10 @@ fn interrupt_frame() -> Value {
         "request":{"subtype":"interrupt"}})
 }
 
+/// A health reminder's turn denies every tool it is not given: no edits, no other commands, no
+/// web.
+const HEALTH_PERMISSIONS: &str = r#"{"permissions":{"defaultMode":"dontAsk","allow":["Bash(vibeface tool:*)","Read","Grep","Glob"]}}"#;
+
 /// How one `claude -p` process starts.
 struct Launch<'a> {
     bin: &'a Path,
@@ -1251,6 +1255,8 @@ struct Launch<'a> {
     effort: Option<&'a str>,
     guide: Option<Arc<Guide>>,
     env: &'a BTreeMap<String, String>,
+    /// A health reminder's turn: it reads files and calls `vibeface tool`, nothing else.
+    restricted: bool,
 }
 
 /// A running `claude -p`: its pipes and process tree.
@@ -1268,13 +1274,12 @@ impl Launch<'_> {
         let mut command = std::process::Command::new(self.bin);
         command
             .args(["-p", "--input-format", "stream-json", "--output-format"])
-            .args([
-                "stream-json",
-                "--verbose",
-                "--permission-mode",
-                "bypassPermissions",
-                "--replay-user-messages",
-            ])
+            .args(["stream-json", "--verbose", "--replay-user-messages"])
+            .args(if self.restricted {
+                ["--settings", HEALTH_PERMISSIONS]
+            } else {
+                ["--permission-mode", "bypassPermissions"]
+            })
             .arg(if self.resume {
                 "--resume"
             } else {
@@ -1469,6 +1474,7 @@ where
         effort: config.reasoning_effort.as_deref(),
         guide,
         env: &env,
+        restricted: config.restricted,
     };
     report.enter(ProviderStage::Launch);
     let mut process = launch
@@ -2010,6 +2016,7 @@ impl Executor for Claude {
                 }),
                 guide: None,
                 env: &env,
+                restricted: false,
             };
             let mut process = match launch.spawn() {
                 Ok(process) => process,
@@ -3271,6 +3278,30 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_health_turn_runs_without_bypassing_permissions() -> Result<()> {
+        let place = Place::new()?;
+        let (record, _) = recorder();
+        let mut config = bot_config(&place, record);
+        config.restricted = true;
+        let (_, never) = tokio::sync::watch::channel(false);
+        bot_turn(&place, &config, "hello", None, never).await.0?;
+        let log = place.log();
+        let argv: Vec<&str> = log[0]["argv"]
+            .as_array()
+            .context("argv")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!argv.contains(&"bypassPermissions"), "{argv:?}");
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--settings", HEALTH_PERMISSIONS]),
+            "{argv:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_bot_turn_streams_its_reply_and_keeps_the_session() -> Result<()> {
         let place = Place::new()?;
         let (record, calls) = recorder();
@@ -3393,6 +3424,7 @@ pub(super) mod tests {
             effort: None,
             guide: None,
             env: &BTreeMap::new(),
+            restricted: false,
         }
         .spawn();
         let Err(failure) = result else {
@@ -3447,6 +3479,7 @@ time.sleep(0.05)
             effort: None,
             guide: None,
             env: &env,
+            restricted: false,
         }
         .spawn()?;
         let processes = Processes::new(place.dir.join(PIDFILE));
@@ -3536,6 +3569,7 @@ time.sleep(0.05)
             effort: None,
             guide: None,
             env: &env,
+            restricted: false,
         }
         .spawn()?;
         processes.track(unrelated.child.token(), bin)?;
