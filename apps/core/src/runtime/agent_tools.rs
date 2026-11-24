@@ -1490,11 +1490,8 @@ impl Runtime {
             call_ref: call_ref.into(),
             kind,
             model: requested_model,
-            // A thread's directory is only informational and may be unknown.
-            cwd: match &thread {
-                Some(_) => requested_cwd.unwrap_or_default(),
-                None => requested_cwd.unwrap_or_default(),
-            },
+            // Omit cwd to use the target Node's Bot workspace; accept_dispatch fills an empty path.
+            cwd: requested_cwd.unwrap_or_default(),
             title: field(args, "title")?.chars().take(120).collect(),
             prompt: field(args, "prompt")?.into(),
             continues: optional("continues"),
