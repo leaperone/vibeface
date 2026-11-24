@@ -107,7 +107,7 @@ def unpack(archive, destination):
         release_format.require(len(roots) == 1, 'archive must contain one root')
         for item in members:
             item.mode &= 0o777
-        source.extractall(destination, members=members)
+        source.extractall(destination, members=members, filter="data")
     return destination / roots.pop()
 
 

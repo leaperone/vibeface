@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mergeProgress, parseChanged } from './progress.ts'
+import { mergeProgress, parseChanged, progressDisplay } from './progress.ts'
 
 const manager = (sequence: number, progress: unknown, trigger = 'turn-a', invocation_id?: string) => parseChanged({
   type: 'manager_progress', conversation_id: 'chat-a', trigger, source_node: 'scheduler-a', invocation_id, sequence, progress,
@@ -128,4 +128,19 @@ test('canonical manager status and tool events remain typed progress', () => {
   assert.equal(state[0].sequence, samples.length)
   assert.equal(state[0].needsRefresh, false)
   assert.equal(state[0].status, 'completed')
+})
+
+test('terminal records see the last delta before paint and a switch cancels the old paint', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const painted: string[][] = []
+  const state = progressDisplay(items => painted.push(items.map(item => item.text)))
+  state.push(manager(1, { type: 'text_delta', text: 'one' }))
+  state.push(manager(2, { type: 'text_delta', text: ' two' }))
+  t.mock.timers.tick(50)
+  assert.deepEqual(painted, [['one two']])
+  state.push(manager(3, { type: 'text_delta', text: ' three' }))
+  assert.equal(state.read()[0].text, 'one two three')
+  state.replace([])
+  t.mock.timers.tick(50)
+  assert.deepEqual(painted, [['one two'], []])
 })

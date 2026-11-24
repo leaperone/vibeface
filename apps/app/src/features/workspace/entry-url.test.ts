@@ -180,7 +180,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
 test("workspace preserves bot and message requests while routing native decisions to their exact work", async (t) => {
   const drainOutbox = async () => { await new Promise(resolve => setTimeout(resolve, 50)) }
   const settleComponent = drainOutbox
-  const hooks = hookHarness(), { react, afterRender } = hooks
+  const hooks = hookHarness(true), { react, afterRender } = hooks
   const stored = new Map<string, string>()
   const browser = {
     location: { href: "https://node.example/app?conversation=chat" },
@@ -1084,7 +1084,7 @@ test("workspace preserves bot and message requests while routing native decision
     })
 
     await t.test('two tabs preserve target order while the earlier input is still signing', { timeout: 10_000 }, async () => {
-      const otherHooks = hookHarness()
+      const otherHooks = hookHarness(true)
       const loadOther = moduleLoader(sandbox, (specifier, filename) => {
         if (specifier === 'react') return otherHooks.react
         if (specifier.endsWith('/lib/node.ts')) return { ...nodeSettings, messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }

@@ -9,7 +9,7 @@ import { base64ToBytes, bytesToBase64, sha256Hex } from "../lib/byte-codec.ts"
 import { requestKey } from "../lib/secure.ts"
 import { notificationForOpening, type Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
-import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
+import { progressDisplay, type LiveProgress } from "../lib/progress.ts"
 import { inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, replyUnsettled, retryText } from "../chat/protocol.ts"
 import { taskActive } from "./labels.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
@@ -182,8 +182,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set<string>())
   /** The chat on screen and the connection it was read over; another connection is another visit. */
   const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
-  const liveRef = useRef<LiveProgress[]>([])
-  liveRef.current = liveProgress
+  const [progressState] = useState(() => progressDisplay(setLiveProgress))
   const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: true, state: "off" }) // disabled until the first permission check
   const alive = useRef(true)
   const activeId = useRef("")
@@ -393,7 +392,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setDataOrigin(cached ? 'cache' : 'none')
     setConversationLoading(false)
     setConversationError(null)
-    setLiveProgress([])
+    progressState.replace([])
     setInterrupted([])
   }
   const readConversation = async (id: string) => {
@@ -496,14 +495,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     // Streamed text of a reply that ended without a final message is kept locally and shown as interrupted.
     const ended = (job: { state: string; reply_message_id?: string } | undefined) => job && isReplyEnded(job.state) && !(job.reply_message_id && next.messages.some((message) => message.message_id === job.reply_message_id))
     const kept = interruptedReplies(readStorage(scoped("interrupted"), [])).filter((item) => item.conversation_id !== id || next.scheduler?.jobs.some((job) => job.trigger === item.trigger && ended(job)))
-    for (const progress of liveRef.current) {
+    for (const progress of progressState.read()) {
       if (progress.kind !== "manager" || !progress.text || progress.conversation_id !== id || kept.some((item) => item.trigger === progress.trigger)) continue
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       if (ended(job)) kept.push({ trigger: progress.trigger, conversation_id: id, after: job?.message_id, text: progress.text })
     }
     writeStorage(scoped("interrupted"), kept.slice(-50))
     setInterrupted(kept.filter((item) => item.conversation_id === id))
-    setLiveProgress((previous) => previous.filter((progress) => {
+    progressState.replace(progressState.read().filter((progress) => {
       if (progress.kind === "native") return next.works.some((item) => item.target_node === progress.target_node && item.work_id === progress.work_id && item.state !== "finished")
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !isReplyEnded(job.state))
@@ -783,7 +782,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     messageSaves.current = new Map()
     workspaceWrites.current = new Map()
     localMessageSaves.current = 0
-    setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
+    setMessageBusy(false); progressState.replace([]); setError(null); setNoticeText("")
     try {
       const nextIgnored = readIgnoredNotifications()
       ignoredNotificationsRef.current = nextIgnored
@@ -802,7 +801,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       ignoredNotificationsRef.current = merged
       setIgnoredNotifications(merged)
     })
-    return () => { alive.current = false; conversationReads.current.invalidate(); historyRequests.current.reset(); stop(); stopLedger?.() }
+    return () => { alive.current = false; progressState.cancel(); conversationReads.current.invalidate(); historyRequests.current.reset(); stop(); stopLedger?.() }
   }, [connection, connectionGeneration])
 
   useEffect(() => {
@@ -822,11 +821,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         ? shown?.scheduler?.jobs.some((job) => job.scope.kind === 'main' && job.trigger === event.trigger)
         : shown?.works.some((work) => work.work_id === event.work_id && work.target_node === event.target_node)
       if (!known) { scheduleRefresh(); return }
-      setLiveProgress((previous) => {
-        const next = mergeProgress(previous, event)
-        if (next.some((item) => item.needsRefresh && !previous.find((prior) => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
-        return next
-      })
+      if (progressState.push(event)) scheduleRefresh()
     })
     // A device coming or going is pushed once the Node's sync notices; this rereads sooner while one is away and catches anything missed.
     let ticks = 0
@@ -838,6 +833,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
       unsubscribe(); clearInterval(timer)
+
       if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
       refreshTimer.current = null
       stopForeground()

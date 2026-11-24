@@ -47,7 +47,7 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
 
 /** The workspace state of one connected browser; React hooks are replayed by hand, one render per call. */
 function workspace(source: 'membership' | 'local_session', readBefore: string[] | null) {
-  const hooks = hookHarness(), { effects, afterRender } = hooks
+  const hooks = hookHarness(true), { effects, afterRender } = hooks
   const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks = new Set<() => void>()
   let notificationReads = [
     { notification_id: 'n-1', conversation_id: conversationId, target, kind: 'progress', text: '有新进展' },
