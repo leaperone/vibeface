@@ -7,6 +7,7 @@ import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseO
 import { cardState, overviewScope, taskGroup, taskLabel } from "./labels.ts"
 import { workspaceActivities } from "./activities.ts"
 import { prepareOverviewInputs } from "./overview-policy.ts"
+import { questionInboxKey } from "./questions.ts"
 import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question, WorkspaceActivityJob } from "./types.ts"
 
 const mainScope: SessionScope = { kind: 'main' }
@@ -467,7 +468,7 @@ test("a stale overview cannot put removed inbox questions back on the task page"
   const overview = overviewFromWorkspace({ openWorks: [], bots: [], questions: [old, fresh], nodes: [] })
   for (const terminalCheckPolicy of ["web-filtered", "mobile-inclusive"] as const) {
     const prepared = prepareOverviewInputs({ openWorks: [], bots: [], questions: [fresh], nodes: [], checks: [], overview,
-      dismissedQuestions: new Set([JSON.stringify([old.conversation_id, old.question_id])]), terminalCheckPolicy, read: true, connected: true })
+      dismissedQuestions: new Set([questionInboxKey(old.conversation_id, old.question_id)]), terminalCheckPolicy, read: true, connected: true })
     assert.deepEqual(prepared.overview.questions.map(q => q.question_id), ["fresh"])
     assert.equal(prepared.activities.groups.attention.length, 1)
   }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { availability, canSetProviderEnvironment, parseNodeSettings, probeIssueText, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
+import { questionInboxKey } from './questions.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
 import { isMainNotification, type BotRecord, type NodeInfo, type NotificationRecord, type PendingMessage, type Question, type ResolvedModel, type WorkCard, type WorkRecord } from './types.ts'
 import { parseNotifications } from './model.ts'
@@ -71,7 +72,7 @@ test('a synced list receipt hides only its ordinary question and leaves approval
   held.attention = { kind: 'approval', device_id: 'node' }
   state.workspace.questions = [question('old'), held, question('new')]
   state.workspace.questions[2].created_at_ms = 2
-  state.workspace.dismissedQuestions = new Set(['["c","old"]'])
+  state.workspace.dismissedQuestions = new Set([questionInboxKey('c', 'old')])
   assert.deepEqual(inboxItems(state).filter((item) => item.kind === 'question').map((item) => item.question.question_id), ['new', 'held'])
 })
 
