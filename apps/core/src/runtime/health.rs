@@ -20,6 +20,9 @@ const MAX_TOOL_WORKS: usize = 128;
 const MAX_TOOL_BYTES: usize = 64 * 1024;
 /// Ten hello rounds (`peers::HELLO_INTERVAL`) without a finished sync.
 const SYNC_STALL_MS: i64 = 10 * 60_000;
+/// ponytail: one limit for every waiting state; a long but legitimate active turn can trip it
+/// for the inputs queued behind it, which costs one reminder.
+const JOB_STALL_MS: i64 = 30 * 60_000;
 /// ponytail: at most 10 s per probe, so one round stays under its minute.
 const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const HOUR_MS: i64 = 3_600_000;
@@ -36,6 +39,7 @@ pub(crate) enum Check {
     WorkLooping,
     AppServerUnresponsive,
     SyncStalled,
+    JobStalled,
 }
 
 impl Check {
@@ -45,6 +49,7 @@ impl Check {
             Self::WorkLooping => "work.looping",
             Self::AppServerUnresponsive => "app_server.unresponsive",
             Self::SyncStalled => "sync.stalled",
+            Self::JobStalled => "job.stalled",
         }
     }
 
@@ -54,6 +59,7 @@ impl Check {
             Self::WorkLooping => "work.loop_ended",
             Self::AppServerUnresponsive => "app_server.recovered",
             Self::SyncStalled => "sync.recovered",
+            Self::JobStalled => "job.recovered",
         }
     }
 
@@ -62,7 +68,8 @@ impl Check {
             Self::WorkStalled => "a running work shows no progress",
             Self::WorkLooping => "a running work repeats tool results or explicit failures",
             Self::AppServerUnresponsive => "the Codex App Server does not answer",
-            Self::SyncStalled => "a reachable peer stopped syncing",
+            Self::SyncStalled => "a connected peer stopped syncing",
+            Self::JobStalled => "a scheduled turn waits in the same state",
         }
     }
 
@@ -72,6 +79,7 @@ impl Check {
             Self::WorkLooping => "运行中的工作疑似重复调用工具或连续失败",
             Self::AppServerUnresponsive => "Codex App Server 没有响应",
             Self::SyncStalled => "对端可以连通，但同步停滞",
+            Self::JobStalled => "一轮回复长时间停在同一状态",
         }
     }
 }
@@ -236,6 +244,10 @@ pub(crate) struct HealthState {
     app_server_missed: Option<i64>,
     /// Problems handed to the primary bot within the last day.
     handed: Vec<(ProblemKey, i64)>,
+    /// Open problems the primary bot has not got yet; each round tries them again.
+    unhanded: BTreeSet<ProblemKey>,
+    /// Each open scheduler job's state and since when this Node has seen it in that state.
+    jobs: HashMap<String, (&'static str, i64)>,
 }
 
 impl HealthState {
@@ -249,6 +261,8 @@ impl HealthState {
             tools: HashMap::new(),
             app_server_missed: None,
             handed: Vec::new(),
+            unhanded: BTreeSet::new(),
+            jobs: HashMap::new(),
         }
     }
 
@@ -307,6 +321,7 @@ impl HealthState {
             self.baseline_ms = now;
             self.pending.clear();
             self.tools.clear();
+            self.jobs.clear();
             self.app_server_missed = None;
         }
         asleep
@@ -355,6 +370,8 @@ impl HealthState {
             .partition(|(key, _)| ran.contains(&key.check));
         open.extend(kept);
         self.problems = open;
+        self.unhanded.extend(began.iter().map(Problem::key));
+        self.unhanded.retain(|key| self.problems.contains_key(key));
         (
             began,
             ended.into_iter().map(|(_, problem)| problem).collect(),
@@ -374,6 +391,15 @@ impl HealthState {
     /// Counts a problem the primary bot got.
     fn handed(&mut self, key: &ProblemKey, now: i64) {
         self.handed.push((key.clone(), now));
+        self.unhanded.remove(key);
+    }
+
+    /// Open problems the primary bot has not got.
+    fn unhanded(&self) -> Vec<Problem> {
+        self.unhanded
+            .iter()
+            .filter_map(|key| self.problems.get(key).cloned())
+            .collect()
     }
 
     /// Records one answered (`true`) or missed probe; returns when the run of misses began.
@@ -384,6 +410,51 @@ impl HealthState {
         }
         Some(*self.app_server_missed.get_or_insert(now))
     }
+}
+
+/// Scheduler jobs that stayed in one waiting state for `JOB_STALL_MS`, counted from when this
+/// Node first saw them there and from `baseline_ms` at the earliest. A running turn has its
+/// own timeout and its works their own check.
+fn stalled_jobs(
+    state: &mut HealthState,
+    jobs: &[crate::scheduling::SchedulerJob],
+    now: i64,
+) -> Vec<Problem> {
+    let waiting: Vec<_> = jobs
+        .iter()
+        .filter(|job| !matches!(job.state, crate::scheduling::JobState::Running { .. }))
+        .collect();
+    let seen = std::mem::take(&mut state.jobs);
+    for job in &waiting {
+        let name = job.state.name();
+        let since = match seen.get(&job.trigger) {
+            Some((known, since)) if *known == name => *since,
+            _ => now,
+        };
+        state.jobs.insert(job.trigger.clone(), (name, since));
+    }
+    waiting
+        .into_iter()
+        .filter_map(|job| {
+            let (name, since) = state.jobs[&job.trigger];
+            let since = since.max(state.baseline_ms);
+            (now - since > JOB_STALL_MS).then(|| Problem {
+                check: Check::JobStalled,
+                subject: job.trigger.clone(),
+                since_ms: since,
+                detail: format!(
+                    "{name} for over {} minutes{}",
+                    JOB_STALL_MS / 60_000,
+                    if job.pending_check {
+                        "; waits on a pending check"
+                    } else {
+                        ""
+                    }
+                ),
+                conversation_id: Some(job.conversation_id.clone()),
+            })
+        })
+        .collect()
 }
 
 /// Runs of works that are past `WORK_STALL_MS` since their last progress.
@@ -458,8 +529,9 @@ fn looping_works(
         .collect()
 }
 
-/// Peers that answer but finished no sync for `SYNC_STALL_MS`, counted from `baseline_ms` at
-/// the earliest.
+/// Peers this Node is connected to, or whose last sync finished, with no sync finished for
+/// `SYNC_STALL_MS`, counted from `baseline_ms` at the earliest. A peer whose syncs fail while
+/// its connection stays open counts too, and one that never finished a sync since start.
 fn stalled_peers(
     peers: &[crate::maintenance::PeerHealth],
     baseline_ms: i64,
@@ -468,26 +540,39 @@ fn stalled_peers(
     peers
         .iter()
         .filter_map(|peer| {
-            let synced = peer.synced_ms?;
-            (peer.reachable == Some(true) && now - synced.max(baseline_ms) > SYNC_STALL_MS).then(
-                || Problem {
-                    check: Check::SyncStalled,
-                    subject: peer.device_id.clone(),
-                    since_ms: synced,
-                    detail: format!("{} answers, but no sync has finished since", peer.name),
-                    conversation_id: None,
-                },
-            )
+            let connected = peer.path.is_some();
+            if !connected && peer.reachable != Some(true) {
+                return None;
+            }
+            let since_ms = peer.synced_ms.unwrap_or(baseline_ms);
+            let detail = match (peer.synced_ms, peer.reachable) {
+                (None, _) => format!(
+                    "{} is connected, but no sync has finished since start",
+                    peer.name
+                ),
+                (Some(_), Some(false)) => {
+                    format!("{} is connected, but every sync since fails", peer.name)
+                }
+                _ => format!("{} answers, but no sync has finished since", peer.name),
+            };
+            (now - since_ms.max(baseline_ms) > SYNC_STALL_MS).then(|| Problem {
+                check: Check::SyncStalled,
+                subject: peer.device_id.clone(),
+                since_ms,
+                detail,
+                conversation_id: None,
+            })
         })
         .collect()
 }
 
 fn record(problem: &Problem, began: bool) {
     let subject = problem.subject.as_str();
-    let (work_id, peer) = match problem.check {
-        Check::WorkStalled | Check::WorkLooping => (Some(subject), None),
-        Check::SyncStalled => (None, Some(subject)),
-        Check::AppServerUnresponsive => (None, None),
+    let (work_id, peer, trigger) = match problem.check {
+        Check::WorkStalled | Check::WorkLooping => (Some(subject), None, None),
+        Check::SyncStalled => (None, Some(subject), None),
+        Check::JobStalled => (None, None, Some(subject)),
+        Check::AppServerUnresponsive => (None, None, None),
     };
     let conversation_id = problem.conversation_id.as_deref();
     if began {
@@ -496,6 +581,7 @@ fn record(problem: &Problem, began: bool) {
             work_id,
             conversation_id,
             peer,
+            trigger,
             since_ms = problem.since_ms,
             detail = problem.detail,
             "{}",
@@ -507,6 +593,7 @@ fn record(problem: &Problem, began: bool) {
             work_id,
             conversation_id,
             peer,
+            trigger,
             since_ms = problem.since_ms,
             "{} no longer",
             problem.check.summary()
@@ -653,7 +740,13 @@ pub(crate) fn read_logs(dir: &Path, args: &Value) -> Result<Value> {
         event: query.event,
         conversation_id: query.conversation_id,
         text: query.grep,
-        limit: Some(limit.saturating_add(skip).min(crate::logging::MAX_READ)),
+        // One more than a page, so a page cut at `limit` still gets a cursor.
+        limit: Some(
+            limit
+                .saturating_add(skip)
+                .saturating_add(1)
+                .min(crate::logging::MAX_READ),
+        ),
         ..Default::default()
     };
     let mut records = crate::logging::read(dir, &filter)?;
@@ -667,13 +760,15 @@ pub(crate) fn read_logs(dir: &Path, args: &Value) -> Result<Value> {
             .count();
         records.truncate(records.len() - skip.min(at_until));
     }
-    if records.len() > limit {
-        records.drain(..records.len() - limit);
+    if records.len() > limit + 1 {
+        records.drain(..records.len() - limit - 1);
     }
     // Room for the envelope, `truncated` and `cursor`.
     let mut room = super::agent_tools::PAGE_BYTES - 200;
     let mut page: Vec<crate::logging::Record> = Vec::new();
-    while let Some(record) = records.pop() {
+    while page.len() < limit
+        && let Some(record) = records.pop()
+    {
         let mut record = shortened(record);
         let mut size = serde_json::to_string(&record)?.len() + 1;
         if size > room && page.is_empty() {
@@ -798,6 +893,18 @@ impl Runtime {
             }
             Err(error) => tracing::debug!(%error, "the work check waits for the next round"),
         }
+        match self
+            .store
+            .read("health.jobs", |store| store.open_scheduler_jobs())
+            .await
+        {
+            Ok(jobs) => {
+                ran.push(Check::JobStalled);
+                let mut state = self.health.lock().expect("health");
+                found.extend(stalled_jobs(&mut state, &jobs, now));
+            }
+            Err(error) => tracing::debug!(%error, "the job check waits for the next round"),
+        }
         // Not connected is no probe: the check keeps what it had.
         if let Some(answered) = self.probe_app_server().await {
             ran.push(Check::AppServerUnresponsive);
@@ -825,11 +932,17 @@ impl Runtime {
         for problem in &ended {
             record(problem, false);
         }
-        for problem in began {
-            record(&problem, true);
-            if let Err(error) = self.hand_to_primary_bot(&problem, now).await {
+        for problem in &began {
+            record(problem, true);
+        }
+        // A problem the primary bot did not get, for a limit, a missing bot or a failed write,
+        // goes again each round while it stays open. Only its first try logs at info.
+        let unhanded = self.health.lock().expect("health").unhanded();
+        for problem in unhanded {
+            let first = began.iter().any(|new| new.key() == problem.key());
+            if let Err(error) = self.hand_to_primary_bot(&problem, now, first).await {
                 tracing::warn!(event = "health.handoff_failed", %error, check = ?problem.check,
-                    subject = problem.subject, "a new problem did not reach the primary bot");
+                    subject = problem.subject, "an open problem did not reach the primary bot");
             }
         }
     }
@@ -853,7 +966,7 @@ impl Runtime {
     /// daily limits. Only the Node that schedules the primary bot may; no Node path lets another
     /// one start that bot's turn without the user's own message, so there only the log has it,
     /// as it does without a running bot or a primary bot.
-    async fn hand_to_primary_bot(&self, problem: &Problem, now: i64) -> Result<()> {
+    async fn hand_to_primary_bot(&self, problem: &Problem, now: i64, first: bool) -> Result<()> {
         if self.manager().is_none() || !self.writable() {
             return Ok(());
         }
@@ -866,8 +979,10 @@ impl Runtime {
             .expect("health")
             .may_hand(&problem.key(), now)
         {
-            tracing::info!(event = "health.handoff_limited", check = ?problem.check,
-                subject = problem.subject, "the hourly or daily limit holds this problem back from the primary bot");
+            if first {
+                tracing::info!(event = "health.handoff_limited", check = ?problem.check,
+                    subject = problem.subject, "the hourly or daily limit holds this problem back from the primary bot");
+            }
             return Ok(());
         }
         let device = self.identity.device_id()?;
@@ -885,19 +1000,25 @@ impl Runtime {
                 .await?
         };
         match reminded {
-            PrimaryReminder::NoPrimaryBot => {
+            PrimaryReminder::NoPrimaryBot if first => {
                 tracing::info!(event = "health.no_primary_bot", check = ?problem.check,
                     "no primary bot to hand the problem to");
             }
             PrimaryReminder::NotOwner {
                 conversation_id,
                 owner,
-            } => {
+            } if first => {
                 tracing::info!(event = "health.not_owner", conversation_id, owner,
                     check = ?problem.check, subject = problem.subject,
                     "another Node schedules the primary bot, so only this log has the problem");
             }
+            PrimaryReminder::NoPrimaryBot | PrimaryReminder::NotOwner { .. } => {}
             PrimaryReminder::Existing(change) => {
+                self.health
+                    .lock()
+                    .expect("health")
+                    .unhanded
+                    .remove(&problem.key());
                 tracing::debug!(conversation_id = change.conversation_id, check = ?problem.check,
                     "the primary bot already has this problem");
             }
@@ -984,11 +1105,12 @@ mod tests {
         }
     }
 
-    const ALL: [Check; 4] = [
+    const ALL: [Check; 5] = [
         Check::WorkStalled,
         Check::WorkLooping,
         Check::AppServerUnresponsive,
         Check::SyncStalled,
+        Check::JobStalled,
     ];
 
     fn tool_event(id: usize, command: &str, output: &str, exit: i64) -> Value {
@@ -1567,6 +1689,95 @@ mod tests {
         assert_eq!(
             (stalled[0].check, stalled[0].since_ms),
             (Check::SyncStalled, 1)
+        );
+    }
+
+    #[test]
+    fn read_logs_gives_a_cursor_when_more_records_match_than_the_limit() -> Result<()> {
+        let dir = log_dir("health-log-count", 51, |index| index, |_| {})?;
+        let first = read_logs(&dir, &json!({}))?;
+        assert_eq!(first["records"].as_array().unwrap().len(), 50);
+        assert_eq!(
+            first["truncated"], true,
+            "the 51st record is not lost silently"
+        );
+        let rest = read_logs(&dir, &json!({"cursor":first["cursor"]}))?;
+        assert_eq!(rest["records"].as_array().unwrap().len(), 1);
+        assert!(rest.get("cursor").is_none());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_connected_peer_whose_syncs_fail_or_never_finish_stalls() {
+        let peer = |path, reachable, synced_ms| crate::maintenance::PeerHealth {
+            device_id: "d".into(),
+            path,
+            name: "Mac".into(),
+            reachable,
+            synced_ms,
+            rtt_ms: None,
+            path_changes: 0,
+            disconnects: 0,
+        };
+        let late = SYNC_STALL_MS + 2;
+        let direct = Some(crate::net::PathKind::Direct);
+        assert_eq!(
+            stalled_peers(&[peer(direct, Some(false), Some(1))], 0, late).len(),
+            1
+        );
+        assert_eq!(stalled_peers(&[peer(direct, None, None)], 1, late).len(), 1);
+        assert!(stalled_peers(&[peer(None, Some(false), Some(1))], 0, late).is_empty());
+        assert!(stalled_peers(&[peer(direct, None, None)], 5, late).is_empty());
+    }
+
+    #[test]
+    fn a_job_stalls_after_waiting_in_one_state() {
+        let job = |state| crate::scheduling::SchedulerJob {
+            conversation_id: "c".into(),
+            scope: crate::scheduling::SessionScope::Main,
+            trigger: "message:m".into(),
+            kind: crate::scheduling::TriggerKind::Human,
+            sequence: 1,
+            basis: crate::model::VersionVector::new(),
+            reply_to: "message:m".into(),
+            message_id: "reply".into(),
+            runtime: None,
+            pending_check: false,
+            tool_calls: false,
+            state,
+        };
+        let mut state = HealthState::new(0);
+        let queued = [job(crate::scheduling::JobState::Queued)];
+        assert!(stalled_jobs(&mut state, &queued, 1_000).is_empty());
+        assert!(stalled_jobs(&mut state, &queued, 1_000 + JOB_STALL_MS).is_empty());
+        let stalled = stalled_jobs(&mut state, &queued, 1_001 + JOB_STALL_MS);
+        assert_eq!(
+            (stalled[0].since_ms, stalled[0].conversation_id.as_deref()),
+            (1_000, Some("c"))
+        );
+        assert!(stalled_jobs(&mut state, &[], 2_000 + JOB_STALL_MS).is_empty());
+        assert!(state.jobs.is_empty(), "a finished job is forgotten");
+    }
+
+    #[test]
+    fn an_open_problem_the_bot_did_not_get_is_tried_again_until_it_ends() {
+        let mut state = HealthState::new(0);
+        let found = || vec![problem(Check::WorkStalled, "w", 0)];
+        state.update(&ALL, found(), 1);
+        state.update(&ALL, found(), 2);
+        assert_eq!(state.unhanded().len(), 1);
+        state.update(&ALL, found(), 3);
+        assert_eq!(state.unhanded().len(), 1, "still open, still not handed");
+        state.handed(&problem(Check::WorkStalled, "w", 0).key(), 3);
+        assert!(state.unhanded().is_empty());
+        state
+            .unhanded
+            .insert(problem(Check::WorkStalled, "w", 0).key());
+        state.update(&ALL, vec![], 4);
+        assert!(
+            state.unhanded().is_empty(),
+            "an ended problem is not handed"
         );
     }
 }

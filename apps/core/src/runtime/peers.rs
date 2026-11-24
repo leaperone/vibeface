@@ -23,6 +23,9 @@ const RETRY_LIMIT: Duration = Duration::from_secs(30);
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_CHUNK: usize = 64 * 1024;
 const BLOB_SYNC_BYTES: u64 = 1024 * 1024;
+/// A source that sends nothing for this long while its connection stays open loses the
+/// download; the committed offset stays for the next try.
+const BLOB_IDLE: Duration = Duration::from_secs(30);
 const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
@@ -2418,8 +2421,9 @@ impl Runtime {
         )
         .await?;
         send.finish().ok();
-        let header = net::read_frame(&mut recv)
-            .await?
+        let header = tokio::time::timeout(BLOB_IDLE, net::read_frame(&mut recv))
+            .await
+            .map_err(|_| blob_stalled(peer, blob, committed))??
             .context("source closed the attachment stream")?;
         if let Some(error) = header["error"].as_str() {
             bail!("{error}");
@@ -2454,9 +2458,9 @@ impl Runtime {
         file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
-        while let Some(chunk) = recv
-            .read_chunk(BLOB_CHUNK)
+        while let Some(chunk) = tokio::time::timeout(BLOB_IDLE, recv.read_chunk(BLOB_CHUNK))
             .await
+            .map_err(|_| blob_stalled(peer, blob, offset))?
             .map_err(|error| anyhow::anyhow!("attachment stream failed: {error}"))?
         {
             offset += chunk.len() as u64;
@@ -2537,6 +2541,15 @@ pub(super) fn staging_room_for(dir: &Path, size: u64, new_object: bool) -> Resul
     );
     Ok(())
 }
+fn blob_stalled(peer: &str, blob: &BlobRef, offset: u64) -> anyhow::Error {
+    tracing::warn!(event = "attachment.stalled", %peer, blob = blob.hash, offset, size = blob.size,
+        idle_s = BLOB_IDLE.as_secs(), "an attachment source stopped sending");
+    anyhow::anyhow!(
+        "attachment source sent nothing for {} s",
+        BLOB_IDLE.as_secs()
+    )
+}
+
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
