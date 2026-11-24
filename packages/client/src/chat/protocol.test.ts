@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, promptIntent, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
+import { awaitsDevice, botReach, botCanSend, canRetryJob, inputEventBody, inputTargetKey, inputTaskCommand, runtimeLabel, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, starterExamples, promptIntent, replyStatusLabel, retryText, reachDevice } from './protocol.ts'
 import type { ManagerJob, TurnRuntime } from '../workspace/types.ts'
 import { parseInputReceipt, parseMessageRequest, parseNodes, parsePendingMessage, parseTurnRuntime, parseWorkspaceCommand, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState, record } from '../workspace/model.ts'
 import { enqueue, type OutboxItem, type OutboxRecord } from '../lib/outbox.ts'
@@ -267,4 +267,12 @@ test('untyped message, queued input and history boundaries require explicit repo
 test('chat input steers by default and starts a task only when the prompt asks', () => {
   for (const text of ['新任务：整理发布说明', ' New task: fix login', 'new  task', '新任务 帮我修登录', '新任务，修登录', 'NEW TASK, fix it', '新任务']) assert.equal(promptIntent(text), 'new_task', text)
   for (const text of ['新任务的进度怎么样？', '新任务呢', 'New task assignments look wrong', '新任务帮我修登录', '顺便看看新任务的进度', 'new tasks list', 'renew task', '']) assert.equal(promptIntent(text), 'continue', text)
+})
+
+
+test('starter drafts use available material and project execution capability', () => {
+  assert.match(starterExamples({ project: true, attachments: false, canRun: true })[0], /只读.*先别改代码/)
+  assert.match(starterExamples({ project: true, attachments: false, canRun: false })[0], /通知/)
+  assert.match(starterExamples({ project: false, attachments: true, canRun: true })[0], /附件.*先别发送/)
+  assert.ok(starterExamples({ project: false, attachments: false, canRun: true }).every((text) => !text.includes('记住')))
 })

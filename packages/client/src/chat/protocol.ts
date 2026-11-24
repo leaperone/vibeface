@@ -6,8 +6,17 @@ import { providerNames } from '../lib/node.ts'
 import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
-/** Start with the bot's role and the person's goal, including when it has a project folder. */
-export const starters = { project: ['按你的职责，你能帮我完成什么？', '先帮我理清目标和步骤', '开始前，需要我提供哪些信息？'], general: ['你能帮我完成什么？', '先帮我理清目标和步骤', '记住：回复用中文'] }
+/** Examples fill an editable draft; they never send or grant permission. */
+export const starters = {
+  project: ['只读排查这个项目的登录流程，给出问题和依据，先别改代码', '整理这个项目最近的改动，写成可复制的发布说明'],
+  general: ['把我提供的活动说明写成给家长的通知，缺少的信息标待补，先别发送', '把我提供的会议记录整理成决定和待办'],
+}
+export function starterExamples(input: { project: boolean; attachments: boolean; canRun: boolean }): string[] {
+  return [
+    ...(input.attachments ? ['把附件整理成一份可复制的通知，缺少的信息标待补，先别发送'] : []),
+    ...(input.project && input.canRun ? starters.project : starters.general),
+  ]
+}
 
 export function inputTaskCommand(input: { task_id: string; owner_bot: string; text: string; channel_id?: string; source_events?: readonly string[] }): Extract<WorkspaceCommand, { kind: 'create_task' }> {
   const request = inputText(input.text.trim() || '附件输入', '任务交代', 65536)

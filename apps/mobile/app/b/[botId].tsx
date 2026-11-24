@@ -9,7 +9,7 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, replyUnsettled, starters, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -334,7 +334,7 @@ export default function ChatScreen() {
           </View> : null}
         </View>
         {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
+          {starterExamples({ project: Boolean(bot.project), attachments: draft.files.length > 0, canRun: botCanSend(reach) }).map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
         </View> : null) : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>

@@ -11,7 +11,7 @@ import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
-import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starters } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
 import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -275,7 +275,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
           </>
             : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
               <div className="flex flex-wrap justify-center gap-2">
-                {starters[bot.project ? 'project' : 'general'].map((example) => <button key={example} type="button" className={`${buttonStyles.button} ${buttonStyles.secondary} h-auto max-w-full whitespace-normal! py-2! [overflow-wrap:anywhere]`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</button>)}
+                {starterExamples({ project: Boolean(bot.project), attachments: files.length > 0, canRun: agentReady }).map((example) => <button key={example} type="button" className={`${buttonStyles.button} ${buttonStyles.secondary} h-auto max-w-full whitespace-normal! py-2! [overflow-wrap:anywhere]`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</button>)}
               </div>
             </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
