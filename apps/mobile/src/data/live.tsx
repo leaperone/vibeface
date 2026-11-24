@@ -147,9 +147,19 @@ function Live({ children }: { children: ReactNode }) {
   const seen = useMemo(() => lastSeen(scope), [scope?.network_id, scope?.device_id, scope?.entry_device_id, device.phase])
 
   const cached = useMemo(() => localConversations.all({ networkId, deviceId: me ?? '' }), [networkId, me, data, shared.generation])
-  const conversations: Record<string, Conversation> = Object.fromEntries(cached.map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
+  // The open conversation shows what the workspace holds, so its stored copy is not projected only to be replaced.
+  const replaced = data && conversationId && (shared.dataOrigin === 'cache' || shared.dataOrigin === 'network') ? conversationId : null
+  const conversations: Record<string, Conversation> = Object.fromEntries(cached.filter((record) => record.conversationId !== replaced).map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
   if (data && conversationId && shared.dataOrigin === 'cache') conversations[conversationId] = cachedConversation({ networkId, deviceId: me ?? '', conversationId, savedAt: cached.find((record) => record.conversationId === conversationId)?.savedAt ?? Date.now(), payload: data }, shared.pendingMessages)
-  if (data && conversationId && shared.dataOrigin === 'network') {
+  // Live progress re-renders this far more often than the conversation itself changes.
+  const shown = useMemo(() => {
+    if (!data || shared.dataOrigin !== 'network') return null
+    const steered = new Set((data.scheduler?.jobs ?? []).filter((job) => job.state === 'steered').map((job) => job.message_id))
+    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
+    return { timeline: chatTimeline(data.messages, data.questions, steered), folded: foldAnswers(data.messages, data.questions) }
+  }, [data, shared.dataOrigin])
+  if (data && conversationId && shown) {
+    const { timeline, folded } = shown
     const jobs = data.scheduler?.jobs ?? []
     // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
     // streaming, which can land a frame or two before the job names it.
@@ -165,9 +175,6 @@ function Live({ children }: { children: ReactNode }) {
     const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
     const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? (sending ? pending.at(-1)?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id))
-    const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
-    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
-    const folded = foldAnswers(data.messages, data.questions)
     const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers) && shared.fresh.has(`question:${question.question_id}`))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined

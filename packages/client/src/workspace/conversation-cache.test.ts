@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { conversationCacheStorageKey, createConversationCache } from './conversation-cache.ts'
+import { conversationCacheStorageKey, conversationSlotKey, createConversationCache } from './conversation-cache.ts'
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from './conversation-read.ts'
 import { completeHistory } from './history-fixture.ts'
 import { mergeHistoryPage } from './history.ts'
@@ -11,7 +11,7 @@ const scope = { networkId: 'network', deviceId: 'phone' }
 const key = (conversationId: string) => ({ ...scope, conversationId })
 function storage() {
   const values = new Map<string, string>()
-  return { getItem: (name: string) => values.get(name) ?? null, setItem: (name: string, value: string) => { values.set(name, value) } }
+  return { values, getItem: (name: string) => values.get(name) ?? null, setItem: (name: string, value: string) => { values.set(name, value) } }
 }
 const message = (id: string, rank = 1) => ({ message_id: id, event_hash: `event-${id}`, role: 'assistant', text: id, created_at_ms: rank, rank: String(rank).padStart(20, '0') })
 function raw(conversationId = 'A', extra: Record<string, unknown> = {}) {
@@ -61,16 +61,24 @@ test('network, device and conversation keys isolate equal IDs and scoped clearin
   assert.equal(cache.all({ ...scope, deviceId: 'other-phone' }).length, 1)
 })
 
-test('corrupt JSON, invalid timestamps, identity mismatches and invalid payloads never become display records', () => {
-  const local = storage(), cache = createConversationCache({ storage: local })
-  for (const value of ['{', '{}', JSON.stringify([{ ...key('A'), savedAt: -1, payload: snapshot() }]), JSON.stringify([{ ...key('A'), savedAt: 0, payload: snapshot('B') }]), JSON.stringify([{ ...key('A'), savedAt: 0, payload: { ...snapshot(), history: {} } }])]) {
-    local.setItem(conversationCacheStorageKey, value)
-    assert.equal(cache.read(key('A')), null)
+test('corrupt JSON, invalid timestamps, identity mismatches, stale revisions and invalid payloads never become display records', () => {
+  const valid = { ...key('A'), savedAt: 0, revision: 1, payload: snapshot() }
+  const shown = (index: string, value: unknown = valid) => {
+    const local = storage()
+    local.setItem(conversationSlotKey(0), typeof value === 'string' ? value : JSON.stringify(value))
+    local.setItem(conversationCacheStorageKey, index)
+    return createConversationCache({ storage: local }).read(key('A'))
   }
+  assert.equal(shown('[[0,1]]')?.savedAt, 0)
+  for (const index of ['{', '{}', '[[0]]', '[[-1,1]]', '[[0.5,1]]', '[[0,"1"]]', '[[0,2]]']) assert.equal(shown(index), null)
+  for (const value of ['{', 'null', '', { ...valid, savedAt: -1 }, { ...valid, payload: snapshot('B') }, { ...valid, payload: { ...snapshot(), history: {} } }, { ...valid, revision: 2 }, { ...valid, revision: undefined }]) {
+    assert.equal(shown('[[0,1]]', value), null)
+  }
+  const local = storage(), cache = createConversationCache({ storage: local })
   cache.save({ ...key('A'), payload: snapshot() })
   const good: unknown = JSON.parse(local.getItem(conversationCacheStorageKey) ?? 'null')
   assert.ok(Array.isArray(good))
-  local.setItem(conversationCacheStorageKey, JSON.stringify([null, {}, ...good]))
+  local.setItem(conversationCacheStorageKey, JSON.stringify([null, {}, [7, 1], ...good]))
   assert.equal(cache.all(scope).length, 1)
   assert.throws(() => cache.save({ ...key('A'), payload: snapshot('B') }))
 })
@@ -79,16 +87,63 @@ test('capacity eviction drops whole conversations and preserves truthful history
   const local = storage(), cache = createConversationCache({ storage: local, maxConversations: 2 })
   for (const id of ['A', 'B', 'C']) cache.save({ ...key(id), payload: snapshot(id) })
   assert.deepEqual(cache.all(scope).map((item) => item.conversationId), ['B', 'C'])
-  const size = new TextEncoder().encode(local.getItem(conversationCacheStorageKey) ?? '').length
+  const size = cache.stats(scope).bytes
+  assert.equal(size, [...local.values].filter(([name]) => name !== conversationCacheStorageKey).reduce((sum, [, value]) => sum + new TextEncoder().encode(value).length, 0))
+  assert.deepEqual(createConversationCache({ storage: local, maxBytes: size - 1 }).all(scope).map((item) => item.conversationId), ['C'], 'the oldest whole conversation goes first')
   const bounded = createConversationCache({ storage: local, maxBytes: size, maxConversations: 2 })
   bounded.save({ ...key('huge'), payload: snapshot('huge', { messages: [message('x'.repeat(size))] }) })
   bounded.save({ ...key('B'), payload: snapshot('B', { messages: [message('x'.repeat(size))] }) })
   assert.deepEqual(bounded.all(scope).map((item) => item.conversationId), ['B', 'C'])
   assert.ok(bounded.stats(scope).bytes <= size)
   assert.equal(bounded.read(key('C'))?.payload.history.messages.complete, true)
+  for (let index = 0; index < 8; index += 1) cache.save({ ...key(`R${index}`), payload: snapshot(`R${index}`) })
+  assert.ok(local.values.size <= 4, 'evicted slots are reused, so storage holds the index and at most one slot beyond the limit')
   bounded.clear(scope)
   assert.equal(bounded.stats(scope).conversations, 0)
   assert.throws(() => createConversationCache({ storage: local, maxConversations: 0 }))
+})
+
+test('a save writes only its own conversation and the small index; replaced and cleared copies are blanked', () => {
+  const local = storage(), writes: [string, string][] = []
+  const cache = createConversationCache({ storage: { getItem: local.getItem, setItem: (name, value) => { writes.push([name, value]); local.setItem(name, value) } } })
+  for (const id of ['A', 'B', 'C']) cache.save({ ...key(id), payload: snapshot(id, { messages: [message(`${id}-text`)] }) })
+  writes.length = 0
+  cache.save({ ...key('B'), payload: snapshot('B', { messages: [message('B-new')] }) })
+  assert.deepEqual(writes.map(([name, value]) => [name, value.includes('B-new'), /[AC]-text/.test(value)]), [
+    [conversationSlotKey(3), true, false], [conversationCacheStorageKey, false, false], [conversationSlotKey(1), false, false],
+  ])
+  assert.ok((local.getItem(conversationCacheStorageKey) ?? '').length < 100)
+  assert.equal(local.getItem(conversationSlotKey(1)), '')
+  assert.deepEqual(createConversationCache({ storage: local }).all(scope).map((item) => [item.conversationId, item.payload.messages[0]?.message_id]), [['A', 'A-text'], ['C', 'C-text'], ['B', 'B-new']])
+  cache.clear(scope)
+  assert.ok([...local.values.values()].every((value) => !/-text|-new/.test(value)), 'cleared conversations leave no readable copy')
+})
+
+test('another cache instance keeps unchanged snapshots and rereads only the conversation that was rewritten', () => {
+  const local = storage(), reads: string[] = []
+  const writer = createConversationCache({ storage: local })
+  const reader = createConversationCache({ storage: { getItem: (name) => { reads.push(name); return local.getItem(name) }, setItem: local.setItem } })
+  for (const id of ['A', 'B']) writer.save({ ...key(id), payload: snapshot(id) })
+  const [a, b] = reader.all(scope)
+  reads.length = 0
+  assert.deepEqual(reader.all(scope), [a, b])
+  assert.equal(reader.all(scope)[1], b)
+  assert.deepEqual(reads, [conversationCacheStorageKey, conversationCacheStorageKey])
+  writer.save({ ...key('B'), payload: snapshot('B', { messages: [message('B-new')] }) })
+  reads.length = 0
+  const [first, second] = reader.all(scope)
+  assert.equal(first, a)
+  assert.equal(second?.payload.messages[0]?.message_id, 'B-new')
+  assert.deepEqual(reads, [conversationCacheStorageKey, conversationSlotKey(2)])
+  writer.clear(key('A'))
+  assert.deepEqual(reader.all(scope).map((item) => item.conversationId), ['B'])
+  assert.equal(reader.read(key('B'))?.payload.messages[0]?.message_id, 'B-new')
+  const counted = { getItem: (name: string) => { reads.push(name); return local.getItem(name) }, setItem: local.setItem }
+  const owner = createConversationCache({ storage: counted }), sibling = createConversationCache({ storage: counted })
+  owner.save({ ...key('C'), payload: snapshot('C') })
+  reads.length = 0
+  assert.deepEqual(sibling.all(scope).map((item) => item.conversationId), ['B', 'C'])
+  assert.deepEqual(reads, [conversationCacheStorageKey], 'instances over the same storage reuse each other\'s parsed copies')
 })
 
 test('a failed disk write retains bounded in-memory conversations for immediate switching', () => {
