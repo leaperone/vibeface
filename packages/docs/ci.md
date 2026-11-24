@@ -39,7 +39,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 | --- | --- | --- |
 | 编辑反馈 | Web 的 Vite HMR、按需 Rust 增量构建 | 辅助开发，不证明重启、恢复或制品可用 |
 | 本地相关检查 | `ci.py plan`、选中包的检查与进程专项 | 核对本次改动涉及的行为 |
-| PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据，不自动合并 |
+| PR 验收 | 独立工作树和同一个 PR，创建后及最终 HEAD 执行 `preflight --no-merge` | 检查固定 base、HEAD、范围及必要证据；preflight 本身不合并，由 Shipping 合并 |
 | 合并后检查 | Shipping 合并后核对 `main` 的 `ci-gate` | 证明该运行选中的检查成功，不发布应用 |
 | 制品发布 | 各应用的精确 Tag 与发布入口 | 核对该应用的完整制品与最终清单；服务应用随后部署，CLI 随后分发 npm |
 | 服务部署 | 自动派发或独立 deploy 命令与对应部署 workflow | 消费已发布版本，核对实际运行版本和服务行为 |
@@ -299,7 +299,7 @@ Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v
 
 Core 的 plan 与 gate 都从同一个内部 `package_policy` 重新计算覆盖范围，拒绝将标准四平台计划缩成 Linux-only 或关闭 npm。未选的 npm 与非 Linux 包不计为已验证。
 
-GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 和明确合并授权。合并后的 CI 与各应用 Tag 的制品、发布和部署检查分别记录。
+GitHub 主分支规则不要求 PR 先更新到最新 base，也不将 `ci-gate` 列为必需状态。仓库开发流程仍要求相关本地验证、最终 HEAD 的 preflight 通过后由 Shipping 合并。合并后的 CI 与各应用 Tag 的制品、发布和部署检查分别记录。
 
 六类应用 Tag 由各自入口校验和发布，main 的普通 CI 只验证源码与制品。参见[构建与发布](releasing.md)。
 
