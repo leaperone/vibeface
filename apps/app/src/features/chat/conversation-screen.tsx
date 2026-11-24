@@ -11,7 +11,7 @@ import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
-import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntents,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
 import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -22,9 +22,10 @@ import { chatStatusLine,chatTaskState,nodeName,staleTaskLabel,taskActive,taskCop
 import { botReadiness,historySections,pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspace/questions.ts'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { InputIntent,InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
+import { DropdownMenu } from '@vibeface/uiarc/dropdown-menu/dropdown-menu.tsx'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
 import { useEffect,useRef,useState,type ReactNode,type RefObject } from 'react'
@@ -38,7 +39,7 @@ const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'runnin
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
-type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
+type ComposerDraft = { text: string; files: File[]; target: string; intent: InputIntent | null; conversationId: string }
 
 function NoBot() {
   const { bots } = useWorkspace()
@@ -61,6 +62,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
   const [selectedTarget, setSelectedTarget] = useState(routeRoutine ? `routine:${routeRoutine}` : 'main')
+  const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
   const [activityOpen, setActivityOpen] = useState(false)
   // The control that opened the activity drawer gets focus back, or the header button once it is gone, unless a link in it navigated away.
   const activityFrom = useRef<HTMLElement | null>(null)
@@ -69,8 +71,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const pendingMessages = workspace.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
-  const draftRef = useRef<ComposerDraft>({ text, files, target: selectedTarget, conversationId })
-  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== selectedTarget || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: selectedTarget, conversationId }
+  const draftRef = useRef<ComposerDraft>({ text, files, target: selectedTarget, intent: selectedIntent, conversationId })
+  if (draftRef.current.text !== text || draftRef.current.files !== files || draftRef.current.target !== selectedTarget || draftRef.current.intent !== selectedIntent || draftRef.current.conversationId !== conversationId) draftRef.current = { text, files, target: selectedTarget, intent: selectedIntent, conversationId }
   const draft = draftRef.current
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const jobs = data?.scheduler?.jobs ?? []
@@ -82,8 +84,11 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
   const sendDisabled = !workspace.canSaveMessages || !bot || !canSend({ ...gate, busy: false })
   const botBusy = activeJobs.length > 0
-  const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
-  const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : botBusy
+  const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : selectedTarget.startsWith('work:') ? { kind: 'work', work_id: selectedTarget.slice(5) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
+  const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : inputTarget?.kind === 'work' ? Boolean(data?.works.some((work) => work.work_id === inputTarget.work_id && taskActive(work.state))) : botBusy
+  const currentInput = data?.messages.find((message) => activeJobs.some((job) => job.message_id === message.message_id))
+  const targetLabel = inputTarget?.kind === 'routine' ? scheduleName(inputTarget.trigger, data?.bot_settings, data?.changes) : inputTarget?.kind === 'work' ? data?.works.find((work) => work.work_id === inputTarget.work_id)?.title || '原工作' : currentInput?.text.slice(0, 48) || `${bot?.name ?? 'Bot'} · 主聊天`
+  const intent = selectedIntent ?? promptIntent(text)
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
@@ -214,7 +219,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // This screen stays mounted, hidden, on other routes, so leaving this chat or route closes the drawer and drops its focus return.
   useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
-  useEffect(() => { setSendError(null); setFiles([]); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
+  useEffect(() => { setSendError(null); setFiles([]); setSelectedIntent(null); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -299,7 +304,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         hint={notice}
         reason={reason}
         disabled={sendDisabled}
-        sendLabel={targetBusy ? '补充当前工作' : '发送'}
+        sendLabel={inputIntentLabel(intent, targetBusy)}
+        target={<div className="flex min-w-0 flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm text-secondary">{targetLabel}</span><DropdownMenu label={inputIntentLabel(intent, targetBusy)} items={[...inputIntents.map((item) => ({ label: item.label, onSelect: () => setSelectedIntent(item.intent) })), ...works.filter((work) => taskActive(work.state)).map((work) => ({ label: `补充：${work.title || '工作'}`, onSelect: () => { setSelectedTarget(`work:${work.work_id}`); setSelectedIntent('continue') } })), ...(selectedTarget !== 'main' ? [{ label: '回到主聊天', onSelect: () => { setSelectedTarget('main'); setSelectedIntent(null) } }] : [])]} /></div>}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}
@@ -311,7 +317,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
           savingDrafts.current.add(submittedDraft)
           setSendError(null)
           const submittedFiles = files
-          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent: promptIntent(text), onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat" || draftRef.current !== submittedDraft) return; if (input.target.kind === "task" || input.target.kind === "channel_task") void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) setFiles((current) => current === submittedFiles ? [] : current) } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
+          workspace.sendMessage(text, submittedFiles, undefined, { target: inputTarget, intent, conversation_id: conversationId, onSaved: (input) => { if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.view !== "chat" || draftRef.current !== submittedDraft) return; if (input.target.kind === "task" || input.target.kind === "channel_task") void navigate({ to: "/tasks/$taskId", params: { taskId: input.target.task_id } }) } }).then((sent) => { if (sent && workspace.isCurrent()) { if (latest.current.conversationId !== conversationId || draftRef.current === submittedDraft) clearSentDraft(conversationId, text); if (draftRef.current === submittedDraft) { setFiles((current) => current === submittedFiles ? [] : current); setSelectedIntent(null) } } }).catch(setSendError).finally(() => { savingDrafts.current.delete(submittedDraft) })
         }}
       >
         <InlineError error={sendError} className="basis-full" />

@@ -72,9 +72,17 @@ export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }):
   if (!input.loaded) return '稍等'
   return ''
 }
-/** Chat composers steer the current work unless the message opens with 新任务 or new task followed by a separator or nothing. */
+/** A typed task prefix is a convenience; the composer's explicit choice takes precedence. */
 export function promptIntent(text: string): InputIntent {
   return /^\s*(新任务(?:$|[\s：:，,])|new\s+task(?:$|[:：,，]))/i.test(text) ? 'new_task' : 'continue'
+}
+export const inputIntents = [
+  { intent: 'continue', label: '补充当前工作' },
+  { intent: 'defer', label: '稍后处理' },
+  { intent: 'new_task', label: '另开一件' },
+] satisfies { intent: InputIntent; label: string }[]
+export function inputIntentLabel(intent: InputIntent, running: boolean): string {
+  return intent === 'continue' && !running ? '发送' : inputIntents.find((item) => item.intent === intent)?.label ?? '发送'
 }
 export function prepareSend(input: {
   conversationId: string

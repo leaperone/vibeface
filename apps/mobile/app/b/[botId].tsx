@@ -4,12 +4,12 @@ import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'ex
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, ChevronRight, Crown, ListChecks, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
-import { FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
+import { ActionSheetIOS, Alert, FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -27,7 +27,7 @@ import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import type { ChatMessage, Conversation } from '@/data/types'
-import type { Question } from '@vibeface/client/workspace/types.ts'
+import type { InputIntent, InputTarget, Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
 import { useChatDraft } from '@/features/chat/use-chat-draft'
@@ -114,6 +114,7 @@ export default function ChatScreen() {
   const live = useLive()
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
+  const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
   const draftScopeKey = JSON.stringify(draftScope)
@@ -123,7 +124,7 @@ export default function ChatScreen() {
   const savingDrafts = useRef(new Set<string>())
   const currentScope = useRef(draftScopeKey)
   currentScope.current = draftScopeKey
-  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main') }, [id, routine])
+  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null) }, [id, routine])
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; close?.() } }, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId)
@@ -223,9 +224,22 @@ export default function ChatScreen() {
   const offline = unreachable(device.link)
   const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
   const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
-  const targetOption = routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: `${bot.name} · 主聊天`, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
+  const selectedWork = selectedTarget.startsWith('work:') ? live?.data?.works.find((work) => work.work_id === selectedTarget.slice(5)) : undefined
+  const currentJob = live?.data?.scheduler?.jobs.find((job) => ['running', 'claimed', 'steering'].includes(job.state))
+  const currentInput = chat?.messages.find((message) => message.message_id === currentJob?.message_id)
+  const targetOption: { label: string; target: InputTarget } = selectedTarget.startsWith('work:') ? { label: selectedWork?.title || '原工作', target: { kind: 'work', work_id: selectedTarget.slice(5) } } : routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: currentInput?.text.slice(0, 48) || `${bot.name} · 主聊天`, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
-  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : chat?.replying
+  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : inputTarget.kind === 'work' ? Boolean(selectedWork && ['accepted', 'starting', 'running'].includes(selectedWork.state)) : Boolean(chat?.replying)
+  const intent = selectedIntent ?? promptIntent(draft.text)
+  const chooseIntent = () => {
+    const options = [
+      ...inputIntents.map((item) => ({ text: item.label, action: () => setSelectedIntent(item.intent) })),
+      ...(live?.data?.works.filter((work) => ['accepted', 'starting', 'running'].includes(work.state)) ?? []).map((work) => ({ text: `补充：${work.title || '工作'}`, action: () => { setSelectedTarget(`work:${work.work_id}`); setSelectedIntent('continue') } })),
+      ...(selectedTarget !== 'main' ? [{ text: '回到主聊天', action: () => { setSelectedTarget('main'); setSelectedIntent(null) } }] : []),
+    ]
+    if (ios) ActionSheetIOS.showActionSheetWithOptions({ title: targetOption.label, options: [...options.map((item) => item.text), '取消'], cancelButtonIndex: options.length }, (index) => { if (routeActive.current && currentScope.current === draftScopeKey) options[index]?.action() })
+    else Alert.alert(targetOption.label, undefined, [...options.map((item) => ({ text: item.text, onPress: item.action })), { text: '取消', style: 'cancel' }])
+  }
   const send = () => {
     const scope = draftScopeKey
     if (savingDrafts.current.has(scope)) return
@@ -237,8 +251,9 @@ export default function ChatScreen() {
       const snapshot = await draft.flush()
       const lease = chatDrafts.lease(snapshot)
       try {
-        await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
+        await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: selectedIntent ?? promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
           void draft.clear(snapshot).then((cleared) => {
+            if (cleared && currentScope.current === scope) setSelectedIntent(null)
             if (cleared && routeActive.current && currentScope.current === scope && live?.isCurrent() && latestLive.current?.conversationId === id && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
           }).catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) })
         } })
@@ -359,8 +374,10 @@ export default function ChatScreen() {
         </Link></View> : null}
         <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
-          sendLabel={targetBusy ? '补充当前工作' : '发送'}
+          sendLabel={inputIntentLabel(intent, targetBusy)}
+          target={<Button variant="ghost" size="sm" accessibilityLabel={`输入方式：${inputIntentLabel(intent, targetBusy)}`} onPress={chooseIntent}><Text className="text-sm">{inputIntentLabel(intent, targetBusy)}</Text></Button>}
         >
+        <Text numberOfLines={1} className="text-sm text-muted">{targetOption.label}</Text>
         {draft.error || draft.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{draft.error || `附件 ${draft.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
         {live?.conversationError ? <View className="gap-1"><ErrorText error={live.conversationError} /><Button variant="ghost" size="sm" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取聊天</Text></Button></View> : null}
         {offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
