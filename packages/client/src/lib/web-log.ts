@@ -115,9 +115,8 @@ export function createReporter(): Reporter {
         queue.unshift(...batch)
         if (queue.length > MAX_QUEUED) queue.splice(0, queue.length - MAX_QUEUED)
         const wait = responded === true && code === "log_rate_limited" ? 60_000 : 5_000
+        // The kept batch goes again with the next record after the pause, on the next connection or on a send.
         pausedUntil = Date.now() + wait
-        // A timer must not keep a test process or a closing page alive.
-        ;(setTimeout(() => { pausedUntil = 0; schedule() }, wait) as { unref?: () => void }).unref?.()
       }
     } finally { sending = false }
     schedule()
