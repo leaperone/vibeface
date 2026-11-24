@@ -29,6 +29,7 @@ pub mod scheduling;
 pub mod store;
 pub mod tools;
 pub mod triage;
+mod webhook;
 pub mod work;
 pub mod workspace;
 

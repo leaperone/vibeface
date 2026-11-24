@@ -34,6 +34,7 @@ pub(crate) mod codex_server;
 mod cursor;
 mod execution_directory;
 mod executor;
+pub(crate) mod executor_gateway;
 mod followup;
 mod health;
 mod input_receipts;
@@ -327,6 +328,7 @@ pub struct Runtime {
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: StoreActor,
+    pub(crate) gateway: executor_gateway::store::GatewayStore,
     net: std::sync::OnceLock<Arc<crate::net::Net>>,
     router: Mutex<Option<iroh::protocol::Router>>,
     relay: Mutex<Option<crate::net::RelayServer>>,
@@ -594,6 +596,7 @@ impl Runtime {
         )?;
         let volunteer = relay::Volunteer::new(&config.network, dir);
         let node = Self {
+            gateway: executor_gateway::store::GatewayStore::open(dir)?,
             delivery,
             data_dir: dir.to_owned(),
             settings: std::sync::Mutex::new(NodeSettings {
@@ -826,6 +829,7 @@ impl Runtime {
                 }
             })?;
         }
+        self.start_gateway_workers()?;
         self.start_push_worker()?;
         self.start_network().await?;
         tracing::info!(

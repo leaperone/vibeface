@@ -1251,6 +1251,23 @@ fn health_settings(cli: Option<&Path>) -> String {
     json!({"permissions":{"defaultMode":"dontAsk","allow":allow}}).to_string()
 }
 
+fn gateway_work(network: &str) -> bool {
+    network == super::executor_gateway::GATEWAY_NETWORK
+}
+
+async fn record_work_signal(
+    node: &Arc<Runtime>,
+    network: &str,
+    work_id: &str,
+    signal: Signal,
+) -> Result<WorkRecord> {
+    if gateway_work(network) {
+        node.gateway.signal(work_id, signal)
+    } else {
+        node.signal_work(network, work_id, signal).await
+    }
+}
+
 /// How one `claude -p` process starts.
 struct Launch<'a> {
     bin: &'a Path,
@@ -1264,6 +1281,8 @@ struct Launch<'a> {
     env: &'a BTreeMap<String, String>,
     /// A health reminder's turn: its `health_settings`, in place of bypassing permissions.
     health: Option<String>,
+    /// Gateway work only: false is read-only, true is workspace-write.
+    gateway: Option<bool>,
 }
 
 /// A running `claude -p`: its pipes and process tree.
@@ -1279,13 +1298,29 @@ struct Process {
 impl Launch<'_> {
     fn spawn(&self) -> Result<Process, ExecFailure> {
         let mut command = std::process::Command::new(self.bin);
+        command.args(["-p", "--input-format", "stream-json", "--output-format"]);
+        command.args(["stream-json", "--verbose"]);
+        if let Some(write) = self.gateway {
+            command.args([
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--restricted",
+                "--tools",
+                if write {
+                    "Read,Glob,Grep,Edit,Write"
+                } else {
+                    "Read,Glob,Grep"
+                },
+                "--permission-mode",
+                if write { "acceptEdits" } else { "dontAsk" },
+            ]);
+        } else if let Some(settings) = &self.health {
+            command.args(["--settings", settings.as_str()]);
+        } else {
+            command.args(["--permission-mode", "bypassPermissions"]);
+        }
+        command.arg("--replay-user-messages");
         command
-            .args(["-p", "--input-format", "stream-json", "--output-format"])
-            .args(["stream-json", "--verbose", "--replay-user-messages"])
-            .args(match &self.health {
-                Some(settings) => ["--settings", settings.as_str()],
-                None => ["--permission-mode", "bypassPermissions"],
-            })
             .arg(if self.resume {
                 "--resume"
             } else {
@@ -1483,6 +1518,7 @@ where
         health: config
             .restricted
             .then(|| health_settings(config.tool_cli.as_deref())),
+        gateway: None,
     };
     report.enter(ProviderStage::Launch);
     let mut process = launch
@@ -1843,6 +1879,7 @@ async fn follow(
                 _ => None,
             };
             if let Some(progress) = turn.apply(frame)
+                && !gateway_work(&network)
                 && let Ok(target_node) = node.identity.device_id()
             {
                 let sequence = node.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1854,14 +1891,13 @@ async fn follow(
                 );
             }
             if let Some(signal) = signal
-                && let Err(error) = node.signal_work(&network, &work_id, signal).await
+                && let Err(error) = record_work_signal(&node, &network, &work_id, signal).await
             {
                 tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code work update was not recorded");
             }
             if let Some(subagent) = turn.subagent_update.take()
-                && let Err(error) = node
-                    .signal_work(&network, &work_id, Signal::Subagent(subagent))
-                    .await
+                && let Err(error) =
+                    record_work_signal(&node, &network, &work_id, Signal::Subagent(subagent)).await
             {
                 tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code subagent update was not recorded");
             }
@@ -1890,9 +1926,8 @@ async fn follow(
         node.claude.processes.forget(process.child.token());
     }
     if missing_input_results {
-        if let Err(error) = node
-            .signal_work(&network, &work_id, Signal::Probed(Probe::Missing))
-            .await
+        if let Err(error) =
+            record_work_signal(&node, &network, &work_id, Signal::Probed(Probe::Missing)).await
         {
             tracing::warn!(event = "claude.work_input_results_pending", %error, work_id, "Claude Code exited before all accepted input results were read");
         }
@@ -1946,7 +1981,7 @@ async fn follow(
         }
     };
     for signal in signals {
-        match node.signal_work(&network, &work_id, signal).await {
+        match record_work_signal(&node, &network, &work_id, signal).await {
             Ok(record) if record.state.finished() => break,
             Ok(_) => {}
             Err(error) => {
@@ -1995,22 +2030,29 @@ impl Executor for Claude {
                 ));
             }
             let _claim = Claim(self, session.clone());
-            // A session is resumed where it ran; Claude Code files it under that directory.
-            let cwd = thread
-                .and_then(|session| transcript(projects.as_deref(), session))
-                .and_then(|path| session_cwd(&path))
-                .unwrap_or_else(|| PathBuf::from(&work.cwd));
+            // Gateway work keeps the admitted cwd; Bot work may resume from the transcript cwd.
+            let cwd = if gateway_work(network) {
+                PathBuf::from(&work.cwd)
+            } else {
+                thread
+                    .and_then(|session| transcript(projects.as_deref(), session))
+                    .and_then(|path| session_cwd(&path))
+                    .unwrap_or_else(|| PathBuf::from(&work.cwd))
+            };
             if !cwd.is_dir() {
                 return reject(ExecFailure::new(
                     FailureKind::Rejected,
                     format!("the work directory {} does not exist", cwd.display()),
                 ));
             }
-            if work.thread.is_none() {
+            if gateway_work(network) {
+                node.gateway_bind_thread(work, &session)?;
+            } else if work.thread.is_none() {
                 node.signal_work(network, work_id, Signal::ThreadCreated(session.clone()))
                     .await?;
             }
             let bin = node.providers().bin(Provider::Claude);
+            let gateway = gateway_work(network).then(|| args["write"].as_bool().unwrap_or(false));
             let launch = Launch {
                 bin: &bin,
                 cwd: &cwd,
@@ -2025,6 +2067,7 @@ impl Executor for Claude {
                 guide: None,
                 env: &env,
                 health: None,
+                gateway,
             };
             let mut process = match launch.spawn() {
                 Ok(process) => process,
@@ -2042,7 +2085,14 @@ impl Executor for Claude {
             }
             .await;
             if let Err(e) = sent {
+                let may_have_sent = process.input.is_some();
                 process.end(&self.processes).await;
+                if gateway_work(network) && may_have_sent {
+                    return Err(super::executor_gateway::err(
+                        "submission_unverified",
+                        "Claude turn submission was not confirmed",
+                    ));
+                }
                 return reject(ExecFailure::new(
                     FailureKind::Lost,
                     format!("Claude Code did not take the prompt: {e}"),
@@ -3444,6 +3494,7 @@ pub(super) mod tests {
             guide: None,
             env: &BTreeMap::new(),
             health: None,
+            gateway: None,
         }
         .spawn();
         let Err(failure) = result else {
@@ -3499,6 +3550,7 @@ time.sleep(0.05)
             guide: None,
             env: &env,
             health: None,
+            gateway: None,
         }
         .spawn()?;
         let processes = Processes::new(place.dir.join(PIDFILE));
@@ -3589,6 +3641,7 @@ time.sleep(0.05)
             guide: None,
             env: &env,
             health: None,
+            gateway: None,
         }
         .spawn()?;
         processes.track(unrelated.child.token(), bin)?;
@@ -4619,6 +4672,69 @@ time.sleep(0.05)
         );
         assert_eq!(result.session_id.as_deref(), Some(native.as_str()));
         assert_eq!(result.output, "done: hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_read_only_fake_claude_completes_via_gateway_call() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, _) = node(&place).await?;
+        let minted = node.gateway.mint(false, None, None)?;
+        let key = minted["key"].as_str().context("caller key")?;
+        let caller = node.gateway.authenticate(key)?;
+        let cwd = place.dir.join("work");
+        let started = node
+            .gateway_call(
+                &caller,
+                "start",
+                json!({
+                    "provider": "claude",
+                    "call_ref": "gw-claude-ro",
+                    "cwd": cwd,
+                    "prompt": "hello gateway",
+                }),
+            )
+            .await?;
+        let work_id = started["work_id"].as_str().context("work id")?;
+        let waited = node
+            .gateway_call(
+                &caller,
+                "wait",
+                json!({"work_id": work_id, "timeout_ms": 15_000}),
+            )
+            .await?;
+        ensure!(
+            waited["state"].as_str() == Some("finished"),
+            "gateway work stayed {:?}",
+            waited
+        );
+        let result = node
+            .gateway_call(&caller, "result", json!({"work_id": work_id}))
+            .await?;
+        assert_eq!(result["final_reply"].as_str(), Some("done: hello gateway"));
+        assert_eq!(
+            result.get("sandbox").and_then(Value::as_str),
+            Some("read-only")
+        );
+        let log = place.log();
+        let argv: Vec<&str> = log[0]["argv"]
+            .as_array()
+            .context("argv")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for flag in ["--safe-mode", "--restricted", "--strict-mcp-config"] {
+            assert!(argv.contains(&flag));
+        }
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--tools", "Read,Glob,Grep"])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--permission-mode", "dontAsk"])
+        );
+        assert!(!argv.contains(&"bypassPermissions"));
         Ok(())
     }
 }

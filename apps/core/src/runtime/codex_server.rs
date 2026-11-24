@@ -271,6 +271,16 @@ impl CodexServer {
         turn: Option<&str>,
         client_id: &str,
     ) -> Result<Probe, CodexError> {
+        self.probe_with(thread, turn, client_id, |_| {}).await
+    }
+
+    pub(super) async fn probe_with(
+        &self,
+        thread: &str,
+        turn: Option<&str>,
+        client_id: &str,
+        terminal: impl FnOnce(&Value),
+    ) -> Result<Probe, CodexError> {
         let epoch = self.epoch();
         let reply = match self
             .read(thread, json!({"threadId":thread,"includeTurns":true}))
@@ -322,7 +332,8 @@ impl CodexServer {
                 });
             }
         };
-        if !matches!(probe, Probe::Running { .. }) {
+        if matches!(probe, Probe::Terminal { .. }) {
+            terminal(found);
             self.inner.release(&format!("manager:{client_id}"));
         }
         Ok(probe)
