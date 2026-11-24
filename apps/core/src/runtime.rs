@@ -57,7 +57,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
-pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool};
+pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool, runs_health_turns};
 pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;

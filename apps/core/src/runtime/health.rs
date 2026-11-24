@@ -773,6 +773,14 @@ pub(crate) fn health_turn(trigger: &str) -> bool {
             if id.starts_with(crate::store::bot_settings::HEALTH_SCHEDULE_PREFIX))
 }
 
+/// Whether `provider` may run a health reminder's turn. Log text reaches that turn, so only the
+/// products this Node keeps read-only for it run it; the others would read it with full host
+/// access.
+pub(crate) fn runs_health_turns(provider: crate::providers::Provider) -> bool {
+    use crate::providers::Provider;
+    matches!(provider, Provider::Codex | Provider::Claude)
+}
+
 /// The tools a health reminder's turn is offered: the tools that only read this network's
 /// sessions, nodes, logs and health, and the provider-config card, which changes nothing until
 /// the user allows it. No work, wake or settings tool, and no `fetch_url`. This limits the
@@ -2145,6 +2153,20 @@ mod tests {
             state.remote.is_empty() && state.unhanded().is_empty(),
             "not asked, not kept"
         );
+    }
+
+    #[test]
+    fn only_products_kept_read_only_run_a_health_turn() {
+        use crate::providers::Provider;
+        for (provider, runs) in [
+            (Provider::Codex, true),
+            (Provider::Claude, true),
+            (Provider::Cursor, false),
+            (Provider::Pi, false),
+            (Provider::Opencode, false),
+        ] {
+            assert_eq!(super::runs_health_turns(provider), runs, "{provider:?}");
+        }
     }
 
     #[test]

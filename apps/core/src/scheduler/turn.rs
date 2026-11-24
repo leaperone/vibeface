@@ -764,6 +764,25 @@ impl TurnAttempt {
         if let Err(error) = ensure_readiness(&readiness) {
             return Ok(ProviderOutcome::Failed(error));
         }
+        if crate::runtime::health_turn(&self.job.trigger)
+            && !crate::runtime::runs_health_turns(provider)
+        {
+            return Ok(ProviderOutcome::Failed(
+                ManagerError {
+                    stage: ProviderStage::Launch,
+                    start: manager::StartEvidence::NotStarted,
+                    outcome: manager::ManagerFailure::Failed,
+                    session_id: None,
+                    failure: ExecFailure::new(
+                        FailureKind::Rejected,
+                        format!(
+                            "a health reminder runs only on Codex or Claude Code, which this Node keeps read-only for the turn; {provider:?} would run it with full host access. See the problem with `vibeface health`."
+                        ),
+                    ),
+                }
+                .into(),
+            ));
+        }
         let cancel = self
             .node
             .register_manager_attempt(
