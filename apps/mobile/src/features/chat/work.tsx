@@ -1,7 +1,7 @@
 import { Card } from '@/components/arc/surface'
 import { Link } from 'expo-router'
 import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
-import { useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
@@ -39,59 +39,98 @@ function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string
   return '结果没法自动确认'
 }
 
-type ChatActivity = { todo: ReactNode[]; sending: ReactNode[]; tasks: ReactNode[]; changes: ReactNode[]; runtime: ReactNode[] }
+type Live = NonNullable<ReturnType<typeof useLive>>
+type Data = NonNullable<Live['data']>
+type Summary = { failures: ReadonlyMap<string, Row[]>; attention: number; tasks: number; hold: QueueHoldReason | null }
+const quiet: Summary = { failures: new Map(), attention: 0, tasks: 0, hold: null }
+
+/** Each work in the state the chat shows; `going`: counted by the status line as a task in progress. */
+function shownTasks(shared: Pick<Live, 'nodes' | 'connectionOnline'>, data: Data) {
+  const asking = new Set(data.questions.filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
+  return data.works.map((work) => {
+    const state = chatTaskState(work, data.works, shared.nodes)
+    const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
+    const away = shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)
+    return { work, state: shownAs, stale: taskStale(shownAs, shared.connectionOnline), away, going: shared.connectionOnline && !away && (taskActive(shownAs) || shownAs === 'awaiting_children') }
+  })
+}
+
+/** What needs the person, in the order the activity page lists it, and the inputs still on their way. */
+function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages' | 'workspaceState'>, data: Data, conversationId: string) {
+  const owner = data.conversation?.owner
+  const here = shared.nodes.find((node) => node.device_id === data.local_node)
+  const inputs = shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
+  const lost = (pending: (typeof inputs)[number]) => Boolean(pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown')
+  return {
+    ownerAway: owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked) ? { owner, here: here.device_id } : null,
+    reconciling: (data.scheduler?.jobs ?? []).filter((job) => job.state === 'reconciling' || job.pending_check),
+    checks: pendingChecks(data, shared.nodes, conversationId),
+    lost: inputs.filter(lost),
+    sending: inputs.filter((pending) => !lost(pending)),
+    deferred: (shared.workspaceState?.inputs ?? []).filter((input) => input.conversation_id === conversationId && input.deferred && !input.cancelled),
+  }
+}
 
 /**
  * What the chat knows besides messages. The list keeps only `failures`, a one-line JobLine after the message that got no
  * reply; everything else lives on the activity page, counted by `attention`, `tasks` and `hold` for the status line.
  */
-export function useChatExtras(conversationId: string, botId: string) {
+export function useChatSummary(conversationId: string): Summary {
+  const shared = useLive()
+  const data = shared && shared.conversationId === conversationId ? shared.data : null
+  const nodes = shared?.nodes, connectionOnline = shared?.connectionOnline, pendingMessages = shared?.pendingMessages, workspaceState = shared?.workspaceState
+  return useMemo(() => {
+    if (!data || !nodes || connectionOnline === undefined || !pendingMessages) return quiet
+    const jobs = data.scheduler?.jobs ?? []
+    const shown = new Set(data.messages.map((message) => message.message_id))
+    const failures = new Map<string, Row[]>()
+    for (const job of jobs) {
+      const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
+      if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
+    }
+    const need = needsPerson({ nodes, pendingMessages, workspaceState: workspaceState ?? null }, data, conversationId)
+    return {
+      failures,
+      attention: (need.ownerAway ? 1 : 0) + need.reconciling.length + need.checks.length + need.lost.length + need.deferred.length,
+      tasks: shownTasks({ nodes, connectionOnline }, data).filter((task) => task.going).length,
+      hold: jobs.find((job) => job.state === 'queued')?.hold_reason ?? null,
+    }
+  }, [data, nodes, connectionOnline, pendingMessages, workspaceState, conversationId])
+}
+
+/** The activity page: what needs the person, inputs on their way, then tasks, changes and runtimes, newest first. */
+export function useChatActivity(conversationId: string, botId: string) {
   const shared = useLive()
   const { directory } = useDevice()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
-  const failures = new Map<string, Row[]>()
-  const activity: ChatActivity = { todo: [], sending: [], tasks: [], changes: [], runtime: [] }
-  let tasks = 0, hold: QueueHoldReason | null = null
-  if (!shared || !data) return { failures, activity, attention: 0, tasks, hold }
+  if (!shared || !data) return null
   const lookup = { nodes: shared.nodes, directory }
-  const asking = new Set(data.questions.filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const jobs = data.scheduler?.jobs ?? []
-  const shown = new Set(data.messages.map((message) => message.message_id))
-  data.works.forEach((work, index) => {
-    const state = chatTaskState(work, data.works, shared.nodes)
-    const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
-    const stale = taskStale(shownAs, shared.connectionOnline), away = shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)
-    if (shared.connectionOnline && !away && (taskActive(shownAs) || shownAs === 'awaiting_children')) tasks++
-    const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
-    activity.tasks.unshift(<TaskCard key={`task:${work.work_id}`} work={work} state={shownAs} stale={stale} away={away} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} />)
+  const need = needsPerson(shared, data, conversationId)
+  const turns = new Map<string, string | undefined>()
+  const tasks = shownTasks(shared, data).map(({ work, state, stale, away }): Row => {
+    const turn = JSON.stringify([work.thread_id, work.turn_id])
+    const joined = work.turn_id ? turns.get(turn) : undefined
+    if (work.turn_id && !turns.has(turn)) turns.set(turn, work.title)
+    return { key: `task:${work.work_id}`, node: <TaskCard work={work} state={state} stale={stale} away={away} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work)} progress={taskProgress(work, shared.liveProgress)} /> }
   })
-  for (const job of jobs) {
-    const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
-    if (job.runtime) activity.runtime.unshift(<Text key={`runtime:${job.trigger}`} className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text>)
-    if (job.state === 'reconciling' || job.pending_check) activity.todo.push(<ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} />)
-    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
-  }
-  hold = jobs.find((job) => job.state === 'queued')?.hold_reason ?? null
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
-  for (const records of [...changes.first, ...[...changes.after.values()].flat()]) activity.changes.unshift(<ChangeCard key={`change:${records[0].change_id}`} records={records} schedules={schedules} overwritten={data.overwritten} />)
-
-  const owner = data.conversation?.owner
-  const here = shared.nodes.find((node) => node.device_id === data.local_node)
-  if (owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked)) {
-    activity.todo.unshift(<ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`}
-      actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(here.device_id, lookup)}</ActionButton>} />)
+  const { ownerAway } = need
+  return {
+    todo: [
+      ...ownerAway ? [{ key: 'owner', node: <ActionCard icon={WifiOff} title={`${nodeName(ownerAway.owner, lookup)} 离线，对话在等它`}
+        actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(ownerAway.here, lookup)}</ActionButton>} /> }] : [],
+      ...need.reconciling.map((job): Row => ({ key: `reconcile:${job.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} /> })),
+      ...need.checks.map((check): Row => ({ key: check.check_id, node: <ConfirmCard check={check} /> })),
+      ...need.deferred.map((input): Row => ({ key: `deferred:${input.input.message_id}`, node: <DeferredInput input={input} /> })),
+      ...need.lost.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
+    ],
+    sending: need.sending.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
+    tasks: tasks.reverse(),
+    changes: [...changes.first, ...[...changes.after.values()].flat()].map((records): Row => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} overwritten={data.overwritten} /> })).reverse(),
+    runtime: jobs.flatMap((job): Row[] => job.runtime ? [{ key: `runtime:${job.trigger}`, node: <Text className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text> }] : []).reverse(),
   }
-  for (const check of pendingChecks(data, shared.nodes, conversationId)) activity.todo.push(<ConfirmCard key={check.check_id} check={check} />)
-  for (const pending of shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')) {
-    const card = <InputStatus key={`delivery:${pending.message_id}`} pending={pending} />
-    if (pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown') activity.todo.push(card)
-    else activity.sending.push(card)
-  }
-  for (const input of shared.workspaceState?.inputs ?? []) {
-    if (input.conversation_id === conversationId && input.deferred && !input.cancelled) activity.todo.push(<DeferredInput key={`deferred:${input.input.message_id}`} input={input} />)
-  }
-  return { failures, activity, attention: activity.todo.length, tasks, hold }
 }
 
 function DeferredInput({ input }: { input: QueuedInput }) {

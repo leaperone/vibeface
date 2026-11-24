@@ -8,7 +8,7 @@ import { Stack, usePathname, useRouter } from 'expo-router'
 import { ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
-import { useEffect } from 'react'
+import { Activity, useEffect } from 'react'
 import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
@@ -79,8 +79,8 @@ function Screens() {
   return <>
     <StatusBar style="auto" />
     <View className="flex-1 flex-row bg-background">
-      {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
-      {ready ? <View className="w-80 border-e border-border bg-surface-muted" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
+      {/* Kept mounted when narrow, hidden with its effects stopped and its updates deferred, so a rotation only flips its display. */}
+      {ready ? <View className="w-80 border-e border-border bg-surface-muted" style={{ display: wide ? 'flex' : 'none' }}><Activity mode={wide ? 'visible' : 'hidden'}><HomeList sidebar /></Activity></View> : null}
       <View className="flex-1">
         <Stack screenListeners={({ route }) => ({ focus: () => { if (route.name !== 'b/[botId]') shared?.setView(route.name === 'tasks' ? 'tasks' : 'other') } })} screenOptions={{
           headerShadowVisible: false,

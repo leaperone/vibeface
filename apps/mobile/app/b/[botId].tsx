@@ -29,16 +29,17 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
-import type { ChatMessage, Conversation } from '@/data/types'
+import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { InputIntent, InputTarget, Question } from '@vibeface/client/workspace/types.ts'
+import type { ReadAttachment } from '@/features/chat/attachments'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
-import { useChatDraft } from '@/features/chat/use-chat-draft'
+import { useChatDraftOwner, useDraftView, type ChatDraftOwner } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
 import { readingPositions } from '@/platform/reading-position'
 import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } from '@/platform/chat-location'
 import { QuestionCard } from '@/features/chat/question-card'
-import { useChatExtras, type Row } from '@/features/chat/work'
+import { useChatSummary, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
 import { touchRow, useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
@@ -61,7 +62,7 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
  * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
  * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
  */
-function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, bot: FaceBot, offline: boolean): Entry[] {
+function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean): Entry[] {
   const rows: Entry[] = []
   const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
@@ -81,7 +82,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.time && previous.message.role === message.role
     if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message, time: times.get(message.message_id), grouped })
-    rows.push(...(extras.failures.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
+    rows.push(...(failures.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   }
   rows.push(...chat.rest.map(question))
   const unreadAt = rows.findIndex((row) => ('message' in row ? row.message.message_id : row.key) === chat.unread)
@@ -91,6 +92,28 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
     node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace bot={bot} mood={offline ? 'asleep' : 'thinking'} size={24} /><Text className="text-sm text-muted">{chat.status ?? '思考中'}</Text></Fade>,
   })
   return rows.reverse()
+}
+
+/** Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it. */
+function Separator({ leadingItem }: { leadingItem: Entry }) {
+  return <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />
+}
+
+/** The composer reads the draft itself, so typing re-renders it and not the chat above it. */
+function DraftComposer({ draft, selectedIntent, targetBusy, onChooseIntent, children, ...props }: { draft: ChatDraftOwner; selectedIntent: InputIntent | null; targetBusy: boolean; onChooseIntent: () => void } & Omit<ComponentProps<typeof Composer<Attachment>>, 'value' | 'onChange' | 'files' | 'onFiles' | 'onPickFiles' | 'sendLabel' | 'target'>) {
+  const { text, files, error, snapshot } = useDraftView(draft)
+  const label = inputIntentLabel(selectedIntent ?? promptIntent(text), targetBusy)
+  return <Composer {...props} sendLabel={label} target={<Button variant="ghost" size="sm" accessibilityLabel={`输入方式：${label}`} onPress={onChooseIntent}><Text className="text-sm">{label}</Text></Button>} value={text} onChange={draft.changeText} files={files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles}>
+    {error || snapshot.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{error || `附件 ${snapshot.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
+    {children}
+  </Composer>
+}
+
+function Starters({ draft, project, canRun }: { draft: ChatDraftOwner; project: boolean; canRun: boolean }) {
+  const { text, files } = useDraftView(draft)
+  return text.trim() ? null : <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+    {starterExamples({ project, attachments: files.length > 0, canRun }).map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
+  </View>
 }
 
 export default function ChatScreen() {
@@ -126,7 +149,7 @@ export default function ChatScreen() {
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
   const draftScopeKey = JSON.stringify(draftScope)
-  const draft = useChatDraft(draftScope)
+  const draft = useChatDraftOwner(draftScope)
   const [sendError, setSendError] = useState('')
   const [sendingScope, setSendingScope] = useState<string | null>(null)
   const savingDrafts = useRef(new Set<string>())
@@ -135,7 +158,7 @@ export default function ChatScreen() {
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null); setIntentMenu(null) }, [id, routine])
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
-  const extras = useChatExtras(id ?? '', botId)
+  const extras = useChatSummary(id ?? '')
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
   const canSetUp = device.ready?.principal.can_manage === true
@@ -169,10 +192,14 @@ export default function ChatScreen() {
     const saved = id ? positions.get(id) : null
     restoration.current = { key: positionKey, messageId: targetMessage ?? (saved?.kind === 'message' ? saved.messageId : null), done: false }
   }
-  const rows = chat && bot ? entries(chat, extras, bot, unreachable(device.link)) : []
+  const offline = unreachable(device.link)
+  // Times say the date once it is no longer today, so a new day builds the rows again too.
+  const day = new Date().toDateString()
+  const listed = useMemo(() => chat && bot ? entries(chat, extras.failures, bot, offline) : [], [chat, extras.failures, bot, offline, day])
   const history = live && live.conversationId === id ? live.data?.history : undefined
+  const rows: Entry[] = history && live && !history.messages.complete ? [...listed, { key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages']} /> }] : listed
   const [visible, setVisible] = useState<{ id: string; messages: VisibleChatMessage[] }>({ id: '', messages: [] })
-  const knownMessages = new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? [])
+  const knownMessages = useMemo(() => new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? []), [chat?.messages])
   const reading = useRef({ id, positions, live, knownMessages })
   reading.current = { id, positions, live, knownMessages }
   const viewability = useRef((event: Parameters<NonNullable<ComponentProps<typeof FlatList<Entry>>['onViewableItemsChanged']>>[0]) => {
@@ -227,10 +254,29 @@ export default function ChatScreen() {
   const above = useAnimatedStyle(() => ({ paddingBottom: ios
     ? dockHeight.value + Math.max(0, Math.abs(keyboard.height.value) - insets.bottom * keyboard.progress.value)
     : Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
+  // Rows get callbacks that keep their identity and read the newest draft and workspace, so history rows skip re-rendering.
+  const latestDraft = useRef(draft)
+  latestDraft.current = draft
+  const quote = useCallback((message: ChatMessage) => {
+    const text = latestDraft.current.view().text
+    latestDraft.current.changeText(`${text ? `${text}\n\n` : ''}> ${message.text.replace(/\n/g, '\n> ')}\n\n`)
+  }, [])
+  const readAttachment = useCallback<ReadAttachment>((attachment, offset) => latestLive.current
+    ? latestLive.current.readArtifactBytes(attachment.hash, offset, id) : Promise.reject(new Error('连上后可读取')), [id])
+  const attachmentScope = useMemo(() => JSON.stringify([workspace.networkId, workspace.deviceId, id]), [workspace.networkId, workspace.deviceId, id])
+  const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
+  // 重试 on the newest reply once it failed or was stopped, as on the web.
+  const newest = chat?.messages.at(-1)
+  const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
+  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && replyUnsettled(job))
+  const retryAsked = useCallback(() => latestLive.current && asked ? latestLive.current.retryReply(asked) : Promise.resolve(), [asked])
+  const retry = asked && live && !blocked && !unknown ? retryAsked : undefined
+  const read = live ? readAttachment : undefined
+  const renderItem = useCallback(({ item }: { item: Entry }) => !('message' in item) ? <>{item.node}</> : bot
+    ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} attachmentScope={attachmentScope} readAttachment={read} onQuote={quote} />
+    : null, [bot, offline, newest, retry, attachmentScope, read, quote])
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
-  const offline = unreachable(device.link)
-  const blocked = chat?.blocked ?? (chat ? null : '尚未完成首读')
   const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
   const selectedWork = selectedTarget.startsWith('work:') ? live?.data?.works.find((work) => work.work_id === selectedTarget.slice(5)) : undefined
   const currentJob = live?.data?.scheduler?.jobs.find((job) => ['running', 'claimed', 'steering'].includes(job.state))
@@ -238,7 +284,6 @@ export default function ChatScreen() {
   const targetOption: { label: string; target: InputTarget } = selectedTarget.startsWith('work:') ? { label: selectedWork?.title || '原工作', target: { kind: 'work', work_id: selectedTarget.slice(5) } } : routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: currentInput?.text.slice(0, 48) || `${bot.name} · 主聊天`, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
   const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : inputTarget.kind === 'work' ? Boolean(selectedWork && ['accepted', 'starting', 'running'].includes(selectedWork.state)) : Boolean(chat?.replying)
-  const intent = selectedIntent ?? promptIntent(draft.text)
   const intentMenuKey = JSON.stringify([draftScopeKey, liveGeneration])
   const changeTarget = async (inputTarget: string) => {
     const scope = draftScopeKey
@@ -292,13 +337,7 @@ export default function ChatScreen() {
       setSendingScope((current) => current === scope ? null : current)
     })
   }
-  if (history && live && !history.messages.complete) rows.push({ key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages']} /> })
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
-  // 重试 on the newest reply once it failed or was stopped, as on the web.
-  const newest = chat?.messages.at(-1)
-  const asked = newest && ['failed', 'stopped'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
-  const unknown = live?.data?.scheduler?.jobs.some((job) => job.message_id === asked && replyUnsettled(job))
-  const retry = asked && live && !blocked && !unknown ? () => live.retryReply(asked) : undefined
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   const statusLine = chatStatusLine(extras)
@@ -376,11 +415,8 @@ export default function ChatScreen() {
       contentContainerClassName={ios ? 'w-full max-w-3xl self-center px-4 pt-2 pb-4' : 'w-full max-w-3xl self-center px-4 py-6'}
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
-      // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
-      ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
-      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined}
-        attachmentScope={JSON.stringify([workspace.networkId, workspace.deviceId, id])} readAttachment={live ? (attachment, offset) => live.readArtifactBytes(attachment.hash, offset, id) : undefined}
-        onQuote={(message) => draft.changeText(`${draft.text ? `${draft.text}\n\n` : ''}> ${message.text.replace(/\n/g, '\n> ')}\n\n`)} /> : <>{item.node}</>}
+      ItemSeparatorComponent={Separator}
+      renderItem={renderItem}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
@@ -391,9 +427,7 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
-        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? (!draft.text.trim() ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {starterExamples({ project: Boolean(bot.project), attachments: draft.files.length > 0, canRun: botCanSend(reach) }).map((example) => <Button key={example} variant="secondary" className="rounded-pill" onPress={() => draft.changeText(example)}><Text className="text-muted">{example}</Text></Button>)}
-        </View> : null) : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
+        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? <Starters draft={draft} project={Boolean(bot.project)} canRun={botCanSend(reach)} /> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
             <Button><Icon as={Bot} /><Text>{reach === 'offline' ? '查看设备' : '设置运行 Bot 的设备'}</Text></Button>
@@ -419,13 +453,11 @@ export default function ChatScreen() {
             <Icon as={ChevronRight} className="size-4 text-muted" />
           </Pressable>
         </Link></View> : null}
-        <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
+        <DraftComposer draft={draft} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
-          sendLabel={inputIntentLabel(intent, targetBusy)}
-          target={<Button variant="ghost" size="sm" accessibilityLabel={`输入方式：${inputIntentLabel(intent, targetBusy)}`} onPress={chooseIntent}><Text className="text-sm">{inputIntentLabel(intent, targetBusy)}</Text></Button>}
+          selectedIntent={selectedIntent} targetBusy={targetBusy} onChooseIntent={chooseIntent}
         >
         <Text numberOfLines={1} className="text-sm text-muted">{targetOption.label}</Text>
-        {draft.error || draft.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{draft.error || `附件 ${draft.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
         {live?.conversationError ? <View className="gap-1"><ErrorText error={live.conversationError} /><Button variant="ghost" size="sm" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取聊天</Text></Button></View> : null}
         {offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
           {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
@@ -439,7 +471,7 @@ export default function ChatScreen() {
             <Button variant="ghost" size="sm" onPress={() => setSelectedTarget('main')}><Text>改回主聊天</Text></Button>
           </View> : null}
         </> : null}
-        </Composer>
+        </DraftComposer>
       </View>
     </KeyboardStickyView>
   </View>

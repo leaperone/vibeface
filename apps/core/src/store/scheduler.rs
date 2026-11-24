@@ -4374,6 +4374,15 @@ impl Store {
         query_jobs(&self.connection, "1", [])
     }
 
+    /// Local scheduler rows that have not finished, for the health checks.
+    pub(crate) fn open_scheduler_jobs(&self) -> Result<Vec<SchedulerJob>> {
+        query_jobs(
+            &self.connection,
+            "state IN ('queued','steering','claimed','running','cancelling','reconciling')",
+            [],
+        )
+    }
+
     /// Scoped overview rows in the same global sequence order as `scheduler_jobs_all`.
     pub fn scheduler_jobs_for_scopes(
         &self,

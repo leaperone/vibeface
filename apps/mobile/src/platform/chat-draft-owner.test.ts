@@ -23,14 +23,15 @@ async function fixture() {
     },
   })
   await repository.write(scope, { text: 'submitted text', files: [{ uri: 'private:original', name: 'report.txt', size: 3, mimeType: null }] })
-  const load = moduleLoader(createContext({}), (specifier) => {
+  const load = moduleLoader(createContext({ setTimeout, clearTimeout }), (specifier) => {
     if (specifier === 'react') return {
       useMemo: (factory: () => unknown) => factory(), useRef: (value: unknown) => ({ current: value }),
-      useState: (initial: unknown) => [typeof initial === 'function' ? initial() : initial, () => {}], useEffect() {},
+      useSyncExternalStore: (_subscribe: unknown, read: () => unknown) => read(), useEffect() {},
     }
+    if (specifier === 'react-native') return { AppState: { addEventListener: () => ({ remove() {} }) } }
     if (specifier === '@/platform/native-chat-drafts') return { chatDrafts: repository }
     if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
-    if (specifier === '@/platform/files') return { privateFiles: { run: async (operation: (valid: () => boolean) => Promise<unknown>) => operation(() => true) } }
+    if (specifier === '@/platform/files') return { privateFiles: { run: async (operation: (valid: () => boolean) => Promise<unknown>) => operation(() => true), lease: () => () => true } }
     throw new Error(`Unexpected dependency: ${specifier}`)
   })
   const hook = load(fileURLToPath(new URL('../features/chat/use-chat-draft.ts', import.meta.url))).useChatDraft
@@ -100,8 +101,10 @@ function nativeFixture() {
     delete() { contents.delete(this.uri) }
   }
   const hooks = hookHarness(true)
-  const load = moduleLoader(createContext({ crypto: { randomUUID: () => `native-${++sequence}` }, AggregateError }), (specifier): unknown => {
-    if (specifier === 'react') return hooks.react
+  const appState = new Set<(state: string) => void>()
+  const load = moduleLoader(createContext({ crypto: { randomUUID: () => `native-${++sequence}` }, AggregateError, setTimeout, clearTimeout }), (specifier): unknown => {
+    if (specifier === 'react') return { ...hooks.react, useSyncExternalStore: (_subscribe: unknown, read: () => unknown) => read() }
+    if (specifier === 'react-native') return { AppState: { addEventListener: (_type: string, listener: (state: string) => void) => { appState.add(listener); return { remove: () => appState.delete(listener) } } } }
     if (specifier === 'expo-file-system') return { File, Directory, Paths: { cache: { uri: 'cache:' }, document: { uri: 'document:', list: () => [] } } }
     if (specifier === 'react-native-mmkv') return { createMMKV: () => ({
       getString: (key: string) => values.get(key), set: (key: string, value: string) => { values.set(key, value) },
@@ -139,6 +142,7 @@ function nativeFixture() {
   return {
     scope, render, repository, contents, copies, copying, reading, finishRead,
     delayRead() { delayRead = true },
+    background() { for (const listener of appState) listener('background') },
     picked: { ...pick, name: 'report.txt', mimeType: 'text/plain' },
     erase: (): ReturnType<typeof privateFiles.erase> => Reflect.apply(Reflect.get(files, 'erase'), files, [async () => {}]),
   }
@@ -228,4 +232,22 @@ test('a successful unchanged send clears the submitted revision and subsequent t
   const next = f.repository.read(f.scope)
   assert.equal(next.text, 'next message')
   assert.equal(next.files.length, 0)
+})
+
+test('typing is saved after a pause, and at once when the app leaves the foreground or the draft changes scope', async () => {
+  const f = nativeFixture(), settled = () => new Promise(resolve => setTimeout(resolve, 0))
+  f.render().changeText('a')
+  f.render().changeText('ab')
+  await settled()
+  assert.equal(f.repository.read(f.scope).text, '', 'typing waits for its delay')
+  await new Promise(resolve => setTimeout(resolve, 600))
+  assert.equal(f.repository.read(f.scope).text, 'ab')
+  f.render().changeText('abc')
+  f.background()
+  await settled()
+  assert.equal(f.repository.read(f.scope).text, 'abc')
+  f.render().changeText('abcd')
+  f.render({ ...f.scope, inputTarget: 'routine:daily' })
+  await settled()
+  assert.equal(f.repository.read(f.scope).text, 'abcd')
 })
