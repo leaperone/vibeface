@@ -32,10 +32,10 @@ function AppLayout() {
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} queued={queued} />
   if (!ready) return <ShellSkeleton home={home} queued={queued} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
-  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id, target?: InputTarget) => {
+  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id, target?: InputTarget, focus?: string) => {
     if (target?.kind === 'task' || target?.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: target.task_id } })
     else if (target?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id } })
-    else void navigate({ to: '/', search: { conversation: id, ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
+    else void navigate({ to: '/', search: { conversation: id, ...(focus ? { message: focus } : {}), ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
   }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding networkId={ready.principal.network_id} step={onboarding} /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>

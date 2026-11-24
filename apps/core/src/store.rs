@@ -983,6 +983,15 @@ impl Store {
         rows.into_iter()
             .map(|(notification_id, conversation_id, kind, text)| {
                 Ok(Notification {
+                    focus: log::event_from(&self.connection, network_id, &notification_id)?
+                        .and_then(|event| match event.body {
+                            EventBody::MessagePosted { message_id, .. }
+                            | EventBody::BotMessaged { message_id, .. } => Some(message_id),
+                            EventBody::QuestionAsked { question_id, .. } => {
+                                Some(format!("question:{question_id}"))
+                            }
+                            _ => None,
+                        }),
                     target: scope_projection::notification_target_from(
                         &self.connection,
                         network_id,

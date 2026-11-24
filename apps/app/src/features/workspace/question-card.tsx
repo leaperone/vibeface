@@ -89,6 +89,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
     <p className="text-sm text-secondary">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
+    {approvalChoices.length ? <p className="text-sm text-secondary">允许仅对这次请求有效；拒绝会结束该请求。</p> : null}
     {question.attention?.kind === 'browser_takeover' ? <p className="text-sm text-secondary">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines text={detail} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-sm text-secondary">

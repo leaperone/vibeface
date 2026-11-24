@@ -36,7 +36,7 @@ import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { messageKey, replyStatusLabel, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, starterExamples, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { addDeviceCopy, deviceCopy, joinCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread, messageTimes, taskMessage } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, chatUpdates, firstUnread, messageTimes, taskMessage } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
 import { networkKey, storageOf } from "@vibeface/client/workspace/storage.ts"
 import { byRecent, listTime, mainConversationAttention, unreachable } from "@vibeface/client/workspace/home.ts"
@@ -1331,7 +1331,7 @@ test("workspace preserves bot and message requests while routing native decision
           const shared = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => render() }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: activeConnection, directory: null }) }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, inputTargetKey } }
           const scope = componentHarness('./workspace-chat.tsx', shared, { setInterval: () => 1, clearInterval() {} }, 'ScopedConversation')
           const props = { target, conversationId: otherBot.conversation_id, label: '附件任务', ...(channel ? { channelId: 'attachment-channel' } : {}) }
-          const chat = componentHarness('../../components/arc/conversation-thread.tsx', { '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
+          const chat = componentHarness('../../components/arc/conversation-thread.tsx', { '@vibeface/client/chat/timeline.ts': { chatUpdates, messageTimes: () => new Map() }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') } })
           const message = componentHarness('../chat/elements/message.tsx', { ...shared, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, messageKey, replyStatusLabel }, '@vibeface/client/lib/errors.ts': errors })
           let downloads = 0
           const artifact = componentHarness('../chat/elements/artifact.tsx', { ...shared, '@vibeface/client/workspace/model.ts': { formatSize } }, { crypto, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} }, document: { createElement: () => ({ click() { downloads++ } }) }, window: { setTimeout: () => 1 } })
@@ -1381,7 +1381,7 @@ test("workspace preserves bot and message requests while routing native decision
         'expo-file-system': { File: SelectedFile },
         '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
         '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
-        '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, messageTimes, taskMessage },
+        '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, messageTimes, taskMessage },
         '@vibeface/client/workspace/home.ts': { mainConversationAttention },
         '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
         '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf },
@@ -1422,7 +1422,7 @@ test("workspace preserves bot and message requests while routing native decision
         'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme }), useCSSVariable: () => theme === 'dark' ? 'black' : 'white' },
         '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
-        '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatUpdates, messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
         '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
@@ -3015,10 +3015,10 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { can_manage: false, source: 'membership' } }, retryNow: () => {}, ...device }) },
     '@vibeface/client/identity/copy.ts': { setUpOnManager },
     '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters },
-    '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
+    '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage },
     '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger },
     '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks },
-    '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval },
+    '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionParts, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval },
     '@vibeface/client/lib/errors.ts': errors,
   }, chatGlobals)
   const messages = componentHarness('../chat/elements/message.tsx', {
@@ -3461,7 +3461,7 @@ test('composers save each pending draft once and let edited drafts save independ
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { network_id: 'network', device_id: 'phone', can_manage: false, source: 'membership' }, isCurrent: () => true } }) },
       '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/lib/node.ts': { providerNames, messageOf }, '@vibeface/client/lib/errors.ts': errors,
       '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
-      '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage },
+      '@vibeface/client/workspace/bot-settings.ts': { botCopy, folderLabels, placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage },
       '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, inputTargetKey, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters },
       '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
       '@/components/kit': { providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
@@ -5332,7 +5332,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionParts, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -5725,7 +5725,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read(), useSharedValue: (value: number) => ({ value }) },
     'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
     'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
-    '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+    '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatUpdates, messageTimes: () => new Map() },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
     '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatExtras: () => ({ failures: new Map(), activity: { todo: [], sending: [], tasks: [], changes: [], runtime: [] }, attention: 0, tasks: 0, hold: null }) }, '@/lib/layout': { useWide: () => false },
@@ -5944,7 +5944,7 @@ test('native composer preserves local input and visible blockers with compact ch
     const render = () => composer.render('Composer', { ...props(), value: 'draft' })
     try {
       assert.equal(props().blocked, null)
-      assert.equal(componentText(props().children), '', 'unverified readiness adds no availability prompt')
+      assert.equal(componentText(props().children), '项目 Bot · 主聊天', 'the bound target is named without an availability warning')
       assert.equal(props().sending, false, 'network activity does not lock local saving')
       assert.equal(screen.render('default').filter(({ type }) => type === 'OfflineBar').length, 0)
       assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
@@ -5988,7 +5988,7 @@ test("conversation preserves local input while execution devices are unavailable
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
   let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/labels.ts': taskLabels, '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionParts, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
@@ -6029,7 +6029,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionParts, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -6048,7 +6048,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
     ...historyActions, generation: 1, isCurrent: () => true, conversationId: 'chat', fresh: new Set(), data: { ...parseConversation(context, "chat"), messages: [ask], questions, scheduler: { scope_jobs: [], jobs: [job], unanswered: [] } }, pendingMessages: [], canSaveMessages: true, workspaceState: null,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true, answered: {},
     refresh: async () => {},
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/identity/copy.ts': { setUpOnManager }, '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, reachDevice, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatTimeline, chatUpdates, firstUnread, taskMessage }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers, questionParts, questionOpen, sharedProject, workApproval: workspaceQuestions.workApproval }, '@vibeface/client/lib/errors.ts': errors }, { setInterval: () => 1, clearInterval() {} })
   const thinking = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { key: string }[]).some((entry) => entry.key === 'activity')
   try {
     assert.equal(thinking(), true, "a question its device closed is not the bot's status")
@@ -6983,4 +6983,66 @@ test('the Web chat keeps the first visible identity and offset through older pag
     assert.equal(view.scrollTop, 390)
     assert.equal(elements.some((element) => element.type === 'Button' && element.props['aria-label'] === '回到最新消息'), true)
   } finally { chat.close() }
+})
+
+
+test('Web input actions send explicit intents and keep a selected work after it ends', async () => {
+  const sends: InputOptions[] = []
+  const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, sendMessage: async (_text: string, _files: unknown, _sent: unknown, options: InputOptions) => { sends.push(options); return true } }
+  shared.data!.works = [parityWork()]
+  const app = conversationHarness(() => shared)
+  const options = () => {
+    const children = workspaceModel.record(workspaceModel.record(app.composer()?.target).props).children
+    assert.ok(Array.isArray(children))
+    const menu = children.find((child) => workspaceModel.record(child).type === 'DropdownMenu')
+    const items = workspaceModel.record(workspaceModel.record(menu).props).items
+    assert.ok(Array.isArray(items)); return items.map(workspaceModel.record)
+  }
+  const choose = (label: string) => { const callback = options().find((option) => option.label === label)?.onSelect; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
+  const change = (text: string) => { const action = app.composer()?.onChange; assert.ok(typeof action === 'function'); action(text) }
+  const submit = () => { const action = app.composer()?.onSubmit; assert.ok(typeof action === 'function'); action() }
+  try {
+    for (const intent of ['defer', 'new_task'] as const) {
+      change('不带特殊前缀的交代')
+      choose(intent === 'defer' ? '稍后处理' : '另开一件')
+      submit(); await settleComponent()
+      assert.equal(sends.at(-1)?.intent, intent)
+      assert.equal(sends.at(-1)?.conversation_id, 'chat')
+    }
+    choose('补充：核对项目')
+    shared.data!.works = [parityWork({ state: 'finished', outcome: 'completed' })]
+    change('原工作的新说明')
+    submit(); await settleComponent()
+    assert.deepEqual(JSON.parse(JSON.stringify(sends.at(-1)?.target)), { kind: 'work', work_id: 'work' })
+    const stale = options().find((option) => option.label === '稍后处理')?.onSelect
+    shared.generation++
+    app.composer()
+    if (typeof stale === 'function') stale()
+    assert.equal(app.composer()?.sendLabel, '发送', 'an old workspace menu cannot change the new input action')
+  } finally { app.app.close() }
+})
+
+test('native input menu exposes all three actions on Android and iOS and rejects stale selections', () => {
+  for (const os of ['ios', 'android']) {
+    const live = { ...parityShared(), fresh: new Set<string>() }
+    const chat: import('../../../../../apps/mobile/src/data/types.ts').Conversation = { origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
+    const workspace = { networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat }, members: [], primary: null, actions: { open() {} } }
+    const app = nativeChatHarness(os, { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } })
+    const composer = () => app.render('default').find(({ type }) => type === 'Composer')!.props
+    const open = () => { const callback = workspaceModel.record(workspaceModel.record(composer().target).props).onPress; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
+    try {
+      open()
+      const entries = app.render('default').filter(({ type, props }) => type === 'Button' && ['补充当前工作', '稍后处理', '另开一件'].includes(componentText(props.children)))
+      assert.equal(entries.length, 3, os)
+      const select = entries.find(({ props }) => componentText(props.children) === '稍后处理')?.props.onPress
+      assert.ok(typeof select === 'function'); select()
+      assert.equal(composer().sendLabel, '稍后处理')
+      open()
+      const old = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === '另开一件')?.props.onPress
+      live.generation++
+      composer()
+      if (typeof old === 'function') old()
+      assert.equal(composer().sendLabel, '稍后处理', 'the old menu cannot act after a connection generation changes')
+    } finally { app.close() }
+  }
 })

@@ -12,7 +12,7 @@ import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, t
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueuedInput, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, providerIcons } from '@/components/kit'
@@ -88,7 +88,25 @@ export function useChatExtras(conversationId: string, botId: string) {
     if (pending.rejected || pending.delivery === 'unknown' || pending.receipt?.stage === 'unknown') activity.todo.push(card)
     else activity.sending.push(card)
   }
+  for (const input of shared.workspaceState?.inputs ?? []) {
+    if (input.conversation_id === conversationId && input.deferred && !input.cancelled) activity.todo.push(<DeferredInput key={`deferred:${input.input.message_id}`} input={input} />)
+  }
   return { failures, activity, attention: activity.todo.length, tasks, hold }
+}
+
+function DeferredInput({ input }: { input: QueuedInput }) {
+  const shared = useLive()
+  const control = async (kind: 'release' | 'cancel') => {
+    if (!shared?.writable) return
+    const receipt = await shared.queryInput({ message_id: input.input.message_id, target: input.input.target, conversation_id: input.conversation_id })
+    if (!('stage' in receipt) || !['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
+    await shared.controlInput({ message_id: input.input.message_id, expected_event: input.control_event, action: { kind } })
+    await shared.readWorkspaceState()
+  }
+  return <ActionCard title="已保存，稍后处理" icon={Hourglass} actions={<>
+    <ActionButton variant="secondary" disabled={!shared?.writable} action={() => control('release')}>现在处理</ActionButton>
+    <ActionButton variant="ghost" disabled={!shared?.writable} action={() => control('cancel')}>取消稍后输入</ActionButton>
+  </>}><Text numberOfLines={3}>{input.input.text || `${input.input.attachments?.length ?? 0} 个附件`}</Text></ActionCard>
 }
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */

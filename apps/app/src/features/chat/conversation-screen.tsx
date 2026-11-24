@@ -12,7 +12,7 @@ import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntents,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
-import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline,chatUpdates,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { failureText,taskError } from '@vibeface/client/lib/errors.ts'
@@ -20,7 +20,7 @@ import { botCopy,placeChanges,scheduleName,scheduleTrigger } from '@vibeface/cli
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { chatStatusLine,chatTaskState,nodeName,staleTaskLabel,taskActive,taskCopy,taskLabel,taskStale } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness,historySections,pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspace/questions.ts'
+import { awaitsAnswer,foldAnswers,questionParts,workApproval } from '@vibeface/client/workspace/questions.ts'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { InputIntent,InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
@@ -52,9 +52,11 @@ function NoBot() {
 /** `missing`: the route names a bot this network does not have. */
 export function ConversationScreen({ missing = false, active }: { missing?: boolean; active: boolean }) {
   const workspace = useWorkspace()
+  const generation = workspace.generation
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
+  const routeMessage = useRouterState({ select: (state) => 'message' in state.location.search && typeof state.location.search.message === 'string' ? state.location.search.message : null })
   const { directory, ready, retryNow } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
   const draftKey = networkKey('bot-drafts', ready?.principal.network_id ?? '')
@@ -173,6 +175,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
+  const updates = chatUpdates(data?.messages ?? [], jobs, workspace.fresh)
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
   if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-sm text-foreground before:h-px before:flex-1 before:bg-foreground/40 after:h-px after:flex-1 after:bg-foreground/40">新消息</p> })
 
@@ -220,6 +223,11 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
   useEffect(() => { setSendError(null); setFiles([]); setSelectedIntent(null); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
+  useEffect(() => {
+    if (!active || !routeMessage || !data || !workspace.connectionOnline || entries.some((entry) => entry.key === routeMessage)) return
+    const section = routeMessage.startsWith('question:') ? 'questions' : 'messages'
+    if (!data.history[section].complete && !workspace.historyLoading.has(section)) void workspace.loadHistory(section).catch(setSendError)
+  }, [active, routeMessage, data, workspace.historyLoading])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -243,6 +251,10 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       return next
     })
   }
+  const chooseInput = (target: string, intent: InputIntent | null) => {
+    if (!workspace.isCurrent() || latest.current.conversationId !== conversationId || latest.current.generation !== generation) return
+    setSelectedTarget(target); setSelectedIntent(intent)
+  }
   const setText = (value: string) => setDrafts((current) => { const next = new Map(current).set(conversationId, value); draftStorage.writeStorage(draftKey, Object.fromEntries(next)); return next })
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
@@ -263,9 +275,15 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   return (
     <section className="conversation-screen" aria-label="对话">
       {history}
+      {updates.length ? <div aria-label="自上次查看以来" className="mx-auto grid w-full max-w-3xl gap-1 px-4 py-2 text-sm">
+        <p className="text-secondary">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录' : '自上次查看以来'} · {updates.length} 条新结果</p>
+        {updates.slice(-2).map((update) => <p key={update.id} className="line-clamp-2"><span className="font-medium">{update.state}</span> · {update.text}</p>)}
+        <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={(event) => openActivity(event.currentTarget)}>查看结果与依据</Button>
+      </div> : null}
       <Chat
         key={conversationId}
         entries={entries}
+        focus={routeMessage ?? undefined}
         empty={bot ? <div className="mx-auto my-auto grid w-full min-w-0 max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotFace bot={bot} mood={botMood(bot, workspace)} size={96} />
           <div className="grid min-w-0 max-w-full justify-items-center gap-1">
@@ -297,7 +315,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
           </Button> : null}
           {showWaiting ? <Button variant="ghost" size="sm" type="button" className="max-w-full max-md:min-h-11!"
             onClick={() => document.getElementById(waitingTarget ?? '')?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-            <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 truncate">{!workspace.connectionOnline ? '最近记录 · ' : ''}{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
+            <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 truncate">{!workspace.connectionOnline ? '最近记录 · ' : ''}{asked ? questionParts(asked.text).ask : waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
           </Button> : null}
         </> : null}
         value={text}
@@ -305,7 +323,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         reason={reason}
         disabled={sendDisabled}
         sendLabel={inputIntentLabel(intent, targetBusy)}
-        target={<div className="flex min-w-0 flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm text-secondary">{targetLabel}</span><DropdownMenu label={inputIntentLabel(intent, targetBusy)} items={[...inputIntents.map((item) => ({ label: item.label, onSelect: () => setSelectedIntent(item.intent) })), ...works.filter((work) => taskActive(work.state)).map((work) => ({ label: `补充：${work.title || '工作'}`, onSelect: () => { setSelectedTarget(`work:${work.work_id}`); setSelectedIntent('continue') } })), ...(selectedTarget !== 'main' ? [{ label: '回到主聊天', onSelect: () => { setSelectedTarget('main'); setSelectedIntent(null) } }] : [])]} /></div>}
+        target={<div className="flex min-w-0 flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm text-secondary">{targetLabel}</span><DropdownMenu label={inputIntentLabel(intent, targetBusy)} items={[...inputIntents.map((item) => ({ label: item.label, onSelect: () => chooseInput(selectedTarget, item.intent) })), ...works.filter((work) => taskActive(work.state)).map((work) => ({ label: `补充：${work.title || '工作'}`, onSelect: () => chooseInput(`work:${work.work_id}`, 'continue') })), ...(selectedTarget !== 'main' ? [{ label: '回到主聊天', onSelect: () => chooseInput('main', null) }] : [])]} /></div>}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}

@@ -4,23 +4,26 @@ import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'ex
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { ArrowDown, Bot, ChevronRight, Crown, ListChecks, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
-import { ActionSheetIOS, Alert, FlatList, Platform, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
+import { FlatList, Modal, Platform, ScrollView, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
 import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
-import { messageTimes } from '@vibeface/client/chat/timeline.ts'
+import { chatUpdates, messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
 import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
+import { questionOpen, questionParts } from '@vibeface/client/workspace/questions.ts'
 import { chatStatusLine } from '@vibeface/client/workspace/labels.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
 import { EmptyState } from '@/components/kit'
+import { PopoverPanel } from '@/components/arc/popover'
+import { privateFiles } from '@/platform/files'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
@@ -112,8 +115,13 @@ export default function ChatScreen() {
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
   const live = useLive()
+  const liveGeneration = live?.generation
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
+  const [intentMenu, setIntentMenu] = useState<{ key: string; version: number } | null>(null)
+  const intentMenuVersion = useRef(0)
+  const intentMenuOwner = useRef(intentMenu)
+  intentMenuOwner.current = intentMenu
   const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
   const [selectedTarget, setSelectedTarget] = useState(routine ? `routine:${routine}` : 'main')
   const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
@@ -124,7 +132,7 @@ export default function ChatScreen() {
   const savingDrafts = useRef(new Set<string>())
   const currentScope = useRef(draftScopeKey)
   currentScope.current = draftScopeKey
-  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null) }, [id, routine])
+  useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null); setIntentMenu(null) }, [id, routine])
   const routeActive = useRef(false)
   useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; close?.() } }, [id, live?.generation]))
   const extras = useChatExtras(id ?? '', botId)
@@ -231,15 +239,36 @@ export default function ChatScreen() {
   const inputTarget = targetOption.target
   const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : inputTarget.kind === 'work' ? Boolean(selectedWork && ['accepted', 'starting', 'running'].includes(selectedWork.state)) : Boolean(chat?.replying)
   const intent = selectedIntent ?? promptIntent(draft.text)
-  const chooseIntent = () => {
-    const options = [
-      ...inputIntents.map((item) => ({ text: item.label, action: () => setSelectedIntent(item.intent) })),
-      ...(live?.data?.works.filter((work) => ['accepted', 'starting', 'running'].includes(work.state)) ?? []).map((work) => ({ text: `补充：${work.title || '工作'}`, action: () => { setSelectedTarget(`work:${work.work_id}`); setSelectedIntent('continue') } })),
-      ...(selectedTarget !== 'main' ? [{ text: '回到主聊天', action: () => { setSelectedTarget('main'); setSelectedIntent(null) } }] : []),
-    ]
-    if (ios) ActionSheetIOS.showActionSheetWithOptions({ title: targetOption.label, options: [...options.map((item) => item.text), '取消'], cancelButtonIndex: options.length }, (index) => { if (routeActive.current && currentScope.current === draftScopeKey) options[index]?.action() })
-    else Alert.alert(targetOption.label, undefined, [...options.map((item) => ({ text: item.text, onPress: item.action })), { text: '取消', style: 'cancel' }])
+  const intentMenuKey = JSON.stringify([draftScopeKey, liveGeneration])
+  const changeTarget = async (inputTarget: string) => {
+    const scope = draftScopeKey
+    const current = () => routeActive.current && currentScope.current === scope && latestLive.current?.generation === liveGeneration
+    const snapshot = await draft.flush()
+    if (!current()) return
+    if (snapshot.text || snapshot.files.length) {
+      const next = { ...draftScope, inputTarget }
+      const existing = chatDrafts.read(next)
+      if (existing.text || existing.files.length) throw new Error('目标已有草稿，请先处理它，当前草稿已保留。')
+      const lease = chatDrafts.lease(snapshot)
+      try {
+        await privateFiles.run(async (valid) => {
+          if (!valid() || !current()) return
+          const saved = await chatDrafts.write(next, { text: snapshot.text, files: snapshot.files })
+          if (valid() && current() && !await draft.clear(snapshot)) {
+            await chatDrafts.clear(next, saved)
+            throw new Error('草稿刚有补充，请重新选择目标；新内容已保留。')
+          }
+        })
+      } finally { lease.release() }
+    }
+    if (current()) { setSelectedTarget(inputTarget); setSelectedIntent(null) }
   }
+  const intentOptions = [
+    ...inputIntents.map((item) => ({ text: item.label, action: () => setSelectedIntent(item.intent) })),
+    ...(live?.data?.works.filter((work) => ['accepted', 'starting', 'running'].includes(work.state)) ?? []).map((work) => ({ text: `补充：${work.title || '工作'}`, action: () => { void changeTarget(`work:${work.work_id}`).catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) } })),
+    ...(selectedTarget !== 'main' ? [{ text: '回到主聊天', action: () => { void changeTarget('main').catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) } }] : []),
+  ]
+  const chooseIntent = () => setIntentMenu({ key: intentMenuKey, version: ++intentMenuVersion.current })
   const send = () => {
     const scope = draftScopeKey
     if (savingDrafts.current.has(scope)) return
@@ -273,6 +302,8 @@ export default function ChatScreen() {
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   const statusLine = chatStatusLine(extras)
+  const nextQuestion = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
+  const updates = chatUpdates(chat?.messages ?? [], live?.data?.scheduler?.jobs ?? [], live?.fresh ?? new Set())
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
@@ -284,6 +315,18 @@ export default function ChatScreen() {
   </Link>
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
+    {intentMenu?.key === intentMenuKey ? <Modal transparent visible animationType="fade" onRequestClose={() => setIntentMenu(null)}>
+      <View className="flex-1 justify-end bg-background/90 p-4" style={{ paddingBottom: insets.bottom + 16 }}>
+        <PopoverPanel accessibilityViewIsModal className="max-h-[75%] w-full max-w-3xl self-center gap-2">
+          <Text role="heading" numberOfLines={2} className="px-2 py-2 font-medium">{targetOption.label}</Text>
+          <ScrollView>{intentOptions.map((option) => <Button key={option.text} variant="ghost" className="justify-start" onPress={() => {
+            if (!routeActive.current || currentScope.current !== draftScopeKey || latestLive.current?.generation !== liveGeneration || intentMenuOwner.current !== intentMenu) return
+            intentMenuOwner.current = null; setIntentMenu(null); option.action()
+          }}><Text className="min-w-0 shrink">{option.text}</Text></Button>)}</ScrollView>
+          <Button variant="secondary" onPress={() => setIntentMenu(null)}><Text>取消</Text></Button>
+        </PopoverPanel>
+      </View>
+    </Modal> : null}
     <Stack.Screen options={{
       title: bot.name,
       headerRight: () => <View className="flex-row"><Link href={`/b/${bot.bot_id}/activity`} asChild><Button variant="ghost" iconOnly accessibilityLabel={extras.attention ? `动态，${extras.attention} 项要处理` : '动态'}><Icon as={ListChecks} className="size-5" />{extras.attention ? <View pointerEvents="none" className="absolute right-2 top-2 size-2 rounded-pill bg-warning" /> : null}</Button></Link><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} className="size-5" /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
@@ -365,6 +408,10 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
+        {nextQuestion ? <View className="px-4"><Button variant="secondary" accessibilityLabel={`现在处理：${questionParts(nextQuestion.text).ask}`} onPress={() => {
+          const index = rows.findIndex((row) => row.key === `q:${nextQuestion.question_id}`)
+          if (index >= 0) toUnread(index)
+        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : updates.length ? <View accessibilityLabel="自上次查看以来" className="w-full max-w-3xl gap-1 self-center px-4"><Text numberOfLines={2} className="text-sm text-muted">{offline ? '最近记录' : '自上次查看以来'} · {updates.at(-1)?.state} · {updates.at(-1)?.text}</Text></View> : null}
         {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
           <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
             <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />

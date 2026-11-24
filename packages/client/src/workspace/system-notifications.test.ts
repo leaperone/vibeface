@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { Notifier } from '../lib/platform.ts'
+import { parseNotifications } from './model.ts'
 import type { NotificationRecord } from './types.ts'
-import { notificationBadgeCount, notificationPreferences, notificationUnreadCounts, systemNotifications, watchNotificationPreferences } from './system-notifications.ts'
+import { notificationBadgeCount, notificationPreview, notificationPreferences, notificationUnreadCounts, systemNotifications, watchNotificationPreferences } from './system-notifications.ts'
 
 const fixture = () => {
   const values = new Map<string, string>()
@@ -67,4 +68,18 @@ test('app badge includes unread task and channel messages and excludes non-push 
   assert.deepEqual(counts, { 'task-bot': 2, 'channel-bot': 1 })
   assert.equal(notificationBadgeCount(counts, { enabled: true, badge: true, sound: false, mutedConversations: [] }), 3)
   assert.equal(notificationBadgeCount(counts, { enabled: true, badge: true, sound: false, mutedConversations: ['task-bot'] }), 1)
+})
+
+
+test('lock-screen previews never copy private result content', () => {
+  const secret = { ...item, text: '/private/project/report.txt: confidential log and attachment' }
+  assert.equal(notificationPreview(secret), 'Bot 有新进展，打开查看')
+  assert.equal(notificationPreview({ ...secret, kind: 'question' }), 'Bot 有一个问题需要你查看')
+})
+
+
+test('notification focus is validated and retains its original question identity', () => {
+  const notification = { ...item, kind: 'question', focus: 'question:original', target: { kind: 'work', work_id: 'original-work' } }
+  assert.deepEqual(parseNotifications({ notifications: [notification] }), [notification])
+  for (const focus of ['', {}, false, 'x'.repeat(1025)]) assert.throws(() => parseNotifications({ notifications: [{ ...notification, focus }] }))
 })

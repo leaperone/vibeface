@@ -26,7 +26,7 @@ import { mergeConversation, mergeWorkspaceState } from "./records.ts"
 import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./history.ts"
 import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
-import { notificationPreferences, systemNotifications } from "./system-notifications.ts"
+import { notificationPreferences, notificationPreview, systemNotifications } from "./system-notifications.ts"
 import { answerId, questionInboxDismissible, questionInboxKey } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -64,7 +64,7 @@ class WorkspaceCommandNotSavedError extends Error {
   constructor(receipt: WorkspaceCommandNotSaved) { super(receipt.reason || '这次操作未保存。请读取最新状态后再操作。') }
 }
 
-function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
+function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget, focus?: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
   const { notifier } = platform
   const inputLock: NonNullable<Platform["inputLock"]> = platform.inputLock ?? ((_name, save) => save())
   const { readStorage, writeStorage } = storageOf(platform.storage)
@@ -530,12 +530,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       items, current,
       eligible: (item) => !isSessionNotification(item) || platform.sessionNotifications !== false,
       visible: (item) => viewRef.current === "chat" && notificationForMain(item, activeId.current) && platform.foreground(),
-      show: (item) => notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: item.text, tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
+      show: (item) => notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: notificationPreview(item), tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
           if (!current()) return
           if (isSessionNotification(item)) {
-            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target) }, () => {})
+            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target, item.focus) }, () => {})
           } else {
-            openConversation(item.conversation_id, item.target)
+            openConversation(item.conversation_id, item.target, item.focus)
           }
       }),
     })
@@ -549,7 +549,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (isSessionNotification(item) && platform.sessionNotifications === false) return true
       if (isSessionNotification(item)) await ackNotificationRef.current(item)
       if (!current()) return false
-      openConversation(item.conversation_id, item.target)
+      openConversation(item.conversation_id, item.target, item.focus)
       return true
     } catch { return false }
   }), [connection])
@@ -1728,7 +1728,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作区组件缺少上下文。")
   return value
 }
-export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string, target?: InputTarget) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
+export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string, target?: InputTarget, focus?: string) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
   const value = useWorkspaceState(platform, connection, openConversation, tabs, initialBot)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

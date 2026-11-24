@@ -130,7 +130,7 @@ export function botReadiness(node: NodeInfo | undefined): BotReadiness | null {
 export function parseNotifications(value: unknown): NotificationRecord[] {
   return list(record(value).notifications).map((item) => {
     const data = record(item)
-    return { notification_id: text(data.notification_id), conversation_id: text(data.conversation_id), kind: text(data.kind), text: text(data.text), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }) }
+    return { notification_id: text(data.notification_id), conversation_id: text(data.conversation_id), kind: text(data.kind), text: text(data.text), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }), ...(data.focus == null ? {} : { focus: inputText(text(data.focus), '提醒位置', 1024) }) }
   })
 }
 function message(value: unknown): TranscriptMessage {

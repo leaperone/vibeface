@@ -319,13 +319,15 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
             vec![],
             8 + index as i64 * 2,
         )?;
+        let notification = origin
+            .pending_notifications(&net.network, "web")?
+            .into_iter()
+            .find(|notification| notification.notification_id == reply.hash)
+            .context("reply notification")?;
+        assert_eq!(notification.target, Some(target.clone()));
         assert_eq!(
-            origin
-                .pending_notifications(&net.network, "web")?
-                .into_iter()
-                .find(|notification| notification.notification_id == reply.hash)
-                .and_then(|notification| notification.target),
-            Some(target.clone())
+            notification.focus.as_deref(),
+            Some(format!("private-reply-{index}").as_str())
         );
     }
     let unknown = origin.append_event(
@@ -861,6 +863,7 @@ fn colliding_question_events_keep_their_own_scope_in_history_and_notifications()
                 private.target, target,
                 "a notification's target must describe its own text"
             );
+            assert_eq!(private.focus.as_deref(), Some("question:q-collision"));
         }
     }
     Ok(())

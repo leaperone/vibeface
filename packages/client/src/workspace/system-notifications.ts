@@ -5,6 +5,11 @@ import { networkKey, storageOf } from './storage.ts'
 export type NotificationPreferences = { enabled: boolean; sound: boolean; badge: boolean; mutedConversations: string[] }
 const preferenceListeners = new Set<(networkId: string) => void>()
 
+/** System and lock-screen text contains no conversation content, paths or attachment names. */
+export function notificationPreview(item: Pick<NotificationRecord, 'kind'>): string {
+  return item.kind === 'question' ? 'Bot 有一个问题需要你查看' : 'Bot 有新进展，打开查看'
+}
+
 export function watchNotificationPreferences(networkId: string, listener: () => void) {
   const changed = (updated: string) => { if (updated === networkId) listener() }
   preferenceListeners.add(changed)
