@@ -991,12 +991,13 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(render().canSaveMessages, false, "the new connection must finish its own authorized read")
         await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         assert.equal(messages.length, before + 1)
+        assert.equal(acknowledgements.length, ackBefore, "the new generation has not confirmed the visible chat yet")
         if (outcome === "success") reading.resolve({ ...context, scheduler: null, works: [work] })
         else reading.reject(new Error("new read unavailable"))
         await drainOutbox()
         assert.equal(render().writable, outcome === "success")
         assert.equal(render().canSaveMessages, outcome === "success")
-        assert.equal(acknowledgements.length, ackBefore)
+        assert.equal(acknowledgements.length, ackBefore + (outcome === "success" ? 1 : 0), "only a confirmed open chat acknowledges the notification")
         if (outcome === "failure") await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         conversationHold = null; scheduler = null
         await render().run(() => render().refresh())
@@ -1027,10 +1028,11 @@ test("workspace preserves bot and message requests while routing native decision
       conversationHold = deferred()
       const restored: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === restored }
       activeConnection = restored; render(); await drainOutbox()
+      assert.equal(acknowledgements.length, ackBefore)
       conversationHold.resolve({ ...context, conversation: { ...context.conversation, conversation_id: currentId }, scheduler: null })
       await drainOutbox()
       assert.equal(render().writable, true)
-      assert.equal(acknowledgements.length, ackBefore)
+      assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
       conversationHold = null
       await render().refresh()
       assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])

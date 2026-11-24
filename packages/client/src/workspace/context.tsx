@@ -411,7 +411,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       snapshot: latestSnapshot,
       scope: snapshotScope(id),
       read: (condition) => rpc('conversation', { conversation_id: id, conditional: true, ...condition }),
-      shown: () => dataRef.current,
+      // A previous Web generation stays visible during reconnect. Its older pages can contain work that finished while offline.
+      shown: () => conversationCache || readGeneration.current === connectionGeneration ? dataRef.current : null,
       loading: setConversationLoading,
       failed: (caught) => setConversationError(messageOf(caught, '读取对话')),
       authorityChanged: () => {
