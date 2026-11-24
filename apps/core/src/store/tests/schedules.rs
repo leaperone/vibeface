@@ -1,7 +1,7 @@
 use super::super::bot_settings::{ChangeRequest, PrimaryReminder};
 use super::super::test_support::{
-    Net, all_accepted, bot_conversation, bot_with_message, net, owner, rename, save_schedule,
-    scheduled_on_both, store, sync, user,
+    Net, all_accepted, bot_conversation, bot_with_message, net, owner, question, rename,
+    save_schedule, scheduled_on_both, store, sync, user, work_spec,
 };
 use super::super::*;
 use crate::providers::Provider;
@@ -134,6 +134,29 @@ fn a_routine_no_change_keeps_completion_without_a_reply() -> Result<()> {
         .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
         .context("routine job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    assert!(matches!(
+        JobOutcome::completed_for(&claimed.job, ""),
+        JobOutcome::Completed
+    ));
+    for invalid in [
+        " ",
+        "no change",
+        "{\"routine_result\":\"no_change\",\"result\":\"changed\"}",
+        "{\"routine_result\":\"no_change\"}\nNew result",
+        "{\"routine_result\":\"changed\",\"routine_result\":\"no_change\"}",
+    ] {
+        assert!(
+            matches!(
+                JobOutcome::completed_for(&claimed.job, invalid),
+                JobOutcome::Completed
+            ),
+            "{invalid}"
+        );
+    }
+    assert!(matches!(
+        JobOutcome::completed_for(&claimed.job, crate::scheduling::ROUTINE_NO_CHANGE),
+        JobOutcome::NoChange
+    ));
     store.finish_job(
         &net.a,
         &net.network,
@@ -141,7 +164,7 @@ fn a_routine_no_change_keeps_completion_without_a_reply() -> Result<()> {
         &trigger,
         &attempt,
         JobOutcome::NoChange,
-        "",
+        crate::scheduling::ROUTINE_NO_CHANGE,
         slot + 20,
     )?;
     assert!(matches!(
@@ -154,6 +177,178 @@ fn a_routine_no_change_keeps_completion_without_a_reply() -> Result<()> {
             .is_none()
     );
     assert!(store.pending_notifications(&net.network, "web")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn routine_results_keep_blanks_changes_errors_decisions_and_work_visible() -> Result<()> {
+    for case in [
+        "blank",
+        "changed",
+        "failed",
+        "decision",
+        "work",
+        "one-shot",
+        "changed-config",
+        "other-scope-decision",
+        "interrupted",
+        "uncertain-write",
+        "truncated-marker",
+    ] {
+        let net = net()?;
+        let mut store = store(&net)?;
+        bot_conversation(&mut store, &net)?;
+        store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+        let schedule = if case == "one-shot" {
+            ChangeRequest::SaveSchedule {
+                schedule_id: None,
+                name: "Check".into(),
+                prompt: "Check once".into(),
+                first_run_at_ms: 100_000,
+                every_minutes: None,
+                enabled: Some(true),
+            }
+        } else {
+            save_schedule(None, "Check", 5)
+        };
+        let (saved, _) = store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            "schedule",
+            schedule,
+            Provider::Codex,
+            3,
+        )?;
+        let BotChange::Schedule { schedule_id, .. } = saved.change else {
+            panic!("schedule")
+        };
+        let slot = if case == "one-shot" { 100_000 } else { 1000 };
+        let trigger = schedule_trigger(&schedule_id, slot);
+        store.admit_due_schedules(&net.a, &net.network, slot + 10)?;
+        let claimed = store
+            .claim_next_fixture(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("job")?;
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        if case == "decision" || case == "other-scope-decision" {
+            let mut card = question(&store, &net, "c", "q-routine-decision", "routine-session")?;
+            if let EventBody::QuestionAsked { target, .. } = &mut card
+                && case == "decision"
+            {
+                *target = Some(crate::workspace::InputTarget::Routine {
+                    bot_id: "bot".into(),
+                    trigger: trigger.clone(),
+                });
+            }
+            store.ask(&net.a, &net.network, "c", card, 1011)?;
+        }
+        if case == "work" {
+            store.accept_work_fixture(
+                &net.a,
+                &net.network,
+                work_spec(&net.a.device_id()?, &trigger, "work", Provider::Codex),
+                1011,
+            )?;
+        }
+        if case == "changed-config" {
+            store.change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                "edit",
+                ChangeRequest::SaveSchedule {
+                    schedule_id: Some(schedule_id),
+                    name: "Check".into(),
+                    prompt: "Now once".into(),
+                    first_run_at_ms: 100_000,
+                    every_minutes: None,
+                    enabled: Some(true),
+                },
+                Provider::Codex,
+                1011,
+            )?;
+        }
+        let text = match case {
+            "blank" => "",
+            "changed" => "发现一项变化",
+            "failed" => "读取来源失败",
+            "interrupted" | "uncertain-write" => "部分修改已经写入，结果尚未核对",
+            _ => crate::scheduling::ROUTINE_NO_CHANGE,
+        };
+        let output = if case == "truncated-marker" {
+            format!(
+                "{}{}有效结果不能静默",
+                crate::scheduling::ROUTINE_NO_CHANGE,
+                " ".repeat(60_000)
+            )
+        } else {
+            text.to_owned()
+        };
+        let text = crate::scheduler::prefix(&output, 60_000);
+        let outcome = if case == "failed" {
+            JobOutcome::Failed(vibeface_bridge::failure::ExecFailure::new(
+                vibeface_bridge::failure::FailureKind::Transport,
+                "fixture failure",
+            ))
+        } else if case == "interrupted" || case == "uncertain-write" {
+            JobOutcome::Interrupted {
+                failure: vibeface_bridge::failure::ExecFailure::new(
+                    vibeface_bridge::failure::FailureKind::Lost,
+                    "fixture interrupted write",
+                ),
+                process_unconfirmed: case == "uncertain-write",
+            }
+        } else {
+            JobOutcome::completed_for(&claimed.job, &output)
+        };
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            outcome,
+            text,
+            slot + 12,
+        )?;
+        let job = store.scheduler_job("c", &trigger)?.context("job")?;
+        if case == "uncertain-write" {
+            assert!(matches!(job.state, JobState::Reconciling { .. }));
+            assert!(
+                !store.pending_checks()?.is_empty(),
+                "an uncertain writer remains visible for reconciliation"
+            );
+            continue;
+        }
+        assert!(
+            matches!(
+                job.state,
+                JobState::Completed { .. } | JobState::Failed { .. } | JobState::Interrupted { .. }
+            ),
+            "{case}"
+        );
+        let reply = store.message(&net.network, "c", &claimed.job.message_id)?;
+        if case == "changed-config" || case == "other-scope-decision" {
+            assert!(
+                reply.is_none(),
+                "eligibility uses the original recurring definition"
+            );
+        } else {
+            let reply = reply.context("visible result")?;
+            assert!(!reply.text.trim().is_empty(), "{case}");
+            assert_ne!(reply.text, crate::scheduling::ROUTINE_NO_CHANGE, "{case}");
+            if case == "decision" {
+                assert!(
+                    store
+                        .question(&net.network, "q-routine-decision")?
+                        .context("decision")?["answer"]
+                        .is_null()
+                );
+            }
+        }
+    }
     Ok(())
 }
 

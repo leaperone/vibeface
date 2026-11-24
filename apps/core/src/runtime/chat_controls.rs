@@ -1016,4 +1016,52 @@ mod conversation_history_tests {
         std::fs::remove_dir_all(directory)?;
         result
     }
+    #[tokio::test]
+    async fn exact_routine_notification_rpc_reads_original_records_outside_main() -> Result<()> {
+        let (node, admin, directory) = node().await?;
+        let result = async {
+            bot(&node, &admin, "routine-chat", "Routine", &[]).await?;
+            let network = node.network_id().await?;
+            let identity = node.identity.clone();
+            let query_network = network.clone();
+            let local = identity.device_id()?;
+            let (question_notice, message_notice) = node.store.call("routine_notice_fixture", move |store| {
+                let (_, event) = store.ask(&identity, &query_network, "routine-chat", EventBody::QuestionAsked {
+                    question_id: "q-routine-original".into(), target: Some(crate::workspace::InputTarget::Routine { bot_id: "routine-chat".into(), trigger: "schedule:fixture:1000".into() }),
+                    attention: AttentionRequest { kind: AttentionKind::Question, device_id: None }, severity: Severity::Attention, text: "原例行检查需要决定".into(), choices: vec![],
+                    about: Subject { node: local, agent: Some(Provider::Codex), session_id: "routine-session".into(), cwd: "/private".into(), summary: "fixture".into(), request_id: Some("held".into()) },
+                }, 4)?;
+                let reply = store.append_event(&identity, &query_network, "routine-chat", EventBody::MessagePosted {
+                    message_id: "routine-result".into(), role: Role::Assistant, text: "原例行结果".into(), attachments: vec![], report_results: None, in_reply_to: Some("schedule:fixture:1000".into()), status: Some(ReplyStatus::Completed), failure: None, answers: None, attestation: None,
+                }, vec![], 5)?;
+                Ok((event.context("question event")?.hash, reply.hash))
+            }).await?;
+            let access = Access::User { network_id: network.clone(), scope: UserScope::Network };
+            let snapshot = node.rpc(access.clone(), crate::command::business_fixture(json!({"method":"conversation", "conversation_id":"routine-chat"}))).await?;
+            assert!(!snapshot["questions"].as_array().context("questions")?.iter().any(|question| question["question_id"] == "q-routine-original"));
+            assert!(!snapshot["messages"].as_array().context("messages")?.iter().any(|message| message["message_id"] == "routine-result"));
+            for (id, kind) in [(question_notice.clone(), "question"), (message_notice, "message")] {
+                let value = node.rpc(access.clone(), crate::command::business_fixture(json!({"method":"notifications", "client_id":"fixture-client", "notification_id":id}))).await?;
+                assert_eq!(value["record"]["kind"], kind);
+                assert_eq!(value["notifications"][0]["target"]["kind"], "routine");
+                assert_eq!(value["notifications"][0]["target"]["trigger"], "schedule:fixture:1000");
+                assert_eq!(value["notifications"][0]["conversation_id"], "routine-chat");
+            }
+            let identity = node.identity.clone();
+            let query_network = network.clone();
+            node.store.call("routine_notice_close", move |store| {
+                store.append_event(&identity, &query_network, "routine-chat", EventBody::QuestionClosed { question_id: "q-routine-original".into(), reason: CloseReason::RequestLost }, vec![], 6)?;
+                Ok(())
+            }).await?;
+            let closed = node.rpc(access.clone(), crate::command::business_fixture(json!({"method":"notifications", "client_id":"fixture-client", "notification_id":question_notice}))).await?;
+            assert_eq!(closed["record"]["question"]["closed"], "request_lost");
+            assert!(node.rpc(Access::User { network_id: "another-network".into(), scope: UserScope::Network }, crate::command::business_fixture(json!({"method":"notifications", "client_id":"fixture-client", "notification_id":question_notice}))).await.is_err());
+            assert!(node.rpc(Access::User { network_id: network.clone(), scope: UserScope::Conversation("another-conversation".into()) }, crate::command::business_fixture(json!({"method":"notifications", "client_id":"fixture-client", "notification_id":question_notice}))).await.is_err());
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        node.shutdown().await;
+        drop(node);
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
 }

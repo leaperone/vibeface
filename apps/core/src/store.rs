@@ -981,20 +981,97 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter()
-            .map(|(notification_id, conversation_id, kind, text)| {
-                Ok(Notification {
-                    target: scope_projection::notification_target_from(
-                        &self.connection,
-                        network_id,
-                        &notification_id,
-                    )?,
-                    notification_id,
-                    conversation_id,
-                    kind,
-                    text,
-                })
-            })
+            .map(|row| self.notification_record(network_id, row))
             .collect()
+    }
+
+    fn notification_record(
+        &self,
+        network: &str,
+        (notification_id, conversation_id, kind, text): (String, String, String, String),
+    ) -> Result<Notification> {
+        let event = log::event_from(&self.connection, network, &notification_id)?;
+        Ok(Notification {
+            focus: event.as_ref().and_then(|event| match &event.body {
+                EventBody::MessagePosted { message_id, .. }
+                | EventBody::BotMessaged { message_id, .. } => Some(message_id.clone()),
+                EventBody::QuestionAsked { question_id, .. } => {
+                    Some(format!("question:{question_id}"))
+                }
+                _ => None,
+            }),
+            target: event
+                .as_ref()
+                .map(|event| {
+                    scope_projection::notification_target_from(&self.connection, network, event)
+                })
+                .transpose()?
+                .flatten(),
+            notification_id,
+            conversation_id,
+            kind,
+            text,
+        })
+    }
+
+    /// A late notification click still resolves its authenticated original target after an answer or read receipt.
+    pub fn notification_by_id(&self, network: &str, id: &str) -> Result<Option<Notification>> {
+        let row = self.connection.query_row("SELECT notification_id,conversation_id,kind,text FROM notifications WHERE network_id=? AND notification_id=?", params![network, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?;
+        row.map(|row| self.notification_record(network, row))
+            .transpose()
+    }
+
+    /// Exact routine content is separate from Main's deliberately filtered history.
+    pub(crate) fn routine_notification_record(
+        &self,
+        network: &str,
+        notification: &Notification,
+    ) -> Result<Value> {
+        let Some(target @ crate::workspace::InputTarget::Routine { .. }) = &notification.target
+        else {
+            return Ok(Value::Null);
+        };
+        let Some(event) =
+            log::event_from(&self.connection, network, &notification.notification_id)?
+        else {
+            return Ok(Value::Null);
+        };
+        ensure!(
+            event.scope_id == notification.conversation_id,
+            "notification conversation mismatch"
+        );
+        match event.body {
+            EventBody::QuestionAsked { question_id, .. } => {
+                let question = self
+                    .question(network, &question_id)?
+                    .context("original question unavailable")?;
+                ensure!(
+                    question["conversation_id"] == notification.conversation_id
+                        && question["target"] == serde_json::to_value(target)?,
+                    "original question target changed"
+                );
+                Ok(serde_json::json!({"kind":"question", "question":question}))
+            }
+            EventBody::MessagePosted { message_id, .. }
+            | EventBody::BotMessaged { message_id, .. } => {
+                let message = self
+                    .message(network, &notification.conversation_id, &message_id)?
+                    .context("original message unavailable")?;
+                ensure!(
+                    scope_projection::trigger_input_target_from(
+                        &self.connection,
+                        network,
+                        &notification.conversation_id,
+                        &crate::scheduling::message_trigger(&message_id)
+                    )?
+                    .as_ref()
+                        == Some(target),
+                    "original message target changed"
+                );
+                Ok(serde_json::json!({"kind":"message", "message":message, "target":target}))
+            }
+            _ => Ok(Value::Null),
+        }
     }
 
     pub fn notification_acked(

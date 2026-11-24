@@ -1081,8 +1081,9 @@ impl TurnAttempt {
             let shown = confirmed_shown.lock().expect("shown").clone();
             confirm_cursor_seen(&self.node, &self.job, &shown, self.phase.result()?).await?;
         }
-        let output = prefix(&self.phase.result()?.output, REPLY_LIMIT).to_owned();
-        let outcome = JobOutcome::completed_for(&self.job, &output);
+        let result = self.phase.result()?;
+        let outcome = JobOutcome::completed_for(&self.job, &result.output);
+        let output = prefix(&result.output, REPLY_LIMIT).to_owned();
         self.commit_reply(outcome, output).await
     }
 

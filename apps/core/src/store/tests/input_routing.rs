@@ -319,13 +319,15 @@ fn main_projection_excludes_task_channel_and_unknown_replies() -> Result<()> {
             vec![],
             8 + index as i64 * 2,
         )?;
+        let notification = origin
+            .pending_notifications(&net.network, "web")?
+            .into_iter()
+            .find(|notification| notification.notification_id == reply.hash)
+            .context("reply notification")?;
+        assert_eq!(notification.target, Some(target.clone()));
         assert_eq!(
-            origin
-                .pending_notifications(&net.network, "web")?
-                .into_iter()
-                .find(|notification| notification.notification_id == reply.hash)
-                .and_then(|notification| notification.target),
-            Some(target.clone())
+            notification.focus.as_deref(),
+            Some(format!("private-reply-{index}").as_str())
         );
     }
     let unknown = origin.append_event(
@@ -861,6 +863,7 @@ fn colliding_question_events_keep_their_own_scope_in_history_and_notifications()
                 private.target, target,
                 "a notification's target must describe its own text"
             );
+            assert_eq!(private.focus.as_deref(), Some("question:q-collision"));
         }
     }
     Ok(())
@@ -1275,5 +1278,48 @@ fn reply_target_refresh_visits_only_related_mixed_history() -> Result<()> {
         "unrelated mixed history increased projection work: {steps:?}"
     );
     eprintln!("reply target SQLite VM steps with 0/2000 unrelated mixed messages: {steps:?}");
+    Ok(())
+}
+
+#[test]
+fn a_late_notification_click_keeps_its_original_target_after_the_question_closes() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let mut card = question(&store, &net, "c", "q-late-open", "external-session")?;
+    if let EventBody::QuestionAsked { about, .. } = &mut card {
+        about.request_id = Some("held-request".into());
+    }
+    let (_, event) = store.ask(&net.a, &net.network, "c", card, 4)?;
+    let event = event.context("question event")?;
+    let original = store
+        .notification_by_id(&net.network, &event.hash)?
+        .context("notification")?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::QuestionClosed {
+            question_id: "q-late-open".into(),
+            reason: CloseReason::RequestLost,
+        },
+        vec![],
+        5,
+    )?;
+    assert!(
+        !store
+            .display_notifications(&net.network, "web")?
+            .iter()
+            .any(|notification| notification.notification_id == event.hash)
+    );
+    let reopened = store
+        .notification_by_id(&net.network, &event.hash)?
+        .context("late notification")?;
+    assert_eq!(reopened, original);
+    assert_eq!(reopened.focus.as_deref(), Some("question:q-late-open"));
+    assert!(
+        store
+            .notification_by_id("another-network", &event.hash)?
+            .is_none()
+    );
     Ok(())
 }

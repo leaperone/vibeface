@@ -12,7 +12,7 @@ import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, t
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueuedInput, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, providerIcons } from '@/components/kit'
@@ -56,7 +56,7 @@ function shownTasks(shared: Pick<Live, 'nodes' | 'connectionOnline'>, data: Data
 }
 
 /** What needs the person, in the order the activity page lists it, and the inputs still on their way. */
-function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages'>, data: Data, conversationId: string) {
+function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages' | 'workspaceState'>, data: Data, conversationId: string) {
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
   const inputs = shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
@@ -67,6 +67,7 @@ function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages'>, data: Data
     checks: pendingChecks(data, shared.nodes, conversationId),
     lost: inputs.filter(lost),
     sending: inputs.filter((pending) => !lost(pending)),
+    deferred: (shared.workspaceState?.inputs ?? []).filter((input) => input.conversation_id === conversationId && input.deferred && !input.cancelled),
   }
 }
 
@@ -77,7 +78,7 @@ function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages'>, data: Data
 export function useChatSummary(conversationId: string): Summary {
   const shared = useLive()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
-  const nodes = shared?.nodes, connectionOnline = shared?.connectionOnline, pendingMessages = shared?.pendingMessages
+  const nodes = shared?.nodes, connectionOnline = shared?.connectionOnline, pendingMessages = shared?.pendingMessages, workspaceState = shared?.workspaceState
   return useMemo(() => {
     if (!data || !nodes || connectionOnline === undefined || !pendingMessages) return quiet
     const jobs = data.scheduler?.jobs ?? []
@@ -87,14 +88,14 @@ export function useChatSummary(conversationId: string): Summary {
       const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
       if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
     }
-    const need = needsPerson({ nodes, pendingMessages }, data, conversationId)
+    const need = needsPerson({ nodes, pendingMessages, workspaceState: workspaceState ?? null }, data, conversationId)
     return {
       failures,
-      attention: (need.ownerAway ? 1 : 0) + need.reconciling.length + need.checks.length + need.lost.length,
+      attention: (need.ownerAway ? 1 : 0) + need.reconciling.length + need.checks.length + need.lost.length + need.deferred.length,
       tasks: shownTasks({ nodes, connectionOnline }, data).filter((task) => task.going).length,
       hold: jobs.find((job) => job.state === 'queued')?.hold_reason ?? null,
     }
-  }, [data, nodes, connectionOnline, pendingMessages, conversationId])
+  }, [data, nodes, connectionOnline, pendingMessages, workspaceState, conversationId])
 }
 
 /** The activity page: what needs the person, inputs on their way, then tasks, changes and runtimes, newest first. */
@@ -122,6 +123,7 @@ export function useChatActivity(conversationId: string, botId: string) {
         actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(ownerAway.here, lookup)}</ActionButton>} /> }] : [],
       ...need.reconciling.map((job): Row => ({ key: `reconcile:${job.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} /> })),
       ...need.checks.map((check): Row => ({ key: check.check_id, node: <ConfirmCard check={check} /> })),
+      ...need.deferred.map((input): Row => ({ key: `deferred:${input.input.message_id}`, node: <DeferredInput input={input} /> })),
       ...need.lost.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
     ],
     sending: need.sending.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
@@ -129,6 +131,21 @@ export function useChatActivity(conversationId: string, botId: string) {
     changes: [...changes.first, ...[...changes.after.values()].flat()].map((records): Row => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} overwritten={data.overwritten} /> })).reverse(),
     runtime: jobs.flatMap((job): Row[] => job.runtime ? [{ key: `runtime:${job.trigger}`, node: <Text className="text-sm text-muted">{runtimeLabel(job.runtime)}</Text> }] : []).reverse(),
   }
+}
+
+function DeferredInput({ input }: { input: QueuedInput }) {
+  const shared = useLive()
+  const control = async (kind: 'release' | 'cancel') => {
+    if (!shared?.writable) return
+    const receipt = await shared.queryInput({ message_id: input.input.message_id, target: input.input.target, conversation_id: input.conversation_id })
+    if (!('stage' in receipt) || !['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
+    await shared.controlInput({ message_id: input.input.message_id, expected_event: input.control_event, action: { kind } })
+    await shared.readWorkspaceState()
+  }
+  return <ActionCard title="已保存，稍后处理" icon={Hourglass} actions={<>
+    <ActionButton variant="secondary" disabled={!shared?.writable} action={() => control('release')}>现在处理</ActionButton>
+    <ActionButton variant="ghost" disabled={!shared?.writable} action={() => control('cancel')}>取消稍后输入</ActionButton>
+  </>}><Text numberOfLines={3}>{input.input.text || `${input.input.attachments?.length ?? 0} 个附件`}</Text></ActionCard>
 }
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */

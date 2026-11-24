@@ -85,6 +85,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const { icon, tone } = looks[question.severity]
   return <ActionCard kind="approval" icon={approval ? Hand : icon} tone={tone} title={ask}>
     <Text className="text-sm text-muted">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
+    {approvalChoices.length ? <Text className="text-sm text-muted">允许仅对这次请求有效；拒绝会结束该请求。</Text> : null}
     {question.attention?.kind === 'browser_takeover' ? <Text className="text-sm text-muted">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-base">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">

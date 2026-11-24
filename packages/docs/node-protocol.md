@@ -263,7 +263,7 @@ Node 执行 `codex app-server --listen unix://<socket>`。在 Unix 上，专用 
 | `resolve` | `conversation_id`、`check_id`、工作项另带 `outcome` 与可选备注 | 本人一键结清：管理进程确认已停止；工作项写一条带本人签名的 `WorkFinished`。不重做原触发 |
 | `upload_attachment` | `conversation_id`、`hash`、`size`、`offset`、`data` | 按 1 MiB 分块上传附件，返回已落盘的偏移 |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
-| `notifications` | `client_id` | 该客户端尚未确认的通知 |
+| `notifications` | `client_id`，可选 `notification_id`、`conversation_id` | 默认返回该客户端尚未确认的通知。指定 `notification_id` 时，在当前个人网络重新读取原通知（已读、已答或失效后仍可定位）；返回其原 `target`、`focus`。例行提醒另带当前原问题或消息的 `record`，不会混入 Main 历史。原会话、目标不匹配时拒绝 |
 | `ack` | `notification_id`、`client_id`、`attestation` | 写入 `NotificationAcked` |
 | `dismiss_work` | `conversation_id`、`work_id`、`attestation` | 本人从待处理关掉一个失败、被拒或未接收的工作：在该会话写 `NotificationAcked { notification_id: work_id, client_id: "inbox" }`（签名事件体 `{"type":"notification_acked", notification_id, client_id}`），不建表；已关掉时不写，重试只读回。工作没有失败时拒绝。返回 `{ dismissed: true }` |
 

@@ -1416,6 +1416,9 @@ pub struct Notification {
     pub conversation_id: ScopeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<crate::workspace::InputTarget>,
+    /// The original message or `question:<id>` within its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
     pub kind: String,
     pub text: String,
 }

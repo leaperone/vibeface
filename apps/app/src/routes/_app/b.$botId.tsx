@@ -2,7 +2,7 @@ import { createFileRoute,Outlet } from '@tanstack/react-router'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { useEffect } from 'react'
 
-export const Route = createFileRoute('/_app/b/$botId')({ validateSearch: (search: Record<string, unknown>): { routine?: string } => typeof search.routine === 'string' ? { routine: search.routine } : {}, component: ChatRoute })
+export const Route = createFileRoute('/_app/b/$botId')({ validateSearch: (search: Record<string, unknown>): { routine?: string; message?: string; notification?: string } => ({ ...(typeof search.notification === 'string' ? { notification: search.notification } : {}), ...(typeof search.routine === 'string' ? { routine: search.routine } : {}), ...(typeof search.message === 'string' ? { message: search.message } : {}) }), component: ChatRoute })
 
 /** The conversation itself stays mounted in the shell so drafts survive navigation; this route only selects it. */
 function ChatRoute() {

@@ -5,6 +5,22 @@ import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
 
+/** Only actual unread replies; completion is separate from any verification stated inside them. */
+export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readonly ManagerJob[], fresh: ReadonlySet<string>) {
+  const seen = new Set<string>()
+  return messages.filter((message) => {
+    if (message.role !== 'assistant' || !fresh.has(message.event_hash) || seen.has(message.event_hash)) return false
+    seen.add(message.event_hash)
+    return true
+  }).map((message) => ({
+    id: message.message_id,
+    text: message.text.trim().split('\n')[0]?.slice(0, 160) || '查看原回复',
+    state: jobs.some((job) => job.reply_message_id === message.message_id && (job.pending_check || job.state === 'reconciling')) ? '结果待确认'
+      : message.status === 'completed' ? '已回复' : message.status === 'failed' ? '失败'
+      : message.status === 'stopped' || message.status === 'interrupted' ? '已中断' : '新回复',
+  }))
+}
+
 /** The Node's order, the same on every device; a message without a rank yet keeps its place after the ranked ones. */
 export function byRank<T extends Pick<TranscriptMessage, "rank">>(messages: readonly T[]): T[] {
   return [...messages].sort((a, b) => a.rank === b.rank ? 0 : a.rank === undefined ? 1 : b.rank === undefined ? -1 : a.rank < b.rank ? -1 : 1)
