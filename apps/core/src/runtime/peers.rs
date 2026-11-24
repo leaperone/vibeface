@@ -2404,7 +2404,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Resumes from the last offset synced to disk, so a restart re-downloads at most one chunk.
     /// An attachment source that went idle: logged at warn once per attachment until it moves on.
     fn blob_stalled(&self, peer: &str, blob: &BlobRef, offset: u64) -> anyhow::Error {
         if self.health.lock().expect("health").blob_stalled(&blob.hash) {
@@ -2414,6 +2413,7 @@ impl Runtime {
         anyhow::Error::new(BlobIdle)
     }
 
+    /// Resumes from the last offset synced to disk, so a restart re-downloads at most one chunk.
     pub(crate) async fn fetch_blob(&self, network: &str, peer: &str, blob: &BlobRef) -> Result<()> {
         use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
         ensure!(blob.size as usize <= MAX_BLOB_BYTES, "attachment too large");

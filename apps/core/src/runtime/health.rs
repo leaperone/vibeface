@@ -249,7 +249,8 @@ pub(crate) struct HealthState {
     /// Each open scheduler job's state and since when this Node has seen it in that state.
     jobs: HashMap<String, (&'static str, i64)>,
     /// Since when each connected peer has been seen connected, and its last attachment progress.
-    peer_connected: HashMap<String, i64>,
+    /// The flag says whether that round had an open connection; a new one starts the time over.
+    peer_connected: HashMap<String, (i64, bool)>,
     peer_progress: HashMap<String, i64>,
     /// Attachments whose source went idle; each is logged at warn once until it downloads.
     stalled_blobs: BTreeSet<String>,
@@ -568,8 +569,14 @@ fn stalled_peers(
         .collect();
     let seen = std::mem::take(&mut state.peer_connected);
     for peer in &connected {
-        let since = seen.get(&peer.device_id).copied().unwrap_or(now);
-        state.peer_connected.insert(peer.device_id.clone(), since);
+        let open = peer.path.is_some();
+        let since = match seen.get(&peer.device_id) {
+            Some((since, had)) if *had || !open => *since,
+            _ => now,
+        };
+        state
+            .peer_connected
+            .insert(peer.device_id.clone(), (since, open));
     }
     state
         .peer_progress
@@ -580,7 +587,7 @@ fn stalled_peers(
             let since_ms = peer.synced_ms.unwrap_or(state.baseline_ms);
             let start = since_ms
                 .max(state.baseline_ms)
-                .max(state.peer_connected[&peer.device_id])
+                .max(state.peer_connected[&peer.device_id].0)
                 .max(
                     state
                         .peer_progress
