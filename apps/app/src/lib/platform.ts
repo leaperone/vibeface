@@ -95,6 +95,11 @@ const browserPlatform: Platform = {
     document.addEventListener('visibilitychange', visible)
     return () => document.removeEventListener('visibilitychange', visible)
   },
+  onBackground(listener) {
+    const hidden = () => { if (document.hidden) listener() }
+    document.addEventListener('visibilitychange', hidden)
+    return () => document.removeEventListener('visibilitychange', hidden)
+  },
   foreground: () => !document.hidden,
   saveRecovery(bytes, name) {
     const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'application/json' }))

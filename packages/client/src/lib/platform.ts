@@ -65,6 +65,8 @@ export type Platform = {
   explicitMessageRead?: boolean
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
+  /** Calls `listener` before the app may suspend work in the background. */
+  onBackground?(listener: () => void): () => void
   foreground(): boolean
   /** Opens a sealed file's download or share; completion does not confirm an external saved copy. */
   saveRecovery(bytes: Uint8Array, name: string): void | Promise<void>

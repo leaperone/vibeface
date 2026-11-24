@@ -70,6 +70,9 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const timers = new Map<number, () => void>()
   const timerDelays = new Map<number, number | undefined>()
   const foregroundListeners = new Set<() => void>()
+  const backgroundListeners = new Set<() => void>()
+  let foreground = true, elapsed = 0
+  class Clock extends Date { static now() { return Date.now() + elapsed } }
   const stored = storage, calls: string[] = [], navigations: string[] = []
   const requests: { method: string; params: Record<string, unknown> }[] = []
   const setupRequests: { path: string; options: RequestInit }[] = []
@@ -173,7 +176,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   }
   const timer = (run: () => void, delay?: number) => { const id = ++nextTimer; timers.set(id, run); timerDelays.set(id, delay); return id }
   const sandbox = createContext({
-    Date,
+    Date: Clock,
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
     sessionStorage: { getItem: (key: string) => tabStorage.get(key) ?? null, setItem: (key: string, value: string) => tabStorage.set(key, value), removeItem: (key: string) => tabStorage.delete(key) },
     location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
@@ -210,7 +213,8 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
   const Provider = load(resolve(clientRoot, 'identity/context.tsx')).DeviceProvider
   const platform = {
     onForeground(listener: () => void) { foregroundListeners.add(listener); return () => { foregroundListeners.delete(listener) } },
-    lan: undefined as Platform['lan'], foreground: () => true,
+    onBackground(listener: () => void) { backgroundListeners.add(listener); return () => { backgroundListeners.delete(listener) } },
+    lan: undefined as Platform['lan'], foreground: () => foreground,
     reserveDeliveryIntent: async () => { throw new Error('unexpected delivery reservation') },
     secure: {
       ticketDecode: () => JSON.stringify({ entry_id: target, invite_id: inviteId }),
@@ -228,7 +232,7 @@ function deviceHarness({ joining = '', saved = false, local = '', invitation = '
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, platform, foreground() { foregroundListeners.forEach(listener => listener()) }, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, timerDelays, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, platform, foreground() { foreground = true; foregroundListeners.forEach(listener => listener()) }, background() { foreground = false; backgroundListeners.forEach(listener => listener()) }, advance(ms: number) { elapsed += ms }, enableTabs, broadcast: (value: unknown) => tabReceive?.(JSON.stringify(value)), secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, directory, receipt, signatures, sockets, stored, timers, timerDelays, location, openHash, localState, navigations, restarts: () => restarts, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -2247,6 +2251,116 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.equal(app.verifications(), 2)
     assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('a brief background switch reuses the live connection and probes after the foreground settles', async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const ready = app.render().ready, before = app.calls.length
+    app.background(); app.advance(10000); app.foreground(); app.foreground()
+    assert.equal(app.render().ready, ready)
+    assert.deepEqual(app.calls.slice(before), [])
+    assert.equal(app.sockets.length, 1)
+    assert.equal(app.timers.size, 1)
+    const [id, probe] = [...app.timers.entries()][0]
+    assert.equal(app.timerDelays.get(id), 1000)
+    app.timers.delete(id); probe(); await settle()
+    assert.deepEqual(app.calls.slice(before), ['info'])
+    assert.equal(app.render().ready, ready)
+    assert.equal(app.timers.size, 0)
+    assert.equal(app.sockets.length, 1)
+  } finally { app.close() }
+})
+
+test('a long background switch probes a half-open connection immediately and bounds failure detection', async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const reply = deferred(); app.holds.set('info', reply)
+    const before = app.calls.length
+    app.background(); app.advance(30001); app.foreground()
+    assert.deepEqual(app.calls.slice(before), ['info'])
+    const [id, expire] = [...app.timers.entries()][0]
+    assert.equal(app.timerDelays.get(id), 5000)
+    app.timers.delete(id); expire()
+    assert.equal(app.render().phase, 'reconnecting')
+    reply.resolve({ device_id: target }); await settle()
+  } finally { app.close() }
+})
+
+for (const late of ['success', 'failure', 'timeout']) test(`a suspended foreground probe's late ${late} cannot affect the resumed connection or its new probe`, async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const ready = app.render().ready
+    const stale = deferred(); app.holds.set('info', stale)
+    app.foreground()
+    const [, expiredWhileSuspended] = [...app.timers.entries()][0]
+    app.background()
+    assert.equal(app.timers.size, 0, 'background cancels the sent probe deadline')
+    app.advance(10000); app.foreground()
+    const fresh = deferred(); app.holds.set('info', fresh)
+    const [graceId, start] = [...app.timers.entries()][0]
+    app.timers.delete(graceId); start()
+    assert.equal(app.timers.size, 1, 'the new probe has its own deadline')
+    const calls = app.calls.length
+    if (late === 'success') stale.resolve({ device_id: target })
+    else if (late === 'failure') stale.reject(new Error('suspended read expired'))
+    else expiredWhileSuspended()
+    await settle()
+    app.foreground()
+    assert.equal(app.calls.length, calls)
+    assert.equal(app.timers.size, 1)
+    assert.equal(app.render().ready, ready)
+    assert.equal(ready?.isCurrent(), true)
+    fresh.resolve({ device_id: target }); await settle()
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+test('another background switch or unmount cancels the foreground grace before it sends', async () => {
+  const app = deviceHarness({ saved: true })
+  app.render(); await settle()
+  const before = app.calls.length
+  app.background(); app.foreground()
+  const [, staleStart] = [...app.timers.entries()][0]
+  app.background(); staleStart()
+  assert.equal(app.timers.size, 0)
+  assert.equal(app.calls.length, before)
+  app.foreground()
+  const [, unmountedStart] = [...app.timers.entries()][0]
+  app.close(); unmountedStart(); app.background(); app.foreground()
+  assert.equal(app.timers.size, 0)
+  assert.equal(app.calls.length, before)
+})
+
+for (const responsive of [false, true]) test(`a probe deadline suspended before lifecycle delivery gives ${responsive ? 'a queued reply' : 'a half-open socket'} one bounded foreground window`, async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle()
+    const ready = app.render().ready
+    const reply = deferred(); app.holds.set('info', reply)
+    app.foreground()
+    const [id, delayed] = [...app.timers.entries()][0]
+    app.advance(20000)
+    app.timers.delete(id); delayed()
+    assert.equal(app.render().ready, ready)
+    assert.equal(app.timers.size, 1)
+    const [nextId, deadline] = [...app.timers.entries()][0]
+    assert.equal(app.timerDelays.get(nextId), 5000)
+    if (responsive) {
+      reply.resolve({ device_id: target }); await settle()
+      assert.equal(app.render().ready, ready)
+      assert.equal(app.timers.size, 0)
+      assert.equal(app.sockets.length, 1)
+    } else {
+      app.advance(20000)
+      app.timers.delete(nextId); deadline()
+      assert.equal(app.render().phase, 'reconnecting', 'timer lag cannot keep a dead socket alive indefinitely')
+      reply.resolve({ device_id: target }); await settle()
+    }
   } finally { app.close() }
 })
 
