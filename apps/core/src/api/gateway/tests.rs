@@ -195,11 +195,9 @@ async fn owner_mints_caller_and_all_protocols_require_a_caller_key() -> Result<(
             for operation in &OPERATIONS[1..] {
                 assert!(manifest["providers"][provider]["operations"][*operation].is_boolean());
             }
-            assert!(
-                manifest["providers"][provider]["sandbox_modes"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("read-only"))
+            assert_eq!(
+                manifest["providers"][provider]["sandbox_modes"],
+                json!(["read-only", "danger-full-access"])
             );
             for field in ["images", "effort", "model"] {
                 assert!(manifest["providers"][provider][field].is_boolean());

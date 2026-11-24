@@ -55,7 +55,7 @@ impl Entry {
             "changed_files": self.details.changed_files,
             "failed_commands": self.details.failed_commands,
             "failure_reason": self.failure_reason,
-            "sandbox": if self.write { "workspace-write" } else { "read-only" },
+            "sandbox": super::sandbox_label(self.write),
             "write": self.write,
             "effort": self.effort,
             "thread": self.thread,

@@ -40,8 +40,8 @@ MCP 使用同一监听器的 `POST /api/gateway/mcp` 和相同的 caller key。�
 `runtime::executor_gateway` 负责鉴权后的准入、发起、跟进和恢复。记录保存在 `<data-dir>/gateway/gateway.sqlite3`，仅属于本机，包含调用方密钥摘要、权限、签名回调配置、工作、控制请求和待投递事件。工作标识采用 `WorkSpec::id("gateway:{caller_id}", "gateway", call_ref)`。侧库调用已有的 `work::accept` 和 `transition`，保留原生线程绑定，独立于 DAG、Bot 会话和 `work_runs`。恢复时只查询原生回合。
 
 - `cwd` 必须是已存在的目录，解析符号链接后位于 Node 配置的执行根目录内。两个提供方均须在本机启用。写入需要调用方具有 `can_write`，并在本次 start 显式指定 `write: true`。在原线程续作时沿用该工作的目录和沙箱。
-- Codex 通过现有 Executor 保留 App Server。Node 发送 `thread/start` 或 `thread/resume`，在侧库记录线程，再发送包含 `clientUserMessageId=work_id` 的 `turn/start`。线程及回合均指定 `approvalPolicy=never`。默认使用 `read-only`，授权写入后使用 `workspace-write`，回合禁用网络并排除系统临时目录的写权限。
-- Claude 由现有 Executor 启动 CLI 并跟随其输出。网关要求 CLI 支持 `--restricted --safe-mode --strict-mcp-config`。只读模式使用 `--permission-mode dontAsk --tools Read,Glob,Grep`，写模式使用 `acceptEdits` 并增加 `Edit,Write`。文件工具受 CLI 工作目录限制，两种模式均不开放 Shell。缺少这些参数的 CLI 会拒绝启动。
+- Codex 通过现有 Executor 保留 App Server。Node 发送 `thread/start` 或 `thread/resume`，在侧库记录线程，再发送包含 `clientUserMessageId=work_id` 的 `turn/start`。线程及回合均指定 `approvalPolicy=never`。默认使用 `read-only`（回合禁用网络）。授权写入与 Bot 相同，使用 `danger-full-access`（`sandboxPolicy.type=dangerFullAccess`）。写入仍需调用方 `can_write` 且本次显式 `write: true`。
+- Claude 由现有 Executor 启动 CLI 并跟随其输出。只读模式使用 `--restricted --safe-mode --strict-mcp-config --permission-mode dontAsk --tools Read,Glob,Grep`，缺少这些参数的 CLI 会拒绝启动。授权写入与 Bot 相同，使用 `--permission-mode bypassPermissions`，不限制工具集。
 
 ## 回调
 

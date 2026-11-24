@@ -341,18 +341,15 @@ async fn codex_write_queue_waits_then_continues_same_thread_and_sandbox() -> Res
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0]["params"]["threadId"], "gateway-thread");
         assert_eq!(resumed[0]["params"]["approvalPolicy"], "never");
-        assert_eq!(resumed[0]["params"]["sandbox"], "workspace-write");
-        assert_eq!(fixture.requests("thread/start")[0]["params"]["sandbox"], "workspace-write");
+        assert_eq!(resumed[0]["params"]["sandbox"], "danger-full-access");
+        assert_eq!(fixture.requests("thread/start")[0]["params"]["sandbox"], "danger-full-access");
         let turns = fixture.requests("turn/start");
         assert_eq!(turns.len(), 2);
         for (turn, id) in turns.iter().zip([first, second]) {
             assert_eq!(turn["params"]["threadId"], "gateway-thread");
             assert_eq!(turn["params"]["clientUserMessageId"], id);
             assert_eq!(turn["params"]["approvalPolicy"], "never");
-            assert_eq!(turn["params"]["sandboxPolicy"], json!({
-                "type":"workspaceWrite","writableRoots":[fixture.cwd],"networkAccess":false,
-                "excludeTmpdirEnvVar":true,"excludeSlashTmp":true
-            }));
+            assert_eq!(turn["params"]["sandboxPolicy"], json!({"type":"dangerFullAccess"}));
             assert_eq!(turn["params"]["effort"], "high");
         }
         assert_eq!(turns[1]["params"]["input"][0]["text"], "continue fixture");
@@ -362,6 +359,7 @@ async fn codex_write_queue_waits_then_continues_same_thread_and_sandbox() -> Res
         assert_eq!(terminal["state"], "finished");
         assert_eq!(terminal["final_reply"], "second answer");
         assert_eq!(terminal["write"], true);
+        assert_eq!(terminal["sandbox"], "danger-full-access");
         assert_eq!(fixture.node.gateway.get(&fixture.caller, first)?.record.text, "first answer");
         fixture.assert_local_only().await
     }.await;

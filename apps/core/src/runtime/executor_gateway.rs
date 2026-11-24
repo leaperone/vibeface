@@ -184,6 +184,14 @@ fn waiting_for_input(record: &WorkRecord) -> bool {
     record.progress == "needs_input" && !matches!(record.state, WorkState::Unverified { .. })
 }
 
+pub(crate) fn sandbox_label(write: bool) -> &'static str {
+    if write {
+        "danger-full-access"
+    } else {
+        "read-only"
+    }
+}
+
 impl Runtime {
     fn enter_gateway(&self) -> Result<crate::maintenance::WorkGuard> {
         self.maintenance.enter().map_err(|error| {
@@ -257,10 +265,10 @@ impl Runtime {
             providers.insert(provider.name().into(), json!({
                 "enabled":local.switches.execution.contains(&provider),
                 "operations":{"start":true,"status":true,"wait":true,"steer":true,"queue":true,"stop":true,"result":true},
-                "sandbox_modes":["read-only","workspace-write"],"default_sandbox":"read-only",
+                "sandbox_modes":["read-only","danger-full-access"],"default_sandbox":"read-only",
                 "sandbox_description":match provider {
-                    Provider::Claude => "Claude CLI --restricted --safe-mode --strict-mcp-config; read-only: --permission-mode dontAsk --tools Read,Glob,Grep; workspace-write: --permission-mode acceptEdits --tools Read,Glob,Grep,Edit,Write",
-                    _ => "Codex native read-only or workspace-write, approvalPolicy=never, network disabled"
+                    Provider::Claude => "Claude CLI; read-only: --restricted --safe-mode --strict-mcp-config --permission-mode dontAsk --tools Read,Glob,Grep; danger-full-access: --permission-mode bypassPermissions",
+                    _ => "Codex native read-only or danger-full-access, approvalPolicy=never; read-only disables network"
                 },
                 "images":false,"effort":true,"model":true,"local_only":true,"file_and_command_results":provider == Provider::Codex
             }));
@@ -446,7 +454,7 @@ impl Runtime {
         let work = &entry.spec;
         let client = self.codex.client();
         let mut params = json!({"cwd":work.cwd,"approvalPolicy":"never",
-            "sandbox":if entry.write {"workspace-write"} else {"read-only"},
+            "sandbox":sandbox_label(entry.write),
             "config":{"web_search":"disabled"}});
         if let Some(model) = work.execution_model() {
             params["model"] = json!(model);
@@ -478,7 +486,7 @@ impl Runtime {
             ));
         }
         let sandbox = if entry.write {
-            json!({"type":"workspaceWrite","writableRoots":[work.cwd],"networkAccess":false,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true})
+            json!({"type":"dangerFullAccess"})
         } else {
             json!({"type":"readOnly","networkAccess":false})
         };

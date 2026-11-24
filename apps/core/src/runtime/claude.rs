@@ -1281,7 +1281,7 @@ struct Launch<'a> {
     env: &'a BTreeMap<String, String>,
     /// A health reminder's turn: its `health_settings`, in place of bypassing permissions.
     health: Option<String>,
-    /// Gateway work only: false is read-only, true is workspace-write.
+    /// Gateway work only: false is read-only, true is danger-full-access (same as Bot).
     gateway: Option<bool>,
 }
 
@@ -1300,19 +1300,15 @@ impl Launch<'_> {
         let mut command = std::process::Command::new(self.bin);
         command.args(["-p", "--input-format", "stream-json", "--output-format"]);
         command.args(["stream-json", "--verbose"]);
-        if let Some(write) = self.gateway {
+        if self.gateway == Some(false) {
             command.args([
                 "--safe-mode",
                 "--strict-mcp-config",
                 "--restricted",
                 "--tools",
-                if write {
-                    "Read,Glob,Grep,Edit,Write"
-                } else {
-                    "Read,Glob,Grep"
-                },
+                "Read,Glob,Grep",
                 "--permission-mode",
-                if write { "acceptEdits" } else { "dontAsk" },
+                "dontAsk",
             ]);
         } else if let Some(settings) = &self.health {
             command.args(["--settings", settings.as_str()]);
@@ -4735,6 +4731,71 @@ time.sleep(0.05)
                 .any(|args| args == ["--permission-mode", "dontAsk"])
         );
         assert!(!argv.contains(&"bypassPermissions"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_write_fake_claude_uses_danger_full_access() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, _) = node(&place).await?;
+        let minted = node.gateway.mint(true, None, None)?;
+        let key = minted["key"].as_str().context("caller key")?;
+        let caller = node.gateway.authenticate(key)?;
+        let cwd = place.dir.join("work");
+        let started = node
+            .gateway_call(
+                &caller,
+                "start",
+                json!({
+                    "provider": "claude",
+                    "call_ref": "gw-claude-write",
+                    "cwd": cwd,
+                    "prompt": "write gateway",
+                    "write": true,
+                }),
+            )
+            .await?;
+        let work_id = started["work_id"].as_str().context("work id")?;
+        let waited = node
+            .gateway_call(
+                &caller,
+                "wait",
+                json!({"work_id": work_id, "timeout_ms": 15_000}),
+            )
+            .await?;
+        ensure!(
+            waited["state"].as_str() == Some("finished"),
+            "gateway work stayed {:?}",
+            waited
+        );
+        let result = node
+            .gateway_call(&caller, "result", json!({"work_id": work_id}))
+            .await?;
+        assert_eq!(result["final_reply"].as_str(), Some("done: write gateway"));
+        assert_eq!(
+            result.get("sandbox").and_then(Value::as_str),
+            Some("danger-full-access")
+        );
+        let log = place.log();
+        let argv: Vec<&str> = log[0]["argv"]
+            .as_array()
+            .context("argv")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--permission-mode", "bypassPermissions"])
+        );
+        for flag in [
+            "--safe-mode",
+            "--restricted",
+            "--strict-mcp-config",
+            "dontAsk",
+            "acceptEdits",
+        ] {
+            assert!(!argv.contains(&flag), "write argv kept {flag}: {argv:?}");
+        }
         Ok(())
     }
 }
