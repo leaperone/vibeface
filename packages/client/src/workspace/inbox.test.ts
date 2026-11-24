@@ -139,6 +139,26 @@ test('a task done itself waits on a child still running, down the chain, and onl
   assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' }), work('g', { parent: 'c', state: 'accepted', outcome: null })]), 'awaiting_children', 'a grandchild still running holds it too')
   assert.equal(chatTaskState(parent, [parent, work('c', { parent: 'p' })]), 'completed', 'finished children do not')
   assert.equal(chatTaskState(work('f', { outcome: 'failed' }), [work('c', { parent: 'f', state: 'running', outcome: null })]), 'failed', 'a failure still reads as one')
+  const loop = [work('a', { parent: 'b' }), work('b', { parent: 'a' }), work('c', { parent: 'b', state: 'running', outcome: null })]
+  assert.deepEqual(loop.map((item) => chatTaskState(item, loop)), ['awaiting_children', 'awaiting_children', 'running'], 'a parent loop ends and still finds the running child')
+  const linear = (item: WorkCard, works: readonly WorkCard[]) => {
+    const state = item.outcome ?? item.state
+    if (state !== 'completed') return state
+    const seen = new Set([item.work_id])
+    const open = (id: string): boolean => works.some((child) => {
+      if (child.parent !== id || seen.has(child.work_id)) return false
+      seen.add(child.work_id)
+      const shown = child.outcome ?? child.state
+      return ['accepted', 'running'].includes(shown) || open(child.work_id)
+    })
+    return open(item.work_id) ? 'awaiting_children' : state
+  }
+  let seed = 11
+  const next = (limit: number) => (seed = seed * 48271 % 2147483647) % limit
+  for (let round = 0; round < 100; round += 1) {
+    const works = Array.from({ length: 1 + next(10) }, (_, index) => next(3) ? work(`w${next(8)}`, { parent: next(4) ? `w${next(8)}` : null, ...(next(3) ? {} : { state: 'running', outcome: null }) }) : work(`w${index}`))
+    assert.deepEqual(works.map((item) => chatTaskState(item, works)), works.map((item) => linear(item, works)))
+  }
 })
 
 test('the device to fix a refused task is chosen by its kind, not its words', () => {

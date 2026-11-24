@@ -2,8 +2,8 @@ import { Card } from '@/components/arc/surface'
 import { Metric } from '@/components/arc/metric'
 import { Link } from 'expo-router'
 import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useState } from 'react'
-import { Pressable, ScrollView, View } from 'react-native'
+import { memo, useEffect, useMemo, useState } from 'react'
+import { FlatList, Pressable, ScrollView, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
@@ -40,7 +40,8 @@ export function TasksScreen() {
   const read = Boolean(shared?.synced)
   const openQuestions = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'question' }> => item.kind === 'question' && !item.done && Boolean(item.question)).map((item) => item.question)
   const pendingChecks = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'confirm' }> => item.kind === 'confirm').map((item) => item.check)
-  const lookup = { nodes: shared?.nodes ?? [], directory }
+  const nodes = shared?.nodes
+  const lookup = useMemo(() => ({ nodes: nodes ?? [], directory }), [nodes, directory])
   const prepared = prepareOverviewInputs({
     openWorks: works,
     bots: shared?.bots ?? [],
@@ -88,7 +89,12 @@ export function TasksScreen() {
   })
 
   const count = (group: TaskGroup) => read ? selection.groups[group].length + heldGroups[group] + taskCounts[group] : null
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
+  const lines: Line[] = loading ? [] : taskGroups.flatMap(({ group, title }) => groups[group].length ? [{ key: `group:${group}`, title, count: groups[group].length }, ...groups[group].map((activity) => ({ key: activity.id, activity }))] : [])
+  return <FlatList data={lines} keyExtractor={(line) => line.key} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center p-6 pb-12"
+    renderScrollComponent={(props) => <KeyboardAwareScrollView {...props} bottomOffset={24} />}
+    renderItem={({ item }) => 'title' in item ? <Text role="heading" className="mt-6 px-1 text-lg font-medium">{item.title} <Text className="text-muted">{item.count}</Text></Text>
+      : <View className="mt-2"><TaskRow work={item.activity.work!} projected={item.activity.projection} waiting={item.activity.facts.questions.length > 0} bot={shared?.bots.find((bot) => bot.conversation_id === item.activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(item.activity.work!, shared?.liveProgress ?? [])} /></View>}
+    ListHeaderComponentClassName="gap-6" ListHeaderComponent={<>
     <PendingSection />
     <MobileMasthead attention={count('attention')} working={count('working')} waiting={count('waiting')} filter={filter} onFilter={setFilter} />
     <Text className="text-sm text-muted">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
@@ -102,11 +108,8 @@ export function TasksScreen() {
         <Skeleton className="size-8 rounded-control" />
         <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-2/3 rounded-pill" /><Skeleton className="h-3 w-1/2 rounded-pill" /></View>
       </View>)}
-    </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
-      <Text role="heading" className="px-1 text-lg font-medium">{title} <Text className="text-muted">{groups[group].length}</Text></Text>
-      {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
-    </View> : null) : selection.groups.attention.length + heldGroups.attention > 0 && (filter === 'all' || filter === 'attention') || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || workspaceTaskGroup(task) === filter) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
-  </KeyboardAwareScrollView>
+    </View> : workActivities.length ? null : selection.groups.attention.length + heldGroups.attention > 0 && (filter === 'all' || filter === 'attention') || otherChecks.length || turns.length || businessTasks.some((task) => filter === 'all' || workspaceTaskGroup(task) === filter) ? null : filter !== 'all' || botFilter !== 'all' ? <Text className="text-sm text-muted">没有符合筛选的执行工作。</Text> : <MobileEmpty bot={bot} read={read} />}
+  </>} />
 }
 
 function MobileQuestionAttention({ activity, bots, read }: { activity: Extract<WorkspaceActivity, { kind: 'attention' }>; bots: BotRecord[]; read: boolean }) {
@@ -142,8 +145,9 @@ function MobileEmpty({ bot, read }: { bot?: Pick<BotRecord, 'bot_id' | 'name'>; 
 
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
+type Line = { key: string; title: string; count: number } | { key: string; activity: Extract<WorkspaceActivity, { kind: 'work' }> }
 
-function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWorkCard; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
+const TaskRow = memo(function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }: { work: OpenWorkCard; waiting: boolean; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
   const shown = cardState(work, lookup.nodes, projected)
   const rawState = shown === 'running' && waiting ? 'waiting' : shown
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
@@ -181,4 +185,4 @@ function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }:
   </>
   return href ? <Link href={href} asChild><Pressable accessibilityRole="link" accessibilityLabel={[title, state, bot?.name, device, line].filter(Boolean).join('，')} className={cn(frame, 'active:bg-surface-muted')}>{body}</Pressable></Link>
     : <View className={frame}>{body}</View>
-}
+})

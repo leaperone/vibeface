@@ -94,6 +94,26 @@ test("questions and hand-offs sit where they happened in the chat", () => {
   assert.deepEqual(before.get("m1")?.map((item) => item.id), ["first"])
   assert.deepEqual(before.get("m2")?.map((item) => item.id), ["a", "b"])
   assert.deepEqual(rest.map((item) => item.id), ["late"])
+  const ranked = [{ message_id: "m1", created_at_ms: 10 }, { message_id: "m2", created_at_ms: 20 }, { message_id: "r1", created_at_ms: 15 }, { message_id: "m3", created_at_ms: 20 }, { message_id: "m4", created_at_ms: 30 }]
+  const placed = placeByTime(ranked, [{ id: "tie", created_at_ms: 20 }, { id: "x", created_at_ms: 12 }, { id: "y", created_at_ms: 12 }, { id: "at-first", created_at_ms: 10 }, { id: "after", created_at_ms: 30 }])
+  assert.deepEqual([...placed.before].map(([id, items]) => [id, items.map((item) => item.id)]), [["m2", ["at-first", "x", "y"]], ["m4", ["tie"]]], "an aside written with a message goes after it; a ranked message earlier in time is not a later one; equal times keep their order")
+  assert.deepEqual(placed.rest.map((item) => item.id), ["after"])
+  assert.deepEqual(placeByTime([], [{ id: "b", created_at_ms: 2 }, { id: "a", created_at_ms: 1 }]).rest.map((item) => item.id), ["a", "b"])
+  let seed = 7
+  const next = (limit: number) => (seed = seed * 48271 % 2147483647) % limit
+  for (let round = 0; round < 200; round += 1) {
+    const rows = Array.from({ length: next(12) }, (_, index) => ({ message_id: `m${index}`, created_at_ms: next(40) }))
+    const asides = Array.from({ length: next(12) }, (_, index) => ({ id: `q${index}`, created_at_ms: next(44) }))
+    const expected = new Map<string, string[]>(), rest: string[] = []
+    for (const item of [...asides].sort((a, b) => a.created_at_ms - b.created_at_ms)) {
+      const found = rows.find((message) => message.created_at_ms > item.created_at_ms)
+      if (found) expected.set(found.message_id, [...expected.get(found.message_id) ?? [], item.id])
+      else rest.push(item.id)
+    }
+    const actual = placeByTime(rows, asides)
+    assert.deepEqual([...actual.before].map(([id, items]) => [id, items.map((item) => item.id)]), [...expected])
+    assert.deepEqual(actual.rest.map((item) => item.id), rest)
+  }
   assert.equal(projectName("/path/to/web/"), "web")
   assert.equal(projectName("C:\\code\\api"), "api")
   const nodes = [{ device_id: "mac", capabilities: { manager: null, manager_state: null, relay: false, roots: ["/Users/me/demo-project/", "/srv/api"] } }]

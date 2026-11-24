@@ -102,10 +102,14 @@ export function foldAnswers(messages: readonly Pick<TranscriptMessage, "message_
 /** Each item goes right before the first message written after it; items newer than every message are `rest`, oldest first. */
 export function placeByTime<T extends { created_at_ms: number }>(messages: readonly Pick<TranscriptMessage, "message_id" | "created_at_ms">[], items: readonly T[]) {
   const before = new Map<string, T[]>(), rest: T[] = []
+  let index = 0
   for (const item of [...items].sort((a, b) => a.created_at_ms - b.created_at_ms)) {
-    const next = messages.find((message) => message.created_at_ms > item.created_at_ms)
-    if (next) before.set(next.message_id, [...before.get(next.message_id) ?? [], item])
-    else rest.push(item)
+    // Items go oldest first, so the first message written after one is never before the previous item's.
+    while (index < messages.length && messages[index].created_at_ms <= item.created_at_ms) index += 1
+    const next = messages[index]
+    if (!next) rest.push(item)
+    else if (before.has(next.message_id)) before.get(next.message_id)?.push(item)
+    else before.set(next.message_id, [item])
   }
   return { before, rest }
 }

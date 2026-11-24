@@ -1,8 +1,8 @@
 import { NavigationRail } from '@/components/arc/navigation'
 import { Link, usePathname, type Href } from 'expo-router'
 import { BellRing, Bot, ChevronRight, Inbox, ListChecks, MessageSquare, MessagesSquare, Plus, RotateCw, Settings, ShieldAlert, Star, WifiOff, X } from 'lucide-react-native'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Alert, Pressable, ScrollView, View } from 'react-native'
+import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Alert, FlatList, Pressable, View, type FlatListProps, type ListViewToken } from 'react-native'
 import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { withUniwind } from 'uniwind'
@@ -14,6 +14,7 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { offlineCopy, recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import type { Mood } from '@vibeface/client/avatar/face.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useLive, useWaiting } from '@/data/live'
@@ -25,17 +26,18 @@ import { listTime } from '@/lib/time'
 import { useRun } from '@/lib/use-run'
 import { cn } from '@/lib/utils'
 import { mobilePlatform } from '@/platform'
-import { useWide } from '@/lib/layout'
+import type { BotRecord } from '@vibeface/client/workspace/types.ts'
 
 // A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
 const Item = withUniwind(Animated.View)
+const Cell: FlatListProps<BotRecord>['CellRendererComponent'] = ({ cellKey, index, item, ...props }) => <Animated.View layout={move} {...props} />
+const Separator = () => <View className="ms-[76px] h-px bg-border-subtle" />
 
 /**
  * The home list: a 待处理 card while something waits, then every bot by its newest message. As a sidebar it draws its
  * own title, new-bot and settings buttons in place of the native header, and keeps the open screen's row lit.
  */
 export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?: number }) {
-  const wide = useWide()
   const workspace = useWorkspace()
   const device = useDevice()
   const pathname = usePathname()
@@ -53,9 +55,16 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
   const replace = sidebar === true && pathname !== '/'
+  // Faces move only while their row shows; the rest hold the still pose.
+  const [shown, setShown] = useState<ReadonlySet<string>>(() => new Set())
+  const onViewable = useCallback(({ viewableItems }: { viewableItems: ListViewToken[] }) => setShown(new Set(viewableItems.map((item) => item.key))), [])
   // Entering animations skip the first render, so only a 待处理 card that appears later fades in.
-  return <LayoutAnimationConfig skipEntering><ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('px-3', sidebar ? 'grow' : 'w-full max-w-3xl self-center pb-8')}
-    contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : { minHeight }}>
+  return <LayoutAnimationConfig skipEntering><FlatList data={bots} keyExtractor={(bot) => bot.bot_id} contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('px-3', sidebar ? 'grow' : 'w-full max-w-3xl self-center pb-8')}
+    contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : { minHeight }}
+    CellRendererComponent={Cell} ItemSeparatorComponent={Separator} onViewableItemsChanged={onViewable}
+    renderItem={({ item: bot }) => <BotRow bot={bot} mood={botMood(bot, workspace, shared)} primary={workspace.primary === bot.conversation_id} unread={workspace.unread[bot.conversation_id] ?? 0}
+      time={bot.last_message ? listTime(bot.last_message.created_at_ms, now) : undefined} active={active(`/b/${bot.bot_id}`)} replace={replace} still={!shown.has(bot.bot_id)} />}
+    ListHeaderComponent={<>
     {sidebar ? <>
       <View className="min-h-16 flex-row items-center gap-2 px-4 py-3">
         <Text role="heading" className="min-w-0 flex-1 text-xl font-medium">消息</Text>
@@ -86,25 +95,15 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-control px-3 py-3 active:bg-surface-muted', active(`/channel/${channel.channel_id}`) && 'bg-surface-muted')}><Icon as={MessagesSquare} className="text-muted" /><Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Pressable></Link>)}
     {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}
     <Text role="heading" className="mb-1 mt-4 px-3 text-sm font-medium text-muted">Bot</Text>
-    {bots.length ? bots.map((bot, index) => {
-      const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
-      return <Item key={bot.bot_id} layout={move}>
-        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} still={sidebar === true && !wide} />} name={bot.name}
-          mark={primary ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
-          label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
-          unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
-          preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
-        {index < bots.length - 1 ? <View className="ms-[76px] h-px bg-border-subtle" /> : null}
-      </Item>
-    }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title={offlineCopy.title(workspace.connection.entry)} action={
+    </>}
+    ListEmptyComponent={empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title={offlineCopy.title(workspace.connection.entry)} action={
       <Button className="min-h-11" onPress={device.retryNow}><Icon as={RotateCw} /><Text>{offlineCopy.retry}</Text></Button>} /></View>
     : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
       <Skeleton className="size-11 rounded-pill" />
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-pill" /><Skeleton className="h-3 w-2/3 rounded-pill" /></View>
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
-    </Link> : undefined} /></View>}
-  </ScrollView></LayoutAnimationConfig>
+    </Link> : undefined} /></View>} /></LayoutAnimationConfig>
 }
 
 /** 新 Bot in a header. While a bot cannot be made it stays tappable and says why, instead of greying out without a word. */
@@ -140,6 +139,14 @@ function NotifyTip() {
     {error ? <View className="px-3"><ErrorText error={error} /></View> : null}
   </Item>
 }
+
+const BotRow = memo(function BotRow({ bot, mood, primary, still, ...row }: { bot: BotRecord; mood: Mood; primary: boolean; unread: number; time?: string; active: boolean; replace: boolean; still: boolean }) {
+  const last = bot.last_message
+  return <Row {...row} href={`/b/${bot.bot_id}`} avatar={<BotFace bot={bot} mood={mood} size={44} still={still} />} name={bot.name}
+    mark={primary ? <Icon as={Star} className="size-3.5 fill-muted text-muted" /> : null}
+    label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
+    preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
+})
 
 function Row({ href, replace, active, avatar, name, mark, label, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; label?: string; preview: string; unread: number; time?: string }) {
   return <Link href={href} replace={replace} asChild>
