@@ -1,6 +1,6 @@
-import { cloneElement, isValidElement, useMemo, type ReactElement, type ReactNode } from 'react'
+import { cloneElement, isValidElement, memo, useMemo, type ReactElement, type ReactNode } from 'react'
 import { ScrollView, View, type TextProps, type TextStyle, type ViewStyle } from 'react-native'
-import { Renderer, useMarkdown, type MarkedStyles } from 'react-native-marked'
+import { Renderer, useMarkdown, type MarkedStyles, type useMarkdownHookOptions } from 'react-native-marked'
 import { useUniwind } from 'uniwind'
 import { arcColors, arcTokens } from '@vibeface/theme/tokens'
 import { Button } from '@/components/arc/button'
@@ -36,13 +36,44 @@ export function Markdown({ text }: { text: string }) {
   const renderer = useMemo(() => new Reply({ backgroundColor: muted, borderColor: border, borderWidth: 1, borderRadius: arcTokens.radius.control, marginVertical: 6, overflow: 'hidden' }), [muted, border])
   // A new theme object would re-parse every reply on screen each time the chat renders.
   const colors = useMemo(() => ({ colors: { text: foreground, link: foreground, border, code: muted } }), [foreground, border, muted])
-  const nodes = useMarkdown(text, {
-    renderer,
-    colorScheme: theme === 'dark' ? 'dark' : 'light',
-    theme: colors,
-    styles,
-  })
-  return <View className="min-w-0">{nodes}</View>
+  const options = useMemo<useMarkdownHookOptions>(() => ({ renderer, colorScheme: theme === 'dark' ? 'dark' : 'light', theme: colors, styles }), [renderer, theme, colors, styles])
+  const blocks = useMemo(() => markdownBlocks(text), [text])
+  return <View className="min-w-0">{blocks.map((block, index) => <Block key={index} text={block} options={options} />)}</View>
+}
+
+/** A finished block keeps its parsed nodes while a streamed reply grows below it; only the block that changed is parsed again. */
+const Block = memo(function Block({ text, options }: { text: string; options: useMarkdownHookOptions }) {
+  return <>{useMarkdown(text, options)}</>
+})
+
+const fenceLine = /^ {0,3}(`{3,}|~{3,})/
+/**
+ * Cuts the text at blank lines outside code fences, before a line that can only start a new top-level block: not
+ * indented, not a list item, quote, table row or HTML, so lists, quotes and code read as they would whole. Reference
+ * links and HTML blocks that may span blank lines resolve across the whole text, so such text stays one block.
+ */
+function markdownBlocks(text: string): string[] {
+  if (/^ {0,3}(\[[^\]\n]+\]:|<(!--|pre|script|style|textarea))/im.test(text)) return [text]
+  const blocks: string[] = []
+  let start = 0, fence = '', blank = false, filled = false
+  for (let at = 0; at < text.length;) {
+    const end = text.indexOf('\n', at), next = end < 0 ? text.length : end + 1
+    const line = text.slice(at, end < 0 ? text.length : end)
+    const marker = fenceLine.exec(line)?.[1], info = marker ? line.trim().slice(marker.length) : ''
+    if (fence) {
+      if (marker && marker[0] === fence[0] && marker.length >= fence.length && !info.trim()) fence = ''
+    } else if (!line.trim()) blank = true
+    else {
+      if (blank && filled && !/^[\s>|<[\-*+\d]/.test(line)) { blocks.push(text.slice(start, at)); start = at }
+      blank = false
+      filled = true
+      // A backtick in a backtick fence's info string makes the line inline code instead.
+      if (marker && !(marker[0] === '`' && info.includes('`'))) fence = marker
+    }
+    at = next
+  }
+  blocks.push(text.slice(start))
+  return blocks
 }
 
 /** Caps Dynamic Type at 2x, as the app's `Text` does; a block's nested runs inherit it from the block's outer text. */

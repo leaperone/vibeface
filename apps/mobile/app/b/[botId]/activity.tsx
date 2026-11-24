@@ -1,14 +1,17 @@
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { ListChecks } from 'lucide-react-native'
-import { useCallback, useRef, useState, type ReactNode } from 'react'
-import { View } from 'react-native'
+import { useCallback, useRef, useState } from 'react'
+import { SectionList, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/arc/button'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
-import { useChatExtras } from '@/features/chat/work'
+import { useChatActivity, type Row } from '@/features/chat/work'
+import { cn } from '@/lib/utils'
+
+const Gap = () => <View className="h-3" />
 
 /** Everything about a bot's chat besides its messages: what needs the person, inputs on their way, tasks, changes and runtimes. */
 export default function BotActivity() {
@@ -33,21 +36,22 @@ export default function BotActivity() {
     }
     return () => { alive = false }
   }, [bot?.conversation_id, shared?.generation, shared?.connectionOnline, retry]))
-  const { activity } = useChatExtras(bot?.conversation_id ?? '', botId)
+  const activity = useChatActivity(bot?.conversation_id ?? '', botId)
   const loaded = shared && bot && shared.conversationId === bot.conversation_id && shared.data?.conversation?.conversation_id === bot.conversation_id
   const readError = error?.generation === shared?.generation && error?.botId === botId ? error.text : null
   const title = <Stack.Screen options={{ title: '动态' }} />
-  if (!loaded) return <>{title}<EmptyState icon={ListChecks}
+  if (!loaded || !activity) return <>{title}<EmptyState icon={ListChecks}
     title={readError ?? (!shared || !shared.connectionOnline ? '连接后再读取' : !bot ? '找不到这个 Bot' : '正在读取')}
     action={shared?.connectionOnline && bot ? <Button variant="secondary" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button> : undefined} className="flex-1 justify-center" /></>
-  const sections: [string, ReactNode[]][] = [['要处理', activity.todo], ['发送中', activity.sending], ['任务', activity.tasks], ['最近改动', activity.changes], ['运行信息', activity.runtime]]
-  const shown = sections.filter(([, items]) => items.length)
-  if (!shown.length) return <>{title}<EmptyState icon={ListChecks} title="暂无动态" className="flex-1 justify-center" /></>
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-8 p-4 pb-10">
+  const sections = ([['要处理', activity.todo], ['发送中', activity.sending], ['任务', activity.tasks], ['最近改动', activity.changes], ['运行信息', activity.runtime]] satisfies [string, Row[]][])
+    .filter(([, data]) => data.length).map(([key, data]) => ({ key, data }))
+  if (!sections.length) return <>{title}<EmptyState icon={ListChecks} title="暂无动态" className="flex-1 justify-center" /></>
+  return <>
     {title}
-    {shown.map(([heading, items]) => <View key={heading} className="gap-3">
-      <Text role="heading" className="text-sm font-medium text-muted">{heading}</Text>
-      {items}
-    </View>)}
-  </KeyboardAwareScrollView>
+    <SectionList sections={sections} keyExtractor={(row) => row.key} stickySectionHeadersEnabled={false}
+      renderSectionHeader={({ section }) => <Text role="heading" className={cn('pb-3 text-sm font-medium text-muted', section !== sections[0] && 'pt-8')}>{section.key}</Text>}
+      renderItem={({ item }) => <>{item.node}</>} ItemSeparatorComponent={Gap}
+      renderScrollComponent={(props) => <KeyboardAwareScrollView {...props} bottomOffset={24} />}
+      keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center p-4 pb-10" />
+  </>
 }
