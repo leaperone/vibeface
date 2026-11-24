@@ -15,13 +15,13 @@ export default function Home() {
   const router = useRouter()
   const wide = useWide()
   const workspace = useWorkspace()
-  const { conversation, work, routine, message } = useLocalSearchParams<{ conversation?: string; work?: string; routine?: string; message?: string }>()
+  const { conversation, work, routine, message, notification } = useLocalSearchParams<{ conversation?: string; work?: string; routine?: string; message?: string; notification?: string }>()
   const bot = workspace.bots.find((item) => item.conversation_id === conversation)
   useEffect(() => {
     if (!bot || !conversation) return
-    if (work) router.replace({ pathname: '/b/[botId]/work/[workId]', params: { botId: bot.bot_id, workId: work, ...(message ? { message } : {}) } })
-    else router.replace({ pathname: '/b/[botId]', params: { botId: bot.bot_id, ...(routine ? { routine } : {}), ...(message ? { message } : {}) } })
-  }, [conversation, work, routine, message, bot?.bot_id, router])
+    if (work) router.replace({ pathname: '/b/[botId]/work/[workId]', params: { botId: bot.bot_id, workId: work, ...(message ? { message } : {}), ...(notification ? { notification } : {}) } })
+    else router.replace({ pathname: '/b/[botId]', params: { botId: bot.bot_id, ...(routine ? { routine } : {}), ...(message ? { message } : {}), ...(notification ? { notification } : {}) } })
+  }, [conversation, work, routine, message, notification, bot?.bot_id, router])
   const bar = useHeaderHeight()
   const frame = useSafeAreaFrame()
   const insets = useSafeAreaInsets()

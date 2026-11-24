@@ -1021,6 +1021,59 @@ impl Store {
             .transpose()
     }
 
+    /// Exact routine content is separate from Main's deliberately filtered history.
+    pub(crate) fn routine_notification_record(
+        &self,
+        network: &str,
+        notification: &Notification,
+    ) -> Result<Value> {
+        let Some(target @ crate::workspace::InputTarget::Routine { .. }) = &notification.target
+        else {
+            return Ok(Value::Null);
+        };
+        let Some(event) =
+            log::event_from(&self.connection, network, &notification.notification_id)?
+        else {
+            return Ok(Value::Null);
+        };
+        ensure!(
+            event.scope_id == notification.conversation_id,
+            "notification conversation mismatch"
+        );
+        match event.body {
+            EventBody::QuestionAsked { question_id, .. } => {
+                let question = self
+                    .question(network, &question_id)?
+                    .context("original question unavailable")?;
+                ensure!(
+                    question["conversation_id"] == notification.conversation_id
+                        && question["target"] == serde_json::to_value(target)?,
+                    "original question target changed"
+                );
+                Ok(serde_json::json!({"kind":"question", "question":question}))
+            }
+            EventBody::MessagePosted { message_id, .. }
+            | EventBody::BotMessaged { message_id, .. } => {
+                let message = self
+                    .message(network, &notification.conversation_id, &message_id)?
+                    .context("original message unavailable")?;
+                ensure!(
+                    scope_projection::trigger_input_target_from(
+                        &self.connection,
+                        network,
+                        &notification.conversation_id,
+                        &crate::scheduling::message_trigger(&message_id)
+                    )?
+                    .as_ref()
+                        == Some(target),
+                    "original message target changed"
+                );
+                Ok(serde_json::json!({"kind":"message", "message":message, "target":target}))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
     pub fn notification_acked(
         &self,
         network_id: &str,

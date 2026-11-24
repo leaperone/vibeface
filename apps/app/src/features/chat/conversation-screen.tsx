@@ -12,6 +12,8 @@ import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntents,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
+import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
+import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { chatTimeline,chatUpdates,firstUnread } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -57,6 +59,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
   const routeMessage = useRouterState({ select: (state) => 'message' in state.location.search && typeof state.location.search.message === 'string' ? state.location.search.message : null })
+  const routeNotification = useRouterState({ select: (state) => 'notification' in state.location.search && typeof state.location.search.notification === 'string' ? state.location.search.notification : null })
   const { directory, ready, retryNow } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
   const draftKey = networkKey('bot-drafts', ready?.principal.network_id ?? '')
@@ -168,7 +171,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const remote = data?.scheduler?.remote
   // A question waiting on the person is the status already; a spinner under it would say the bot is still thinking.
-  const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
+  const toAnswer = routeRoutine ? [] : questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
   const asked = toAnswer[0]
   const stopping = activeJobs.some((job) => job.state === 'cancelling')
   if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-sm text-secondary">{bot ? <BotFace bot={bot} mood={workspace.connectionOnline && remote?.reachable !== false ? 'thinking' : 'asleep'} size={24} /> : null}{stopping ? '正在停止' : !workspace.connectionOnline || remote?.reachable === false ? '暂时收不到进展' : '思考中'}</p> })
@@ -202,7 +205,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const sending = pendingMessages.filter((pending) => !undecided(pending))
   const changeGroups = [...placedChanges.first, ...[...placedChanges.after.values()].flat()]
   const runtime = jobs.filter((job) => job.runtime).at(-1)?.runtime
-  const statusLine = chatStatusLine({ attention, tasks: runningTasks, hold: jobs.find((job) => job.state === 'queued')?.hold_reason })
+  const statusLine = routeRoutine ? '' : chatStatusLine({ attention, tasks: runningTasks, hold: jobs.find((job) => job.state === 'queued')?.hold_reason })
 
   const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
@@ -223,11 +226,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   useEffect(() => { setActivityOpen(false); activityFrom.current = null }, [conversationId, pathname])
   // Picked files belong to the bot they were picked for.
   useEffect(() => { setSendError(null); setFiles([]); setSelectedIntent(null); setSelectedTarget(routeRoutine ? `routine:${routeRoutine}` : 'main') }, [conversationId, routeRoutine])
-  useEffect(() => {
-    if (!active || !routeMessage || !data || !workspace.connectionOnline || entries.some((entry) => entry.key === routeMessage)) return
-    const section = routeMessage.startsWith('question:') ? 'questions' : 'messages'
-    if (!data.history[section].complete && !workspace.historyLoading.has(section)) void workspace.loadHistory(section).catch(setSendError)
-  }, [active, routeMessage, data, workspace.historyLoading])
+  const location = useHistoryLocation({ workspace, active, focus: routeRoutine ? null : routeMessage, found: entries.some((entry) => entry.key === routeMessage || 'message' in entry && entry.message.message_id === routeMessage) })
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -275,12 +274,13 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   return (
     <section className="conversation-screen" aria-label="对话">
       {history}
-      {updates.length ? <div aria-label="自上次查看以来" className="mx-auto grid w-full max-w-3xl gap-1 px-4 py-2 text-sm">
+      {location.kind !== 'found' ? <div role="status" className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2 text-sm text-secondary"><p>{location.text}</p>{location.kind === 'failed' ? <Button type="button" variant="secondary" size="sm" onClick={location.retry}>重新定位原记录</Button> : null}</div> : null}
+      {!routeRoutine && updates.length ? <div aria-label="自上次查看以来" className="mx-auto grid w-full max-w-3xl gap-1 px-4 py-2 text-sm">
         <p className="text-secondary">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录' : '自上次查看以来'} · {updates.length} 条新结果</p>
         {updates.slice(-2).map((update) => <p key={update.id} className="line-clamp-2"><span className="font-medium">{update.state}</span> · {update.text}</p>)}
         <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={(event) => openActivity(event.currentTarget)}>查看结果与依据</Button>
       </div> : null}
-      <Chat
+      {routeRoutine && bot ? <RoutineRecord workspace={workspace} botId={bot.bot_id} trigger={routeRoutine} notificationId={routeNotification} /> : <Chat
         key={conversationId}
         entries={entries}
         focus={routeMessage ?? undefined}
@@ -302,7 +302,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
               </div>
             </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
-      />
+      />}
       {bot && inputTarget ? <PromptInput
         id="message-text"
         above={!workspace.connectionOnline || history && statusLine || showWaiting ? <>
@@ -424,5 +424,15 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
     <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />没能回复</span>
     {job.failure ? <span className="min-w-0 truncate text-secondary" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
     {retry ? <ActionButton variant="ghost" className="-ms-1" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : <ActionButton variant="ghost" action={refresh}>再查一次</ActionButton>}
+  </div>
+}
+
+
+function RoutineRecord({ workspace, botId, trigger, notificationId }: { workspace: ReturnType<typeof useWorkspace>; botId: string; trigger: string; notificationId: string | null }) {
+  const record = useNotificationRecord({ workspace, conversationId: workspace.conversationId, target: { kind: 'routine', bot_id: botId, trigger }, notificationId })
+  return <div className="mx-auto grid w-full max-w-3xl gap-3 overflow-y-auto px-4 py-6" aria-label="原例行记录">
+    <h2 className="text-sm font-medium">{scheduleName(trigger, workspace.data?.bot_settings, workspace.data?.changes)}</h2>
+    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : <Chat entries={[{ key: record.content.message.message_id, message: record.content.message }]} empty={null} /> : <p role="status" className="text-sm text-secondary">{record.text}</p>}
+    {record.kind === 'failed' ? <Button type="button" variant="secondary" onClick={record.retry}>重新读取原记录</Button> : null}
   </div>
 }

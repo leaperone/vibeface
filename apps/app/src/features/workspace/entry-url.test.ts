@@ -1984,6 +1984,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (nativePureModules.has(specifier)) return loadComponentModule(fileURLToPath(new URL(`../../../../../apps/mobile/src/${specifier.slice(2)}.ts`, import.meta.url)))
     if (specifier === './cached') return loadComponentModule(fileURLToPath(new URL('../../../../../apps/mobile/src/data/cached.ts', import.meta.url)))
     if (specifier === '@vibeface/client/lib/use-generation-action.ts') return loadComponentModule(fileURLToPath(new URL('../../../../../packages/client/src/lib/use-generation-action.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/chat/use-notification-record.ts') return loadComponentModule(fileURLToPath(new URL('../../../../../packages/client/src/chat/use-notification-record.ts', import.meta.url)))
+    if (specifier === '@vibeface/client/chat/use-history-location.ts') return loadComponentModule(fileURLToPath(new URL('../../../../../packages/client/src/chat/use-history-location.ts', import.meta.url)))
     if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
     if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
@@ -3005,7 +3007,7 @@ function findActionProps(node: unknown, label: string): Record<string, unknown> 
   return undefined
 }
 
-function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}) {
+function conversationHarness(workspace: () => Record<string, unknown>, device: Record<string, unknown> = {}, search: Record<string, string> = {}) {
   const chatGlobals = {
     setInterval: () => 1, clearInterval() {},
     matchMedia: () => ({ matches: false }),
@@ -3017,6 +3019,7 @@ function conversationHarness(workspace: () => Record<string, unknown>, device: R
     },
   }
   const app = componentHarness('../chat/conversation-screen.tsx', {
+    '@tanstack/react-router': { useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname: '/b/bot', search } }) },
     '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', botTint: () => ({}) },
     '@/lib/glossary': { terms: { inbox: { label: '待处理', icon: 'InboxIcon' }, undelivered: { icon: 'UndeliveredIcon' }, approval: { icon: 'ApprovalIcon' } } },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) },
@@ -3768,7 +3771,7 @@ test('chat task history keeps completed and unknown records while counting only 
   try {
     assert.equal(label(), '动态，2 项要处理')
     assert.equal(badge(), true, 'the unverifiable work needs the person')
-    assert.match(status(), /^2 项要处理待处理$/, 'the failed and unverifiable works count; the open approval is the question pill, not a running task')
+    assert.match(status(), /^2 项要处理允许继续吗？$/, 'the failed and unverifiable works count; the open approval is the question pill, not a running task')
 
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
@@ -5752,11 +5755,11 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 34 }), useSafeAreaFrame: () => ({ width: 390 }) },
     'uniwind': { withUniwind: (value: unknown) => value, useUniwind: () => ({ theme: 'light' }), useCSSVariable: () => 'white' },
     '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { chatUpdates, messageTimes: () => new Map() },
-    '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy },
+    '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-    '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
+    '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
     ...dependencies,
-  })
+  }, { requestAnimationFrame: (run: () => void) => run() })
 }
 
 test('native composer adds photos and files without replacing current attachments or drafts', async (t) => {
@@ -6107,7 +6110,7 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
     assert.equal(retried, 1)
     connectionOnline = true
     assert.doesNotMatch(componentText(harness.composer()?.above), /最近记录 · /)
-    assert.match(componentText(harness.composer()?.above), /待处理/)
+    assert.match(componentText(harness.composer()?.above), /继续吗？/)
     assert.equal(harness.composer()?.disabled, false)
   } finally { harness.app.close() }
 })
@@ -7133,4 +7136,137 @@ test('notification click routes preserve the original question through task chan
       } finally { screen.close() }
     } finally { root.close() }
   }
+})
+
+
+test('notification question pagination uses questions and pauses failed cursors until explicit retry on Web and Mobile', async () => {
+  for (const native of [false, true]) {
+    const calls: HistorySection[] = []
+    let fail = true
+    const shared = { ...parityShared(), fresh: new Set<string>(), dataOrigin: 'network' as const, historyLoading: new Set<HistorySection>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, loadHistory: async (section: HistorySection) => {
+      calls.push(section)
+      if (fail) throw new Error('temporary history failure')
+      const data = shared.data; assert.ok(data)
+      shared.data = { ...data, history: { ...data.history, questions: { next_cursor: null, complete: true } } }
+    } }
+    const data = shared.data; assert.ok(data)
+    shared.data = { ...data, history: { ...data.history, messages: { next_cursor: null, complete: true }, questions: { next_cursor: 'older-questions', complete: false } } }
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = { origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
+    const mobile = native ? nativeChatHarness('android', { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', message: 'question:q-older' }) }, '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } }) : null
+    const web = native ? null : conversationHarness(() => shared, {}, { message: 'question:q-older' })
+    const render = () => mobile ? mobile.render('default') : web!.render({ active: true })
+    try {
+      render(); render(); await settleComponent()
+      for (let refresh = 0; refresh < 4; refresh++) { shared.historyLoading = new Set(); shared.data = { ...shared.data! }; render(); await settleComponent() }
+      assert.deepEqual(calls, ['questions'], `${native ? 'native' : 'web'} never retries an ordinary failure or loads Main messages for a question`)
+      assert.match(componentText(render()), /未能定位原问题/)
+      fail = false
+      const retry = render().find(({ type, props }) => type === 'Button' && componentText(props.children) === '重新定位原记录')?.props[native ? 'onPress' : 'onClick']
+      assert.ok(typeof retry === 'function'); retry(); render(); await settleComponent()
+      assert.deepEqual(calls, ['questions', 'questions'])
+      assert.match(componentText(render()), /原问题已不在这段对话记录中/)
+      render(); await settleComponent(); assert.equal(calls.length, 2)
+    } finally { mobile?.close(); web?.app.close() }
+  }
+})
+
+test('an older question appears after its own history page and stops focus pagination', async () => {
+  const question = workspaceModel.parseQuestions({ questions: [{ question_id: 'q-old', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' }, bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '原问题在更早记录中', choices: [], about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '', summary: '' }, author: 'worker', created_at_ms: 1, answer: null, closed: null }] })[0]; assert.ok(question)
+  for (const native of [false, true]) {
+    const calls: string[] = []
+    const shared = { ...parityShared(), fresh: new Set<string>(), dataOrigin: 'network' as const, historyLoading: new Set<HistorySection>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, loadHistory: async (section: HistorySection) => {
+      calls.push(section)
+      shared.data = { ...shared.data!, questions: [question], history: { ...shared.data!.history, questions: { next_cursor: 'even-older', complete: false } } }
+      conversation.rest = [question]
+    } }
+    shared.data = { ...shared.data!, history: { ...shared.data!.history, questions: { next_cursor: 'older', complete: false }, messages: { next_cursor: null, complete: true } } }
+    const conversation: import('../../../../../apps/mobile/src/data/types.ts').Conversation = { origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
+    const mobile = native ? nativeChatHarness('ios', { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', message: 'question:q-old' }) }, '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat: conversation }, members: [], primary: null, actions: { open() {} } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } },) : null
+    const web = native ? null : conversationHarness(() => shared, {}, { message: 'question:q-old' })
+    const render = () => mobile ? mobile.render('default') : web!.render({ active: true })
+    try {
+      render(); render(); await settleComponent(); const elements = render(); await settleComponent(); render()
+      assert.deepEqual(calls, ['questions'])
+      const rows = mobile ? elements.find(({ type }) => type === 'FlatList')?.props.data : elements.find(({ type }) => type === 'Chat')?.props.entries
+      assert.match(JSON.stringify(rows), /q-old/)
+      assert.doesNotMatch(componentText(elements), /原问题已不在/)
+    } finally { mobile?.close(); web?.app.close() }
+  }
+})
+
+
+test('routine notification screens display the exact scoped item and ignore late reads after route or connection changes', async () => {
+  for (const native of [false, true]) {
+    const target = { kind: 'routine' as const, bot_id: 'bot', trigger: 'schedule:check:1000' }
+    const question = workspaceModel.parseQuestions({ questions: [{ question_id: 'q-routine', conversation_id: 'chat', target, bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '原例行决定', choices: [], about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '', summary: '' }, author: 'worker', created_at_ms: 1, answer: null, closed: null }] })[0]; assert.ok(question)
+    const requests: { notification_id: string; conversation_id: string; target: InputTarget }[] = []
+    let pending = pendingResult()
+    const shared = { ...parityShared(), readNotificationRecord: (input: { notification_id: string; conversation_id: string; target: InputTarget }) => { requests.push(input); return pending.promise } }
+    const app = componentHarness(native ? '../../../../../apps/mobile/app/b/[botId].tsx' : '../chat/conversation-screen.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/workspace/bot-settings.ts': { scheduleName }, 'uniwind': { withUniwind: (value: unknown) => value },
+    }, {}, 'RoutineRecord')
+    const props = { workspace: shared, botId: 'bot', conversationId: 'chat', trigger: target.trigger, notificationId: 'notice-a' }
+    let navigation: unknown = null
+    const ready = { principal: { network_id: 'network', device_id: 'phone', source: 'membership' }, info: { network_id: 'network' }, entry: { device_id: 'gateway' } }
+    const opener = componentHarness(native ? '../../../../../apps/mobile/src/data/live.tsx' : '../../routes/_app.tsx', {
+      'expo-router': { useRouter: () => ({ push: (value: unknown) => { navigation = value } }) },
+      '@tanstack/react-router': { createFileRoute: () => () => ({}), useNavigate: () => (value: unknown) => { navigation = value }, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname: '/', href: '/', search: {} } }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready, phase: 'ready', entries: [], joining: false, link: { kind: 'online' } }) },
+      '@vibeface/client/identity/access.ts': { accessOf }, '@/features/identity/onboarding-flag': { useOnboarding: () => null }, '@vibeface/client/workspace/context.tsx': { WorkspaceProvider: 'SharedWorkspace' },
+    }, {}, native ? 'Device' : 'AppLayout')
+    try {
+      const open = opener.render(native ? 'Device' : 'AppLayout').find(({ props }) => typeof props.openConversation === 'function')?.props.openConversation
+      assert.ok(typeof open === 'function'); open('chat', target, 'question:q-routine', 'notice-a')
+      const routed = workspaceModel.record(navigation)
+      const search = workspaceModel.record(native ? routed.params : routed.search)
+      assert.equal(search.notification, 'notice-a'); assert.equal(search.routine, target.trigger)
+    } finally { opener.close() }
+
+    const main = native ? nativeChatHarness('ios', {
+      'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot', routine: target.trigger, message: 'question:q-routine', notification: 'notice-a' }) },
+      '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: {}, members: [], actions: { open() {} } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) },
+    }) : null
+    const web = native ? null : conversationHarness(() => ({ ...shared, fresh: new Set(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false } }), {}, { routine: target.trigger, message: 'question:q-routine', notification: 'notice-a' })
+    const source = main ? main.render('default') : web!.render({ active: true })
+    const route = source.find(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord')
+    assert.equal(route?.props.notificationId, 'notice-a')
+    assert.equal(route?.props.trigger, target.trigger)
+    assert.equal(source.some(({ type }) => type === 'FlatList' || type === 'Chat'), false, 'routine routes render their original record instead of Main')
+    const render = () => app.render('RoutineRecord', props)
+    try {
+      render(); await settleComponent()
+      assert.equal(requests.length, 1)
+      assert.deepEqual(JSON.parse(JSON.stringify(requests[0])), { notification_id: 'notice-a', conversation_id: 'chat', target })
+      const old = pending; pending = pendingResult(); shared.generation++; props.notificationId = 'notice-b'; render(); await settleComponent()
+      old.resolve({ kind: 'question', question }); await settleComponent()
+      assert.equal(render().some(({ type }) => type === 'QuestionCard'), false, 'a prior route or connection never populates the new record')
+      pending.resolve({ kind: 'question', question }); await settleComponent()
+      assert.equal(render().find(({ type }) => type === 'QuestionCard')?.props.question, question)
+      assert.equal(render().some(({ type }) => type === 'FlatList'), false, 'the routine does not claim to show Main history')
+      const next = pendingResult(); pending = next; props.notificationId = 'result-notice'; render(); await settleComponent()
+      next.resolve({ kind: 'message', message: { message_id: 'result', event_hash: 'result-event', role: 'assistant', text: '原例行结果', created_at_ms: 1 } }); await settleComponent()
+      const shown = render()
+      if (native) assert.equal(shown.find(({ type }) => type === 'Message')?.props.message && workspaceModel.record(shown.find(({ type }) => type === 'Message')?.props.message).text, '原例行结果')
+      else assert.match(JSON.stringify(shown.find(({ type }) => type === 'Chat')?.props.entries), /原例行结果/)
+    } finally { app.close(); main?.close(); web?.app.close() }
+  }
+})
+
+
+test('focused history does not restart a failure after an empty scan advanced its cursor', async () => {
+  let reads = 0
+  const shared = { ...parityShared(), dataOrigin: 'network' as const, historyLoading: new Set<HistorySection>(), loadHistory: async () => {
+    reads++
+    shared.data = { ...shared.data!, history: { ...shared.data!.history, questions: { next_cursor: 'failed-cursor', complete: false } } }
+    throw new Error('failed after empty scan')
+  } }
+  shared.data = { ...shared.data!, history: { ...shared.data!.history, questions: { next_cursor: 'first-cursor', complete: false } } }
+  const app = componentHarness('../../../../../packages/client/src/chat/use-history-location.ts', { '../lib/node.ts': { messageOf } })
+  const render = () => { app.render('useHistoryLocation', { workspace: shared, active: true, focus: 'question:q-old', found: false }); return workspaceModel.record(app.output) }
+  try {
+    render(); await settleComponent(); render(); await settleComponent(); render()
+    assert.equal(reads, 1)
+    assert.equal(render().kind, 'failed')
+  } finally { app.close() }
 })

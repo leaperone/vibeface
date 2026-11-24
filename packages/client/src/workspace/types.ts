@@ -299,6 +299,7 @@ export type PendingCheck =
   | { kind: "work"; check_id: string; detail: string; work_id: string; target?: InputTarget; target_node: string; conversation_id: string; title: string; reason: ConfirmReason }
   | { kind: "device"; check_id: string; detail: string; target_node: string; reason: "offline" | "disconnected"; works: Extract<PendingCheck, { kind: "work" }>[] }
   | { kind: "process"; check_id: string; detail: string }
+export type NotificationContent = { kind: 'question'; question: Question } | { kind: 'message'; message: TranscriptMessage }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string; target?: InputTarget; focus?: string }
 export const sessionNotificationKind = "session_attributed"
 export const isSessionNotification = (item: Pick<NotificationRecord, "kind">) => item.kind === sessionNotificationKind

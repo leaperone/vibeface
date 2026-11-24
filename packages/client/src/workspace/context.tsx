@@ -14,7 +14,7 @@ import { inputTargetKey, inputTaskCommand, isQueuedReceipt, prepareSend, replyUn
 import { taskActive } from "./labels.ts"
 import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
-  inputText, parseConversation, parseNodeReport, parseNotifications,
+  inputText, parseNotificationContent, parseConversation, parseNodeReport, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseQuestionInbox, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
   parseInputReceipt, parseInputNotSaved, parsePendingMessage, parseScopeContext, parseWorkDetail, parseWorkspaceCommand, parseWorkspaceCommandResult, parseWorkspaceCommandNotSaved, parseWorkspaceHistory, parseWorkspaceState,
@@ -64,7 +64,7 @@ class WorkspaceCommandNotSavedError extends Error {
   constructor(receipt: WorkspaceCommandNotSaved) { super(receipt.reason || '这次操作未保存。请读取最新状态后再操作。') }
 }
 
-function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget, focus?: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
+function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string, target?: InputTarget, focus?: string, notificationId?: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
   const { notifier } = platform
   const inputLock: NonNullable<Platform["inputLock"]> = platform.inputLock ?? ((_name, save) => save())
   const { readStorage, writeStorage } = storageOf(platform.storage)
@@ -533,9 +533,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       show: (item) => notifier.show({ title: item.kind === "question" ? "Vibeface · 需要你回答" : isSessionNotification(item) ? "Vibeface · 接手会话" : "Vibeface · 进展", body: notificationPreview(item), tag: item.notification_id, destination: { network_id: networkId, device_id: clientId, notification_id: item.notification_id, conversation_id: item.conversation_id } }, () => {
           if (!current()) return
           if (isSessionNotification(item)) {
-            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target, item.focus) }, () => {})
+            void ackNotificationRef.current(item).then(() => { if (current()) openConversation(item.conversation_id, item.target, item.focus, item.notification_id) }, () => {})
           } else {
-            openConversation(item.conversation_id, item.target, item.focus)
+            openConversation(item.conversation_id, item.target, item.focus, item.notification_id)
           }
       }),
     })
@@ -549,7 +549,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (isSessionNotification(item) && platform.sessionNotifications === false) return true
       if (isSessionNotification(item)) await ackNotificationRef.current(item)
       if (!current()) return false
-      openConversation(item.conversation_id, item.target, item.focus)
+      openConversation(item.conversation_id, item.target, item.focus, item.notification_id)
       return true
     } catch { return false }
   }), [connection])
@@ -1470,6 +1470,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       else { onScreen.current = null; setFresh(new Set<string>()) }
     }, nodes, nodesRead: nodeReport !== null, nodeReport, refreshNodes, conversationId, data: visibleData, dataOrigin: visibleOrigin, conversationLoading, conversationError, refreshConversation, markMessagesRead, fresh, notifications, ignoredNotifications, questions, dismissedQuestions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     historyLoading, loadHistory, cancelHistory, refreshing, incomplete, chatSlot, pendingMessages, messageBusy, canSaveMessages, liveProgress, interrupted,
+    readNotificationRecord: async (expected: { notification_id: string; conversation_id: string; target: InputTarget }) => {
+      requireCurrent()
+      const response = await rpc('notifications', { notification_id: expected.notification_id, conversation_id: expected.conversation_id })
+      requireCurrent()
+      return parseNotificationContent(response, expected)
+    },
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
     joined, synced,
@@ -1728,7 +1734,7 @@ export function useWorkspace() {
   if (!value) throw new Error("工作区组件缺少上下文。")
   return value
 }
-export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string, target?: InputTarget, focus?: string) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
+export function WorkspaceProvider({ platform, connection, openConversation, tabs, initialBot = null, children }: { platform: Platform; connection: ReadyConnection; openConversation: (conversationId: string, target?: InputTarget, focus?: string, notificationId?: string) => void; tabs: Tabs; initialBot?: string | null; children: ReactNode }) {
   const value = useWorkspaceState(platform, connection, openConversation, tabs, initialBot)
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

@@ -10,6 +10,8 @@ import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanima
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
 import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
+import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { chatUpdates, messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -118,7 +120,7 @@ function Starters({ draft, project, canRun }: { draft: ChatDraftOwner; project: 
 
 export default function ChatScreen() {
   const router = useRouter()
-  const { botId, routine, message: targetMessage } = useLocalSearchParams<{ botId: string; routine?: string; message?: string }>()
+  const { botId, routine, message: targetMessage, notification } = useLocalSearchParams<{ botId: string; routine?: string; message?: string; notification?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()
   const insets = useSafeAreaInsets()
@@ -156,8 +158,9 @@ export default function ChatScreen() {
   const currentScope = useRef(draftScopeKey)
   currentScope.current = draftScopeKey
   useEffect(() => { setSelectedTarget(routine ? `routine:${routine}` : 'main'); setSelectedIntent(null); setIntentMenu(null) }, [id, routine])
+  const [routeFocused, setRouteFocused] = useState(false)
   const routeActive = useRef(false)
-  useFocusEffect(useCallback(() => { routeActive.current = true; const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
+  useFocusEffect(useCallback(() => { routeActive.current = true; setRouteFocused(true); const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; setRouteFocused(false); intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
   const extras = useChatSummary(id ?? '')
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
@@ -197,7 +200,7 @@ export default function ChatScreen() {
   const day = new Date().toDateString()
   const listed = useMemo(() => chat && bot ? entries(chat, extras.failures, bot, offline) : [], [chat, extras.failures, bot, offline, day])
   const history = live && live.conversationId === id ? live.data?.history : undefined
-  const rows: Entry[] = history && live && !history.messages.complete ? [...listed, { key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages']} /> }] : listed
+  const rows: Entry[] = history && live && (!history.messages.complete || !history.questions.complete) ? [...listed, { key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages', 'questions']} /> }] : listed
   const [visible, setVisible] = useState<{ id: string; messages: VisibleChatMessage[] }>({ id: '', messages: [] })
   const knownMessages = useMemo(() => new Map(chat?.messages.map((message) => [message.message_id, message.event_hash]) ?? []), [chat?.messages])
   const reading = useRef({ id, positions, live, knownMessages })
@@ -220,21 +223,20 @@ export default function ChatScreen() {
     if (!routeActive.current || !current.id || current.live?.conversationId !== current.id || current.live.dataOrigin !== 'network' || !current.live.connectionOnline || current.live.historyLoading.has('messages') || current.live.data?.history.messages.complete) return
     void current.live.loadHistory('messages').catch((cause) => { if (reading.current.id === current.id) setSendError(messageOf(cause)) })
   }
+  const focused = restoration.current.messageId
+  const questionIds = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().map((question) => question.question_id)
+  const recordLocation = focused ? chatMessageLocation({ messageId: focused, messages: chat?.messages ?? [], questionIds }) : null
+  const locatedIndex = rows.findIndex((row) => recordLocation?.kind === 'question' ? row.key === `q:${recordLocation.questionId}` : recordLocation?.kind === 'message' && 'message' in row && row.message.message_id === recordLocation.messageId)
+  const location = useHistoryLocation({ workspace: live, active: Boolean(routeFocused && id && !routine && focused), focus: recordLocation?.kind === 'question' ? `question:${recordLocation.questionId}` : focused, found: locatedIndex >= 0 })
   useEffect(() => {
-    if (!id || !rows.length || restoration.current.done) return
-    const target = restoration.current.messageId
-    if (target) {
-      const questionIds = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().map((question) => question.question_id)
-      const location = chatMessageLocation({ messageId: target, messages: chat?.messages ?? [], questionIds })
-      const index = rows.findIndex((row) => location.kind === 'question' ? row.key === `q:${location.questionId}` : 'message' in row && row.message.message_id === location.messageId)
-      if (index >= 0) {
-        restoration.current.done = true
-        away.current = index > 1
-        requestAnimationFrame(() => list.current?.scrollToIndex({ index, viewPosition: 1, animated: false }))
-      } else if (history && !history.messages.complete && live?.dataOrigin === 'network') loadOlder()
-      else if (live?.dataOrigin === 'network' && !live.conversationLoading) restoration.current.done = true
-    } else restoration.current.done = true
-  }, [positionKey, rows.length, live?.data, live?.historyLoading, live?.dataOrigin])
+    if (!id || restoration.current.done) return
+    if (!focused) restoration.current.done = true
+    else if (locatedIndex >= 0) {
+      restoration.current.done = true
+      away.current = locatedIndex > 1
+      requestAnimationFrame(() => list.current?.scrollToIndex({ index: locatedIndex, viewPosition: 1, animated: false }))
+    }
+  }, [positionKey, focused, locatedIndex])
   const toLatest = () => {
     if (scrollInset.current.id !== id) return
     restoration.current.done = true
@@ -340,8 +342,8 @@ export default function ChatScreen() {
   const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
-  const statusLine = chatStatusLine(extras)
-  const nextQuestion = [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
+  const statusLine = routine ? '' : chatStatusLine(extras)
+  const nextQuestion = routine ? undefined : [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
   const updates = chatUpdates(chat?.messages ?? [], live?.data?.scheduler?.jobs ?? [], live?.fresh ?? new Set())
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
@@ -380,7 +382,7 @@ export default function ChatScreen() {
     }} />
     <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
-    <FlatList
+    {routine ? <RoutineRecord workspace={live} botId={bot.bot_id} conversationId={id} trigger={routine} notificationId={notification ?? null} /> : <FlatList
       key={id}
       ref={list}
       data={rows}
@@ -417,8 +419,8 @@ export default function ChatScreen() {
       ListFooterComponent={<View style={{ height: header }} />}
       ItemSeparatorComponent={Separator}
       renderItem={renderItem}
-    />
-    {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
+    />}
+    {routine || rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
         <BotFace bot={bot} mood={mood} size={96} />
         <View className="items-center gap-1">
@@ -442,10 +444,11 @@ export default function ChatScreen() {
         {scrollButton.id === id && scrollButton.visible ? <View pointerEvents="box-none" className={ios ? 'absolute -top-13 w-full max-w-3xl self-center items-end px-4' : 'absolute -top-14 w-full max-w-3xl self-center items-end px-4'}>
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
+        {location.kind !== 'found' ? <View role="status" className="w-full max-w-3xl gap-2 self-center px-4 py-2"><Text className="text-sm text-muted">{location.text}</Text>{location.kind === 'failed' ? <Button variant="secondary" onPress={location.retry}><Text>重新定位原记录</Text></Button> : null}</View> : null}
         {nextQuestion ? <View className="px-4"><Button variant="secondary" accessibilityLabel={`现在处理：${questionParts(nextQuestion.text).ask}`} onPress={() => {
           const index = rows.findIndex((row) => row.key === `q:${nextQuestion.question_id}`)
           if (index >= 0) toUnread(index)
-        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : updates.length ? <View accessibilityLabel="自上次查看以来" className="w-full max-w-3xl gap-1 self-center px-4"><Text numberOfLines={2} className="text-sm text-muted">{offline ? '最近记录' : '自上次查看以来'} · {updates.at(-1)?.state} · {updates.at(-1)?.text}</Text></View> : null}
+        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : !routine && updates.length ? <View accessibilityLabel="自上次查看以来" className="w-full max-w-3xl gap-1 self-center px-4"><Text numberOfLines={2} className="text-sm text-muted">{offline ? '最近记录' : '自上次查看以来'} · {updates.at(-1)?.state} · {updates.at(-1)?.text}</Text></View> : null}
         {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
           <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
             <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />
@@ -475,4 +478,15 @@ export default function ChatScreen() {
       </View>
     </KeyboardStickyView>
   </View>
+}
+
+
+function RoutineRecord({ workspace, botId, conversationId, trigger, notificationId }: { workspace: ReturnType<typeof useLive>; botId: string; conversationId: string; trigger: string; notificationId: string | null }) {
+  const record = useNotificationRecord({ workspace, conversationId, target: { kind: 'routine', bot_id: botId, trigger }, notificationId })
+  const bot = workspace?.bots.find((bot) => bot.bot_id === botId)
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-32" accessibilityLabel="原例行记录">
+    <Text role="heading" className="text-sm font-medium">{scheduleName(trigger, workspace?.data?.bot_settings, workspace?.data?.changes)}</Text>
+    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : bot ? <Message message={record.content.message} bot={bot} offline={!workspace?.connectionOnline} attachmentScope={JSON.stringify([conversationId, trigger])} /> : null : <Text role="status" className="text-sm text-muted">{record.text}</Text>}
+    {record.kind === 'failed' ? <Button variant="secondary" onPress={record.retry}><Text>重新读取原记录</Text></Button> : null}
+  </ScrollView>
 }

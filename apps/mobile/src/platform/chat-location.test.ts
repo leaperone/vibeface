@@ -23,3 +23,8 @@ test('a replacement event with the same message identity needs its own visible s
 test('a notification opens its original question before an answer exists', () => {
   assert.deepEqual(chatMessageLocation({ messageId: 'question:decision', messages: [], questionIds: ['decision'] }), { kind: 'question', questionId: 'decision' })
 })
+
+
+test('an unloaded notification question remains in the questions collection', () => {
+  assert.deepEqual(chatMessageLocation({ messageId: 'question:older', messages: [], questionIds: [] }), { kind: 'question', questionId: 'older' })
+})

@@ -133,6 +133,24 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
     return { notification_id: text(data.notification_id), conversation_id: text(data.conversation_id), kind: text(data.kind), text: text(data.text), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }), ...(data.focus == null ? {} : { focus: inputText(text(data.focus), '提醒位置', 1024) }) }
   })
 }
+export function parseNotificationContent(value: unknown, expected: { notification_id: string; conversation_id: string; target: InputTarget }): import('./types.ts').NotificationContent {
+  const notification = parseNotifications(value).find((item) => item.notification_id === expected.notification_id && item.conversation_id === expected.conversation_id)
+  const matches = (target: InputTarget | undefined) => target && JSON.stringify(parseInputTarget(target)) === JSON.stringify(parseInputTarget(expected.target))
+  if (!notification || !matches(notification.target)) throw new Error('原提醒目标已不在当前网络记录中。')
+  const content = record(record(value).record)
+  if (content.kind === 'question') {
+    const [question] = parseQuestions({ questions: [content.question] })
+    if (!question || question.conversation_id !== expected.conversation_id || !matches(question.target) || notification.focus !== `question:${question.question_id}`) throw new Error('原问题不属于这个提醒目标。')
+    return { kind: 'question', question }
+  }
+  if (content.kind === 'message') {
+    const parsed = message(content.message)
+    if (!matches(parseInputTarget(content.target)) || notification.focus !== parsed.message_id) throw new Error('原消息不属于这个提醒目标。')
+    return { kind: 'message', message: { ...parsed, target: expected.target } }
+  }
+  throw new Error('这个提醒的原记录已不可用。')
+}
+
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
   return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }) }
