@@ -31,8 +31,16 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 const HANDOFFS_PER_HOUR: usize = 6;
 const HANDOFFS_PER_DAY: usize = 24;
 pub(crate) const MAX_LOG_READ: usize = 200;
+/// Open problems one member Node shares, and how much of each.
+const MAX_SHARED_PROBLEMS: usize = 32;
+const MAX_SUBJECT_BYTES: usize = 256;
+const MAX_DETAIL_CHARS: usize = 500;
+/// ponytail: one fixed wait per member, asked all at once, so a round stays under its minute.
+const PEER_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Check {
     WorkStalled,
@@ -88,16 +96,18 @@ impl Check {
 pub(crate) struct ProblemKey {
     check: Check,
     subject: String,
+    /// The member Node that found the problem; `None` for this one.
+    device: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Problem {
     pub check: Check,
     /// The work ID, the peer's device ID, or `codex` for the App Server.
     pub subject: String,
     pub since_ms: i64,
     pub detail: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
 }
 
@@ -106,7 +116,27 @@ impl Problem {
         ProblemKey {
             check: self.check,
             subject: self.subject.clone(),
+            device: None,
         }
+    }
+
+    fn found_on(&self, device: &str) -> ProblemKey {
+        ProblemKey {
+            device: Some(device.to_owned()),
+            ..self.key()
+        }
+    }
+
+    /// A problem a member Node answered with, held to what a reminder note and a log line take.
+    fn bounded(mut self) -> Option<Self> {
+        if self.subject.is_empty() || self.subject.len() > MAX_SUBJECT_BYTES {
+            return None;
+        }
+        self.detail = self.detail.chars().take(MAX_DETAIL_CHARS).collect();
+        self.conversation_id = self
+            .conversation_id
+            .filter(|id| vibeface_protocol::validate_id(id).is_ok());
+        Some(self)
     }
 }
 
@@ -246,6 +276,8 @@ pub(crate) struct HealthState {
     handed: Vec<(ProblemKey, i64)>,
     /// Open problems the primary bot has not got yet; each round tries them again.
     unhanded: BTreeSet<ProblemKey>,
+    /// Open problems other member Nodes reported to this one, which schedules the primary bot.
+    remote: BTreeMap<ProblemKey, Problem>,
     /// Each open scheduler job's state and since when this Node has seen it in that state.
     jobs: HashMap<String, (&'static str, i64)>,
     /// Since when each connected peer has been seen connected, and its last attachment progress.
@@ -268,6 +300,7 @@ impl HealthState {
             app_server_missed: None,
             handed: Vec::new(),
             unhanded: BTreeSet::new(),
+            remote: BTreeMap::new(),
             jobs: HashMap::new(),
             peer_connected: HashMap::new(),
             peer_progress: HashMap::new(),
@@ -390,7 +423,8 @@ impl HealthState {
         open.extend(kept);
         self.problems = open;
         self.unhanded.extend(began.iter().map(Problem::key));
-        self.unhanded.retain(|key| self.problems.contains_key(key));
+        self.unhanded
+            .retain(|key| self.problems.contains_key(key) || self.remote.contains_key(key));
         (
             began,
             ended.into_iter().map(|(_, problem)| problem).collect(),
@@ -413,12 +447,58 @@ impl HealthState {
         self.unhanded.remove(key);
     }
 
-    /// Open problems the primary bot has not got.
-    fn unhanded(&self) -> Vec<Problem> {
+    /// Open problems the primary bot has not got, with their keys.
+    fn unhanded(&self) -> Vec<(ProblemKey, Problem)> {
         self.unhanded
             .iter()
-            .filter_map(|key| self.problems.get(key).cloned())
+            .filter_map(|key| {
+                let problem = self.problems.get(key).or_else(|| self.remote.get(key))?;
+                Some((key.clone(), problem.clone()))
+            })
             .collect()
+    }
+
+    /// Takes what each member Node in `answers` reported: `Some` replaces its open problems,
+    /// `None`, a member that did not answer, keeps them. Members not asked lose theirs. A
+    /// member confirms its problems over two rounds itself, so a new one is open at once.
+    /// Returns the problems that began, with the member that found them.
+    fn update_remote(
+        &mut self,
+        answers: BTreeMap<String, Option<Vec<Problem>>>,
+    ) -> Vec<(String, Problem)> {
+        let mut began = Vec::new();
+        let mut remote = BTreeMap::new();
+        let known = std::mem::take(&mut self.remote);
+        for (key, problem) in known.clone() {
+            let device = key.device.as_deref().unwrap_or_default();
+            if matches!(answers.get(device), Some(None)) {
+                remote.insert(key, problem);
+            }
+        }
+        for (device, problems) in answers {
+            for problem in problems.into_iter().flatten() {
+                let key = problem.found_on(&device);
+                let since_ms = match known.get(&key) {
+                    Some(known) => known.since_ms,
+                    None => {
+                        began.push((device.clone(), problem.clone()));
+                        self.unhanded.insert(key.clone());
+                        problem.since_ms
+                    }
+                };
+                remote.insert(
+                    key,
+                    Problem {
+                        since_ms,
+                        ..problem
+                    },
+                );
+            }
+        }
+        self.remote = remote;
+        self.unhanded
+            .retain(|key| self.problems.contains_key(key) || self.remote.contains_key(key));
+        began
     }
 
     /// Records one answered (`true`) or missed probe; returns when the run of misses began.
@@ -652,14 +732,21 @@ fn record(problem: &Problem, began: bool) {
 }
 
 /// The turn the primary bot gets for a new problem.
-fn handoff_note(problem: &Problem, device: &str) -> String {
+fn handoff_note(problem: &Problem, device: &str, member: bool) -> String {
     let conversation = problem
         .conversation_id
         .as_ref()
         .map(|id| format!("，会话 {id}"))
         .unwrap_or_default();
+    let tools = if member {
+        format!(
+            "这是另一台成员设备报告的问题：给 read_health 和 read_logs 传 node: \"{device}\" 读那台设备的日志和健康状态。"
+        )
+    } else {
+        "这两个工具默认读取执行这一轮的设备自己的日志和健康状态。".to_owned()
+    };
     format!(
-        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。这两个工具只读取执行这一轮的设备自己的日志和健康状态，这一轮不在设备 {device} 上执行时不可用。这一轮不能派发或控制工作，也不能设提醒或给其他 bot 发消息；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
+        "设备 {device} 的 Node 健康检查发现新问题：{}（{}）。\n发现问题的设备：{device}\n对象：{}{conversation}\n开始于：{}（Unix 毫秒）\n详情：{}\n\n先用 read_health 和 read_logs 排查原因。{tools}这一轮不能派发或控制工作，也不能设提醒或给其他 bot 发消息；能自行处理的就处理，例如用 propose_provider_config 提议配置；需要本人决定时按现有拍板流程发卡片。这条提示来自 Node 的健康检查，不是本人的消息。",
         problem.check.title(),
         problem.check.began(),
         problem.subject,
@@ -993,10 +1080,19 @@ impl Runtime {
         // goes again each round while it stays open. Only its first try logs at info.
         // ponytail: one store transaction per open problem a minute, as on a Node that does not
         // schedule the primary bot; back off per key if that write lock ever shows up.
-        let unhanded = self.health.lock().expect("health").unhanded();
-        for problem in unhanded {
-            let first = began.iter().any(|new| new.key() == problem.key());
-            match self.hand_to_primary_bot(&problem, now, first).await {
+        let mut first_keys: BTreeSet<_> = began.iter().map(Problem::key).collect();
+        for (device, problem) in self.member_problems(&peers).await {
+            tracing::info!(event = "health.member_problem", device, check = ?problem.check,
+                subject = problem.subject, since_ms = problem.since_ms, detail = problem.detail,
+                "a member Node reports a problem");
+            first_keys.insert(problem.found_on(&device));
+        }
+        let mut unhanded = self.health.lock().expect("health").unhanded();
+        // This Node's own first, so a member's batch does not use up the limits before them.
+        unhanded.sort_by_key(|(key, _)| key.device.is_some());
+        for (key, problem) in unhanded {
+            let first = first_keys.contains(&key);
+            match self.hand_to_primary_bot(&key, &problem, now, first).await {
                 Err(error) if first => {
                     tracing::warn!(event = "health.handoff_failed", %error, check = ?problem.check,
                         subject = problem.subject, "an open problem did not reach the primary bot");
@@ -1027,7 +1123,13 @@ impl Runtime {
     /// daily limits. Only the Node that schedules the primary bot may; no Node path lets another
     /// one start that bot's turn without the user's own message, so there only the log has it,
     /// as it does without a running bot or a primary bot.
-    async fn hand_to_primary_bot(&self, problem: &Problem, now: i64, first: bool) -> Result<()> {
+    async fn hand_to_primary_bot(
+        &self,
+        problem_key: &ProblemKey,
+        problem: &Problem,
+        now: i64,
+        first: bool,
+    ) -> Result<()> {
         if self.manager().is_none() || !self.writable() {
             return Ok(());
         }
@@ -1038,7 +1140,7 @@ impl Runtime {
             .health
             .lock()
             .expect("health")
-            .may_hand(&problem.key(), now)
+            .may_hand(problem_key, now)
         {
             if first {
                 tracing::info!(event = "health.handoff_limited", check = ?problem.check,
@@ -1046,10 +1148,13 @@ impl Runtime {
             }
             return Ok(());
         }
-        let device = self.identity.device_id()?;
+        let device = match &problem_key.device {
+            Some(member) => member.clone(),
+            None => self.identity.device_id()?,
+        };
         let (key, note) = (
             handoff_key(problem, &device, now),
-            handoff_note(problem, &device),
+            handoff_note(problem, &device, problem_key.device.is_some()),
         );
         let identity = self.identity.clone();
         let reminded = {
@@ -1079,15 +1184,12 @@ impl Runtime {
                     .lock()
                     .expect("health")
                     .unhanded
-                    .remove(&problem.key());
+                    .remove(problem_key);
                 tracing::debug!(conversation_id = change.conversation_id, check = ?problem.check,
                     "the primary bot already has this problem");
             }
             PrimaryReminder::Written(change) => {
-                self.health
-                    .lock()
-                    .expect("health")
-                    .handed(&problem.key(), now);
+                self.health.lock().expect("health").handed(problem_key, now);
                 self.publish_changed(
                     &network,
                     &change.conversation_id,
@@ -1117,14 +1219,121 @@ impl Runtime {
             .await
     }
 
+    /// On the Node that schedules the primary bot, asks each connected member Node for its open
+    /// problems and keeps them as this Node's own, so they reach the primary bot the same way.
+    /// Elsewhere, or with no primary bot, member problems stay with their Node.
+    async fn member_problems(
+        &self,
+        peers: &[crate::maintenance::PeerHealth],
+    ) -> Vec<(String, Problem)> {
+        let owner = async {
+            let network = self.store.call("network", |store| store.network()).await?;
+            let Some(network) = network else {
+                return Ok(None);
+            };
+            let local = self.identity.device_id()?;
+            let read = network.clone();
+            let owner = self
+                .store
+                .read("health.primary_owner", move |store| {
+                    store.primary_bot_owner(&read)
+                })
+                .await?;
+            Ok::<_, anyhow::Error>((owner.as_deref() == Some(local.as_str())).then_some(network))
+        };
+        let network = match owner.await {
+            Ok(Some(network)) if self.manager().is_some() => network,
+            Ok(_) => {
+                self.health
+                    .lock()
+                    .expect("health")
+                    .update_remote(BTreeMap::new());
+                return Vec::new();
+            }
+            Err(error) => {
+                tracing::debug!(%error, "member problems wait for the next round");
+                return Vec::new();
+            }
+        };
+        let asked = peers
+            .iter()
+            .filter(|peer| peer.path.is_some() || peer.reachable == Some(true))
+            .map(|peer| {
+                let network = network.clone();
+                async move {
+                    let request = self.peer_request(
+                        &network,
+                        &peer.device_id,
+                        json!({"type":"health_problems"}),
+                    );
+                    let answer = tokio::time::timeout(PEER_HEALTH_TIMEOUT, request).await;
+                    let problems = match answer {
+                        // One record this version cannot read, as a newer check, is skipped alone.
+                        Ok(Ok(answer)) => Some(
+                            answer["problems"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .take(MAX_SHARED_PROBLEMS)
+                                .filter_map(|problem| {
+                                    serde_json::from_value::<Problem>(problem.clone()).ok()
+                                })
+                                .filter_map(Problem::bounded)
+                                .collect(),
+                        ),
+                        Ok(Err(error)) => {
+                            tracing::debug!(peer = peer.device_id, %error,
+                                "a member Node did not share its problems");
+                            None
+                        }
+                        Err(_) => None,
+                    };
+                    (peer.device_id.clone(), problems)
+                }
+            });
+        let answers = futures_util::future::join_all(asked)
+            .await
+            .into_iter()
+            .collect();
+        self.health.lock().expect("health").update_remote(answers)
+    }
+
+    /// Whether `device` is the Node that schedules the primary bot.
+    pub(super) async fn schedules_primary_bot(&self, network: &str, device: &str) -> Result<bool> {
+        let network = network.to_owned();
+        let owner = self
+            .store
+            .read("health.primary_owner", move |store| {
+                store.primary_bot_owner(&network)
+            })
+            .await?;
+        Ok(owner.as_deref() == Some(device))
+    }
+
+    /// `health_problems` for a member Node: this Node's open problems, bounded.
+    pub(super) fn shared_problems(&self) -> Value {
+        let state = self.health.lock().expect("health");
+        let problems: Vec<_> = state
+            .problems
+            .values()
+            .take(MAX_SHARED_PROBLEMS)
+            .cloned()
+            .filter_map(Problem::bounded)
+            .collect();
+        json!({"problems":problems})
+    }
+
     /// Open problems, when the checks last ran, and the last hour's warnings and errors by event.
     pub(crate) async fn health_status(&self) -> Value {
         let (checked, problems) = {
             let state = self.health.lock().expect("health");
-            (
-                state.checked_ms,
-                state.problems.values().cloned().collect::<Vec<_>>(),
-            )
+            let mut problems: Vec<Value> = state.problems.values().map(|p| json!(p)).collect();
+            problems.extend(state.remote.iter().map(|(key, problem)| {
+                let mut problem = json!(problem);
+                problem["device"] = json!(key.device);
+                problem
+            }));
+            (state.checked_ms, problems)
         };
         let dir = self.data_dir.clone();
         let since = now_ms() - HOUR_MS;
@@ -1512,7 +1721,12 @@ mod tests {
             handoff_key(&problem(Check::WorkStalled, "a", 0), device, 1),
             handoff_key(&problem(Check::WorkStalled, "a", 0), "device-2", 1)
         );
-        assert!(handoff_note(&problem(Check::WorkStalled, "a", 0), device).contains(device));
+        assert!(handoff_note(&problem(Check::WorkStalled, "a", 0), device, false).contains(device));
+        assert!(
+            handoff_note(&problem(Check::WorkStalled, "a", 0), "device-2", true)
+                .contains("node: \"device-2\""),
+            "a member's problem says how to read that device"
+        );
     }
 
     #[test]
@@ -1881,6 +2095,76 @@ mod tests {
         assert!(
             state.unhanded().is_empty(),
             "an ended problem is not handed"
+        );
+    }
+
+    #[test]
+    fn member_problems_open_at_once_stay_while_unanswered_and_end_when_gone() {
+        let mut state = HealthState::new(0);
+        let found = |subject: &str| vec![problem(Check::WorkStalled, subject, 7)];
+        let answers = |entries: Vec<(&str, Option<Vec<Problem>>)>| {
+            entries
+                .into_iter()
+                .map(|(device, problems)| (device.to_owned(), problems))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let began = state.update_remote(answers(vec![("b", Some(found("w")))]));
+        assert_eq!(
+            began.len(),
+            1,
+            "a member confirmed it over two rounds itself"
+        );
+        let (key, _) = &state.unhanded()[0];
+        assert_eq!(key.device.as_deref(), Some("b"));
+        assert_ne!(
+            *key,
+            problem(Check::WorkStalled, "w", 7).key(),
+            "not this Node's own"
+        );
+        assert!(
+            state
+                .update_remote(answers(vec![("b", Some(found("w")))]))
+                .is_empty()
+        );
+        assert!(state.update_remote(answers(vec![("b", None)])).is_empty());
+        assert_eq!(
+            state.remote.len(),
+            1,
+            "a member that did not answer keeps its problems"
+        );
+        state.handed(&key.clone(), 1);
+        assert!(state.unhanded().is_empty());
+        state.update_remote(answers(vec![("b", Some(vec![]))]));
+        assert!(
+            state.remote.is_empty(),
+            "a problem it no longer reports ended"
+        );
+        state.update_remote(answers(vec![("b", Some(found("w")))]));
+        state.update_remote(BTreeMap::new());
+        assert!(
+            state.remote.is_empty() && state.unhanded().is_empty(),
+            "not asked, not kept"
+        );
+    }
+
+    #[test]
+    fn a_member_problem_is_bounded() {
+        let mut long = problem(Check::SyncStalled, "p", 0);
+        long.detail = "x".repeat(MAX_DETAIL_CHARS + 10);
+        long.conversation_id = Some("not an id!".into());
+        let long = long.bounded().unwrap();
+        assert_eq!(long.detail.chars().count(), MAX_DETAIL_CHARS);
+        assert_eq!(long.conversation_id, None);
+        assert!(problem(Check::SyncStalled, "", 0).bounded().is_none());
+        assert!(
+            problem(Check::SyncStalled, &"s".repeat(MAX_SUBJECT_BYTES + 1), 0)
+                .bounded()
+                .is_none()
+        );
+        let wire = json!([{"check":"job_stalled","subject":"c:t","since_ms":1,"detail":"d"}]);
+        assert_eq!(
+            serde_json::from_value::<Vec<Problem>>(wire).unwrap()[0].check,
+            Check::JobStalled
         );
     }
 }
