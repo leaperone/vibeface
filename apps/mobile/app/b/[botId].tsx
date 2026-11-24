@@ -358,7 +358,7 @@ export default function ChatScreen() {
           </Pressable>
         </Link></View> : null}
         <Composer value={draft.text} onChange={draft.changeText} files={draft.files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
-          blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
+          blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={live?.writable && (inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           sendLabel={targetBusy ? '补充当前工作' : '发送'}
         >
         {draft.error || draft.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{draft.error || `附件 ${draft.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}

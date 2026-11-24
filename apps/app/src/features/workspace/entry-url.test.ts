@@ -6057,9 +6057,8 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
   } finally { app.close() }
 })
 
-test('offline chat keeps reconnect and stale waiting summary above the composer, then drops the stale prefix when back online', () => {
+test('offline chat keeps its connection notice and stale waiting summary above the composer, then drops both when back online', () => {
   let connectionOnline = false
-  let retried = 0
   const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
     about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const workspace = () => ({
@@ -6069,17 +6068,14 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
     data: { ...parseConversation(context, 'chat'), questions: [question], scheduler: null, messages: [] },
     refresh: async () => {},
   })
-  const harness = conversationHarness(workspace, { retryNow: () => { retried++ } })
+  const harness = conversationHarness(workspace)
   try {
     const above = componentText(harness.composer()?.above)
-    assert.match(above, /重试连接/)
+    assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), true)
     assert.match(above, /最近记录 · /)
     assert.ok(harness.composer()?.disabled)
-    const reconnect = harness.findAction('重试连接')?.onClick
-    assert.equal(typeof reconnect, 'function')
-    if (typeof reconnect === 'function') reconnect()
-    assert.equal(retried, 1)
     connectionOnline = true
+    assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), false)
     assert.doesNotMatch(componentText(harness.composer()?.above), /最近记录 · /)
     assert.match(componentText(harness.composer()?.above), /待处理/)
     assert.equal(harness.composer()?.disabled, false)

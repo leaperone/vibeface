@@ -6,7 +6,7 @@ import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, Wor
 export type { Question }
 
 /** How this phone reaches its network right now. `entry`: the device it goes through, as the person named it; `direct`: straight to it on the LAN. */
-export type Connection = { state: 'connecting' | 'online' | 'syncing' | 'offline'; entry: string; direct: boolean }
+export type Connection = { state: 'connecting' | 'reconnecting' | 'online' | 'syncing' | 'offline'; entry: string; direct: boolean }
 
 /**
  * Where this phone stands with the network. `joining`: the invitation went out and an admin must allow it;
