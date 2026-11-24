@@ -21,9 +21,9 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
     catch (cause) { failure = cause instanceof Error ? cause.message : '草稿无法读取，请重试。' }
   }
   const pending = unsaved.get(key)
-  const owner = { scope, snapshot, text: pending?.typed() ? pending.text : snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>(), timer: null as ReturnType<typeof setTimeout> | null, typed: () => true }
-  // Adopted typing is still unwritten: it keeps its erase lease and is written like any other typing.
-  if (owner.text !== snapshot.text && pending) { owner.typed = pending.typed; owner.timer = setTimeout(() => draft.save(), saveDelay) }
+  const owner = { scope, snapshot, text: pending?.typed() ? pending.text : snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>(), timer: null as ReturnType<typeof setTimeout> | null, adopted: false, typed: () => true }
+  // Adopted typing is still unwritten and keeps its erase lease. No timer starts here: a render React discards must not write.
+  if (owner.text !== snapshot.text && pending) { owner.typed = pending.typed; owner.adopted = true }
   let view: DraftView = { snapshot, text: owner.text, files: owner.files, error: failure }
   const listeners = new Set<() => void>()
   const setView = (next: DraftView | ((previous: DraftView) => DraftView)) => {
@@ -33,6 +33,7 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
 
   const persist = async () => {
     if (owner.timer) { clearTimeout(owner.timer); owner.timer = null }
+    owner.adopted = false
     const sequence = ++owner.sequence
     const requested = { text: owner.text, files: owner.files }
     const previous = owner.tail
@@ -66,9 +67,9 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
   }
   /** Writes typing still waiting for its delay. Typing from before an erase is not written back after it, as it was erased with the rest. */
   const save = () => {
-    if (!owner.timer) return
+    if (!owner.timer && !owner.adopted) return
     if (owner.typed()) void persist().catch(() => {})
-    else { clearTimeout(owner.timer); owner.timer = null }
+    else { if (owner.timer) clearTimeout(owner.timer); owner.timer = null; owner.adopted = false }
   }
   const draft = {
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener) } },
@@ -106,13 +107,13 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
     async clear(snapshot: DraftSnapshot) {
       const sequence = owner.sequence
       // Typing not written yet is newer than the flushed snapshot, just as a write after it would be.
-      if (owner.timer || owner.flushed.get(snapshot) !== sequence) return false
+      if (owner.timer || owner.adopted || owner.flushed.get(snapshot) !== sequence) return false
       const previous = owner.tail
       const work = privateFiles.run(async (valid) => {
         await previous
         if (!valid()) throw new Error('应用内数据正在清除，请重试。')
-        if (owner.timer || owner.sequence !== sequence || !await chatDrafts.clear(owner.scope, snapshot)) return false
-        if (owner.sequence === sequence && !owner.timer) {
+        if (owner.timer || owner.adopted || owner.sequence !== sequence || !await chatDrafts.clear(owner.scope, snapshot)) return false
+        if (owner.sequence === sequence && !owner.timer && !owner.adopted) {
           const empty = chatDrafts.read(owner.scope)
           owner.snapshot = empty; owner.text = empty.text; owner.files = empty.files
           if (current.current === draft) setView({ snapshot: empty, text: empty.text, files: empty.files, error: '' })
