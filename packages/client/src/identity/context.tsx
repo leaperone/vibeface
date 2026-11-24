@@ -533,6 +533,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       let active: Session | null = null
       // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
       const own = candidate.device_id === target.entry.device_id
+      const started = Date.now()
       try {
         active = await open(candidate, { resuming: true, timeoutMs: ways <= 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000 })
         if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这个节点已属于另一组设备。')
@@ -545,6 +546,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
         return true
       } catch (cause) {
+        // ponytail: the first three rounds of a reconnect only, so a long time offline does not push crash records out.
+        if (target.attempt < 3) reportLog({ level: 'info', event: 'connection.attempt_failed', message: messageOf(cause).slice(0, 300), fields: {
+          path: candidate.kind, node: candidate.device_id, ...(candidate.kind === 'lan' ? { addrs: candidate.addrs } : { address: candidate.address }),
+          elapsed_ms: Date.now() - started, attempt: target.attempt, opened: active !== null, ...failureFields(cause, messageOf(cause)),
+        } })
         if (active && session.current === active && !active.networkId) { generation.current += 1; session.current = null; active.channel.close() }
         if (reconnect.current !== target) return true
         // Only a definite answer about this browser's identity ends the resume; a Node error, timeout or drop is retried.

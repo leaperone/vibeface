@@ -254,8 +254,6 @@ function Live({ children }: { children: ReactNode }) {
     }
   }, [device.join, device.cancelJoin, device.leave])
 
-  useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
-
   const fresh = shared.synced || shared.bots.length > 0
   const bots = fresh || !seen ? shared.bots : seen.bots, primary = fresh || !seen ? shared.primary : seen.primary
   const members = device.directory || !seen ? directory : seen.members

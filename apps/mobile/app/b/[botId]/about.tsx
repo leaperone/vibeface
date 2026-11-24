@@ -1,7 +1,7 @@
 import { SelectionItem } from '@/components/arc/selection'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessageSquareWarning, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -59,7 +59,8 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
           : <ActionButton variant="secondary" size="sm" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
       </View>
     </View>
-    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话记录和后台工作" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
+    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话记录和后台工作" href={`/b/${bot.bot_id}/context`} />
+      <SettingsRow icon={MessageSquareWarning} label="报告问题" href={{ pathname: '/report', params: { conversation: bot.conversation_id } }} /></SettingsGroup>
     {owner || models.length ? <SettingsGroup>
       {owner ? <SettingsRow icon={Laptop} label="运行设备">
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}

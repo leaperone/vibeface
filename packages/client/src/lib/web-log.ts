@@ -101,13 +101,25 @@ export function createReporter(): Reporter {
   const queue: WebRecord[] = []
   let sink: Sink | null = null
   let sending = false
-  const schedule = () => { if (sink && queue.length && !sending) void Promise.resolve().then(flush) }
+  let pausedUntil = 0
+  const schedule = () => { if (sink && queue.length && !sending && Date.now() >= pausedUntil) void Promise.resolve().then(flush) }
   async function flush() {
     if (!sink || sending || !queue.length) return
     sending = true
     const batch = queue.splice(0, MAX_BATCH)
-    // A record that cannot be delivered is dropped; reporting its failure would loop.
-    try { await sink(batch, "web") } catch { /* dropped */ } finally { sending = false }
+    try { await sink(batch, "web") } catch (cause) {
+      // Only a batch the device refused as invalid is dropped; any other failure keeps it for a later try.
+      // A failed send is never reported as a record of its own, which would loop.
+      const { responded, code } = (cause ?? {}) as { responded?: unknown; code?: unknown }
+      if (!(responded === true && code === "log_rejected")) {
+        queue.unshift(...batch)
+        if (queue.length > MAX_QUEUED) queue.splice(0, queue.length - MAX_QUEUED)
+        const wait = responded === true && code === "log_rate_limited" ? 60_000 : 5_000
+        pausedUntil = Date.now() + wait
+        // A timer must not keep a test process or a closing page alive.
+        ;(setTimeout(schedule, wait) as { unref?: () => void }).unref?.()
+      }
+    } finally { sending = false }
     schedule()
   }
   return {
@@ -121,13 +133,17 @@ export function createReporter(): Reporter {
     /** Records wait in memory until a device connects; returns the detach function. */
     connect(next: Sink) {
       sink = next
+      pausedUntil = 0
       schedule()
       return () => { if (sink === next) sink = null }
     },
     flush,
     async send() {
       const before = queue.length
-      while (sink && queue.length) await flush()
+      for (let left = Infinity; sink && queue.length && queue.length < left;) {
+        left = queue.length
+        await flush()
+      }
       return { sent: before - queue.length, left: queue.length, connected: sink !== null }
     },
     pending: () => queue.length,
