@@ -445,11 +445,35 @@ impl Runtime {
                     .await
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
-            Tool::ReadLogs => {
-                let (dir, args) = (self.data_dir.clone(), args.clone());
-                tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args)).await?
+            Tool::ReadLogs | Tool::ReadHealth => {
+                let mut args = args.clone();
+                let node = args
+                    .as_object_mut()
+                    .and_then(|args| args.remove("node"))
+                    .and_then(|node| node.as_str().map(str::to_owned))
+                    .filter(|node| self.identity.device_id().ok().as_ref() != Some(node));
+                let kind = if tool == Tool::ReadLogs {
+                    "read_logs"
+                } else {
+                    "read_health"
+                };
+                match node {
+                    Some(node) => {
+                        self.peer_request(
+                            access.network_id(),
+                            &node,
+                            json!({"type":kind,"args":args}),
+                        )
+                        .await
+                    }
+                    None if tool == Tool::ReadLogs => {
+                        let dir = self.data_dir.clone();
+                        tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args))
+                            .await?
+                    }
+                    None => self.read_health().await,
+                }
             }
-            Tool::ReadHealth => self.read_health().await,
             Tool::ListBots => {
                 let now = now_ms();
                 let network = network.to_owned();

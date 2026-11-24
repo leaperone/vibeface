@@ -173,3 +173,35 @@ async fn an_offline_node_keeps_its_last_capabilities_across_a_restart() -> Resul
     std::fs::remove_dir_all(dir_b)?;
     result
 }
+
+#[tokio::test]
+async fn a_member_node_shares_its_problems_logs_and_health() -> Result<()> {
+    let (first, second) = (LocalIdentity::generate(), LocalIdentity::generate());
+    let (first_id, second_id) = (first.device_id()?, second.device_id()?);
+    let network = first.fixture_network_id()?;
+    let state = first.sign_network_fixture(1, vec![first_id.clone(), second_id.clone()])?;
+    let (a, dir_a) = node(&first).await?;
+    let (b, dir_b) = node(&second).await?;
+    let result = async {
+        for node in [&a, &b] {
+            node.install_membership(state.clone()).await?;
+            node.start_network().await?;
+        }
+        a.net()?.learn(&b.net()?.addr()).await;
+        b.net()?.learn(&a.net()?.addr()).await;
+        super::super::test_support::ready_member_rpc(&a, &network, &second_id).await?;
+        let ask = |kind: &str, args: Value| {
+            a.peer_request(&network, &second_id, json!({"type":kind,"args":args}))
+        };
+        assert!(ask("health_problems", json!({})).await?["problems"].is_array());
+        assert!(ask("read_logs", json!({"limit":5})).await?["records"].is_array());
+        assert!(
+            ask("read_logs", json!({"bogus":1})).await.is_err(),
+            "the member checks the query"
+        );
+        assert!(ask("read_health", json!({})).await?["health"]["problems"].is_array());
+        Ok(())
+    }
+    .await;
+    super::super::test_support::finish_nodes(result, vec![(a, dir_a), (b, dir_b)]).await
+}
