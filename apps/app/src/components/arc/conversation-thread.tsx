@@ -46,7 +46,8 @@ export function Chat({ entries, empty, focus }: { entries: ChatEntry[]; empty: R
     if (newestSend !== lastSend.current) { lastSend.current = newestSend; reading.current = false; anchor.current = null }
     place()
     if (focus && focused.current !== focus) {
-      const row = [...viewport.current?.querySelectorAll<HTMLElement>('[data-history-key]') ?? []].find((row) => row.dataset.historyKey === focus)
+      const key = entries.find((entry) => entry.key === focus || 'message' in entry && entry.message.message_id === focus)?.key
+      const row = [...viewport.current?.querySelectorAll<HTMLElement>('[data-history-key]') ?? []].find((row) => row.dataset.historyKey === key)
       if (row) { row.scrollIntoView({ block: 'center' }); focused.current = focus; capture(); return }
     }
     if (!focus && !unreadShown.current && entries.some(entry => entry.key === 'unread')) {

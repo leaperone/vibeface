@@ -1527,9 +1527,20 @@ impl Runtime {
             Ok(BusinessCommand::Notifications(_)) => {
                 let network = network.to_owned();
                 let client = field(input, "client_id")?.to_owned();
+                let notification_id = input
+                    .get("notification_id")
+                    .map(|_| id(input, "notification_id"))
+                    .transpose()?;
                 let notifications = self
                     .read_display(&access, input, "notifications", move |store| {
-                        store.display_notifications(&network, &client)
+                        if let Some(id) = notification_id {
+                            Ok(store
+                                .notification_by_id(&network, &id)?
+                                .into_iter()
+                                .collect())
+                        } else {
+                            store.display_notifications(&network, &client)
+                        }
                     })
                     .await?;
                 Ok(json!({"notifications":notifications}))

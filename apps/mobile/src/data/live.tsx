@@ -85,8 +85,8 @@ function Device({ children }: { children: ReactNode }) {
   const { ready } = device
   if (!ready) return <Offline>{children}</Offline>
   return <SharedWorkspace key={`${ready.principal.network_id}:${ready.principal.device_id}`} platform={mobilePlatform} connection={ready} tabs={noTabs} openConversation={(id, target?: InputTarget, focus?: string) => {
-    if (target?.kind === 'task' || target?.kind === 'channel_task') router.push(`/task/${target.task_id}`)
-    else if (target?.kind === 'channel_member') router.push(`/channel/${target.channel_id}`)
+    if (target?.kind === 'task' || target?.kind === 'channel_task') router.push({ pathname: '/task/[taskId]', params: { taskId: target.task_id, ...(focus ? { message: focus } : {}) } })
+    else if (target?.kind === 'channel_member') router.push({ pathname: '/channel/[channelId]', params: { channelId: target.channel_id, ...(focus ? { message: focus } : {}) } })
     else router.push({ pathname: '/', params: { conversation: id, ...(focus ? { message: focus } : {}), ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
   }}>
     <Live>{children}</Live>

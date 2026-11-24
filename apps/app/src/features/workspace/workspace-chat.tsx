@@ -4,7 +4,7 @@ import { Details,EmptyState,InlineError,StatusPill,useAction } from '@/component
 import { RoutedAction } from "@/components/arc/routed-action"
 import '@/features/chat/chat.css'
 import { webPlatform } from '@/lib/platform'
-import { Link,useNavigate } from '@tanstack/react-router'
+import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { inputTargetKey,promptIntent } from '@vibeface/client/chat/protocol.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -161,6 +161,7 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
   const workspace = useWorkspace()
   const { ready } = useDevice()
   const navigate = useNavigate()
+  const focus = useRouterState({ select: (state) => 'message' in state.location.search && typeof state.location.search.message === 'string' ? state.location.search.message : undefined })
   const routeActive = useRef(true)
   useEffect(() => { routeActive.current = true; return () => { routeActive.current = false } }, [])
   const [history, setHistory] = useState<WorkspaceHistory | null>(null)
@@ -218,7 +219,8 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
     }
   }
   const postedIds = new Set((history?.events ?? []).flatMap((event) => event.body.type === 'input_posted' ? [event.body.message_id] : []))
-  for (const question of workspace.questions.filter((question) => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target)))) entries.push({ key: `question:${question.question_id}`, node: <QuestionCard question={question} inTask /> })
+  const questions = workspace.questions.filter((question) => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target)))
+  for (const question of questions) entries.push({ key: `question:${question.question_id}`, node: <QuestionCard question={question} inTask /> })
   for (const item of pending) if (!postedIds.has(item.message_id)) entries.push({ key: item.message_id, conversationId: item.conversation_id, anchor: true, message: { message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' } })
   for (const item of pending) entries.push({ key: `delivery:${item.message_id}`, node: <WorkspaceInputStatus pending={item} refresh={refresh} /> })
   const busy = task && ['running', 'update_pending'].includes(task.state)
@@ -230,7 +232,8 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
       : <EmptyState className={styles.empty} icon={MessagesSquare} title={!history.events.length && !history.coverage.truncated ? '发送一条交代开始对话' : '已加载范围内暂无可显示的对话'} description={history.coverage.truncated ? '更早的记录尚未加载，当前范围不代表完整历史。' : history.events.length ? '已读取的记录尚未包含消息或工作结果。' : ''} />
   return <section className={`conversation-screen ${styles.conversation}`} data-composer-idle={!text && !files.length || undefined} aria-label={channelId ? '频道对话' : '任务对话'}>
     <div className={`${styles.search} mx-auto grid w-full max-w-(--page-width) shrink-0 gap-1 px-4 pt-3 text-sm text-secondary sm:px-6`}><Input label={channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'} type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入关键词" /></div>
-    <div className={styles.history} data-conversation-history=""><Chat key={channelId ?? scopeTaskId} entries={entries} empty={empty} /></div>
+    {focus?.startsWith('question:') && (!workspace.synced || !workspace.connectionOnline) ? <p role="status" className="px-4 py-2 text-sm text-secondary">最近记录尚未同步完，原问题状态待确认。</p> : focus?.startsWith('question:') && !questions.some((question) => `question:${question.question_id}` === focus) ? <p role="status" className="px-4 py-2 text-sm text-secondary">原问题已不在当前{channelId ? '频道' : '任务'}的待处理记录中。请查看这里的最新结果，旧提醒不会再次执行。</p> : null}
+    <div className={styles.history} data-conversation-history=""><Chat key={channelId ?? scopeTaskId} entries={entries} empty={empty} focus={focus} /></div>
     <PromptInput value={text} onChange={setDraft} files={files} onFiles={setFiles} hint="" reason={workspace.readOnlyNotice || workspace.writeNotice} disabled={!workspace.canSaveMessages} label={`${busy ? '补充给' : '发给'} ${label}`} sendLabel={busy ? '补充当前工作' : '发送'} target={<div className={styles.targetControls}>
         {targetControl}
         <InputQueue target={target} channelId={channelId} />

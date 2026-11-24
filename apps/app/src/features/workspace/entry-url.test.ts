@@ -7074,3 +7074,63 @@ test('native input menu exposes all three actions on Android and iOS and rejects
     } finally { app.close() }
   }
 })
+
+
+test('notification click routes preserve the original question through task channel and work screen entries', async () => {
+  const targets: InputTarget[] = [{ kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }]
+  for (const native of [false, true]) for (const target of targets) {
+    const focus = 'question:q-original'
+    let navigated: unknown = null
+    const ready = { principal: { network_id: 'network', device_id: 'phone', source: 'membership', can_manage: true }, info: { network_id: 'network' }, entry: { device_id: 'gateway' }, isCurrent: () => true }
+    const root = componentHarness(native ? '../../../../../apps/mobile/src/data/live.tsx' : '../../routes/_app.tsx', {
+      'expo-router': { useRouter: () => ({ push: (value: unknown) => { navigated = value } }) },
+      '@tanstack/react-router': { createFileRoute: () => () => ({}), useNavigate: () => (value: unknown) => { navigated = value }, useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { pathname: '/', href: '/', search: {} } }) },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready, phase: 'ready', entries: [], joining: false, link: { kind: 'online' } }) },
+      '@vibeface/client/identity/access.ts': { accessOf }, '@/features/identity/onboarding-flag': { useOnboarding: () => null },
+      '@vibeface/client/workspace/context.tsx': { WorkspaceProvider: 'SharedWorkspace' },
+    }, {}, native ? 'Device' : 'AppLayout')
+    try {
+      const callback = root.render(native ? 'Device' : 'AppLayout').find(({ props }) => typeof props.openConversation === 'function')?.props.openConversation
+      assert.ok(typeof callback === 'function')
+      callback('chat', target, focus)
+      const navigation = workspaceModel.record(navigated)
+      const params = workspaceModel.record(native ? navigation.params : navigation.search)
+      assert.equal(params.message, focus, `${native ? 'native' : 'web'} ${target.kind}`)
+      const question = workspaceModel.parseQuestions({ questions: [{ question_id: 'q-original', conversation_id: 'chat', target, bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '是否继续原操作？', choices: [{ label: '拒绝', action: 'deny' }], about: { node: 'worker', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'worker', created_at_ms: 1, answer: null, closed: null }] })[0]
+      assert.ok(question)
+      const domain: WorkspaceDomainState = { channels: [{ channel_id: 'channel', title: '频道', purpose: '', members: ['bot'], coordinator_bot: 'bot', coordinator_node: 'worker', revision: 1, owner_epoch: 1, event_hash: 'channel-event', created_at_ms: 1 }], tasks: [{ task_id: 'task', root_task_id: 'task', owner_bot: 'bot', title: '任务', request: '交代', expected_result: '结果', source_events: [], dependencies: [], reply_only: false, revision: 1, action: 'continue', request_event: 'request', event_hash: 'task-event', created_at_ms: 1, updated_at_ms: 1, state: 'running' }], assignments: [], inputs: [], coverage: { limit: 128, truncated: false } }
+      const shared = { ...parityShared(), questions: [question], workspaceState: domain, data: parseConversation({ ...context, works: [parityWork()] }), readWorkspaceState: async () => domain, readWorkspaceHistory: async () => ({ history_authority: 'authority', next_cursor: null, complete: true, events: [], coverage: { limit: 128, truncated: false, scope: target.kind === 'task' || target.kind === 'channel_task' ? 'task' : 'channel' } }) }
+      const work = target.kind === 'work'
+      const screen = componentHarness(native ? work ? '../../../../../apps/mobile/app/b/[botId]/work/[workId].tsx' : '../../../../../apps/mobile/src/features/workspace/workspace.tsx' : work ? './task-detail.tsx' : './workspace-chat.tsx', {
+        'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ message: focus }), useRouter: () => ({ push() {}, back() {} }) },
+        '@tanstack/react-router': { useRouterState: ({ select }: { select: (state: unknown) => unknown }) => select({ location: { search: { message: focus } } }) },
+        '@/data/live': { useLive: () => shared }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+        '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, members: [] }) },
+        '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready, directory: null }) },
+        '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/lib/errors.ts': errors, '@vibeface/client/lib/node.ts': { messageOf, providerNames },
+        '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, inputTargetKey },
+        '@/components/kit': { EmptyState: 'EmptyState', Details: 'Details', providerIcons: { codex: 'CodexIcon' }, toneText: {} }, '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+        'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }) },
+        '@/lib/use-run': { useRun: () => ({ busy: null, error: '', run: async (_key: string, action: () => Promise<void>) => action() }) },
+      }, { setInterval: () => 1, clearInterval() {}, requestAnimationFrame: (run: () => void) => run(), window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }) } }, native && work ? 'TaskDetail' : !native && !work ? 'ScopedConversation' : '')
+      const name = work ? 'TaskDetail' : native ? 'ScopedWorkspaceScreen' : 'ScopedConversation'
+      const props = work ? { botId: 'bot', workId: 'work', focus } : native ? target.kind === 'channel_member' ? { channelId: 'channel' } : { taskId: 'task' } : { target, conversationId: 'chat', label: '原任务', ...(target.kind === 'channel_member' ? { channelId: 'channel' } : {}) }
+      try {
+        screen.render(name, props); await settleComponent()
+        const elements = screen.render(name, props)
+        if (!native && !work) {
+          const chat = elements.find(({ type }) => type === 'Chat')
+          assert.equal(chat?.props.focus, focus)
+          assert.match(JSON.stringify(chat?.props.entries), /q-original/)
+        } else assert.equal(elements.find(({ type }) => type === 'QuestionCard')?.props.question, question, `${native ? 'native' : 'web'} ${target.kind} reaches the original question`)
+        shared.questions = []
+        const gone = screen.render(name, props)
+        assert.match(componentText(gone), /原问题已不在.*待处理记录中/)
+        assert.equal(gone.some(({ type }) => type === 'QuestionCard'), false, 'a handled original never borrows another question')
+        shared.questions = [{ ...question, target: { kind: 'bot_main', bot_id: 'another-bot' } }]
+        const foreign = screen.render(name, props)
+        assert.equal(foreign.some(({ type }) => type === 'QuestionCard'), false, 'a matching question ID from another scope cannot supply an action')
+      } finally { screen.close() }
+    } finally { root.close() }
+  }
+})

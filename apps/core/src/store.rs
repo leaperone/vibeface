@@ -981,29 +981,44 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter()
-            .map(|(notification_id, conversation_id, kind, text)| {
-                Ok(Notification {
-                    focus: log::event_from(&self.connection, network_id, &notification_id)?
-                        .and_then(|event| match event.body {
-                            EventBody::MessagePosted { message_id, .. }
-                            | EventBody::BotMessaged { message_id, .. } => Some(message_id),
-                            EventBody::QuestionAsked { question_id, .. } => {
-                                Some(format!("question:{question_id}"))
-                            }
-                            _ => None,
-                        }),
-                    target: scope_projection::notification_target_from(
-                        &self.connection,
-                        network_id,
-                        &notification_id,
-                    )?,
-                    notification_id,
-                    conversation_id,
-                    kind,
-                    text,
-                })
-            })
+            .map(|row| self.notification_record(network_id, row))
             .collect()
+    }
+
+    fn notification_record(
+        &self,
+        network: &str,
+        (notification_id, conversation_id, kind, text): (String, String, String, String),
+    ) -> Result<Notification> {
+        let event = log::event_from(&self.connection, network, &notification_id)?;
+        Ok(Notification {
+            focus: event.as_ref().and_then(|event| match &event.body {
+                EventBody::MessagePosted { message_id, .. }
+                | EventBody::BotMessaged { message_id, .. } => Some(message_id.clone()),
+                EventBody::QuestionAsked { question_id, .. } => {
+                    Some(format!("question:{question_id}"))
+                }
+                _ => None,
+            }),
+            target: event
+                .as_ref()
+                .map(|event| {
+                    scope_projection::notification_target_from(&self.connection, network, event)
+                })
+                .transpose()?
+                .flatten(),
+            notification_id,
+            conversation_id,
+            kind,
+            text,
+        })
+    }
+
+    /// A late notification click still resolves its authenticated original target after an answer or read receipt.
+    pub fn notification_by_id(&self, network: &str, id: &str) -> Result<Option<Notification>> {
+        let row = self.connection.query_row("SELECT notification_id,conversation_id,kind,text FROM notifications WHERE network_id=? AND notification_id=?", params![network, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?;
+        row.map(|row| self.notification_record(network, row))
+            .transpose()
     }
 
     pub fn notification_acked(

@@ -19,7 +19,7 @@ export default function Home() {
   const bot = workspace.bots.find((item) => item.conversation_id === conversation)
   useEffect(() => {
     if (!bot || !conversation) return
-    if (work) router.replace(`/b/${bot.bot_id}/work/${work}`)
+    if (work) router.replace({ pathname: '/b/[botId]/work/[workId]', params: { botId: bot.bot_id, workId: work, ...(message ? { message } : {}) } })
     else router.replace({ pathname: '/b/[botId]', params: { botId: bot.bot_id, ...(routine ? { routine } : {}), ...(message ? { message } : {}) } })
   }, [conversation, work, routine, message, bot?.bot_id, router])
   const bar = useHeaderHeight()

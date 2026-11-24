@@ -542,7 +542,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   useEffect(() => notifier.watchOpen?.(async (destination) => {
     try {
-      const result = await notificationForOpening({ destination, connection, current, read: async () => parseNotifications(await rpc("notifications")) })
+      const result = await notificationForOpening({ destination, connection, current, read: async (notification_id) => parseNotifications(await rpc("notifications", { notification_id })) })
       if (result.kind === 'deferred') return false
       if (result.kind === 'invalid') return true
       const item = result.notification

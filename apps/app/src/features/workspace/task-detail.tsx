@@ -53,7 +53,7 @@ const followWidth = (change: () => void) => {
  * /b/:botId/work/:workId — side panel beside the chat on wide screens, an overlay on tablets, full screen on phones.
  * `from`: opened from 待处理 or 任务, so leaving returns to that list instead of to the chat.
  */
-export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "tasks" }) {
+export function TaskDetail({ botId, workId, from, focus }: { botId: string; workId: string; from?: "tasks"; focus?: string }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const action = useAction()
@@ -84,6 +84,11 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const work = loaded ? { ...loaded.work, target: loaded.work.target ?? undefined } : undefined
   // A running turn held on an approval reads as 需要你同意, as in the chat, and the question is answered right here.
   const asking = work ? workApproval({ work, conversationId: work.conversation_id, questions: workspace.questions, answered: workspace.answered }) : undefined
+  const focusQuestion = focus?.startsWith('question:') ? focus.slice(9) : null
+  const originalQuestion = focusQuestion && work ? workspace.questions.find((question) => question.question_id === focusQuestion && question.conversation_id === work.conversation_id && question.target?.kind === 'work' && question.target.work_id === work.work_id) : null
+  const question = focusQuestion ? originalQuestion : asking
+  const questionRef = useRef<HTMLDivElement>(null)
+  useEffect(() => { if (focusQuestion) questionRef.current?.scrollIntoView({ block: 'center' }) }, [focusQuestion, question?.question_id, work?.work_id])
   const shown = work ? shownState(work, workspace.nodes) : ""
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
@@ -199,7 +204,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </section> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
-      {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
+      {question || focusQuestion ? <div ref={questionRef} className="scroll-mt-4">{question ? <QuestionCard key={question.question_id} question={question} inTask /> : <p role="status" className="text-sm text-secondary">{!workspace.synced ? '最近记录尚未同步完，原问题状态待确认。' : '原问题已不在这个工作的待处理记录中。请查看这里的最新结果，旧提醒不会再次执行。'}</p>}</div> : null}
       {stop ? <div className="grid gap-2">
         {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => setConfirming(false)}>取消</Button>

@@ -13,5 +13,5 @@ function Home() {
   const workspace = useWorkspace()
   const { conversation, work, routine, message } = Route.useSearch()
   const bot = homeBot({ narrow: useIsMobile(), conversation, bots: workspace.bots, current: workspace.conversationId })
-  return bot ? work ? <Navigate to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work }} replace /> : <Navigate to="/b/$botId" params={{ botId: bot.bot_id }} search={{ ...(routine ? { routine } : {}), ...(message ? { message } : {}) }} replace /> : <ConversationList />
+  return bot ? work ? <Navigate to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work }} search={message ? { message } : {}} replace /> : <Navigate to="/b/$botId" params={{ botId: bot.bot_id }} search={{ ...(routine ? { routine } : {}), ...(message ? { message } : {}) }} replace /> : <ConversationList />
 }
