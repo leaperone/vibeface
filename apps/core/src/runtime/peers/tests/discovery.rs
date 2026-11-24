@@ -194,9 +194,10 @@ async fn a_member_node_shares_its_problems_logs_and_health() -> Result<()> {
         let ask = |kind: &str, args: Value| {
             a.peer_request(&network, &second_id, json!({"type":kind,"args":args}))
         };
+        let refused = ask("health_problems", json!({})).await.unwrap_err();
         assert!(
-            ask("health_problems", json!({})).await.is_err(),
-            "only the Node that schedules the primary bot asks"
+            format!("{refused:#}").contains("only the Node that schedules the primary bot"),
+            "{refused:#}"
         );
         {
             let (first, network, first_id) = (first.clone(), network.clone(), first_id.clone());

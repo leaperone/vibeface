@@ -550,7 +550,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 | `health_problems` | 读取本设备已成立的健康问题，最多 32 条，`detail` 截到 500 字符；调度主 Bot 的 Node 每轮健康检查向已连接的成员读取，交给主 Bot |
-| `read_logs`、`read_health` | 另一台设备的主 Bot 用 `read_logs`、`read_health` 的 `node` 读本设备的日志和健康状态，`args` 与本机工具相同；访问限制在发起设备上核对。这三种请求只接受本机记录里调度主 Bot 的那台 Node，主 Bot 刚换设备、本机还没同步到时会拒绝 |
+| `read_logs`、`read_health` | 另一台设备的主 Bot 用 `read_logs`、`read_health` 的 `node` 读本设备的日志和健康状态，`args` 与本机工具相同；访问限制在发起设备上核对。`health_problems`、`read_logs`、`read_health` 只接受本机记录里调度主 Bot 的那台 Node，主 Bot 刚换设备、本机还没同步到时会拒绝 |
 | `join_changed` | 保存请求的 Node 告知本机持有的加入请求有变化，不带请求内容；收到的 Node 向本机客户端推送不带会话的 `changed`，不回传、不转发。同步正常但 3 秒内没有送达的 Node 在 3 秒后补发一次 |
 
 `addresses` 请求为 `{ type: "addresses", network_id, records }`，回复为 `{ records }`；两者的 `records` 都是必填的签名地址记录数组，显式 `[]` 表示只拉取。外层额外字段不改变现有路由行为。缺失、null、错误类型或任意元素结构错误会在合并前整批拒绝，返回固定的脱敏协议错误，不写入合法前缀。结构合法的记录仍逐条验签并核对个人网络和当前 Node 成员资格；无效记录被跳过，其余有效记录正常接受，保留现有 256 条上限与 seq 高水位规则。地址交换失败不阻断后续历史同步。
