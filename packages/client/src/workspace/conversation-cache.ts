@@ -128,6 +128,11 @@ export function createConversationCache(options: { storage: KeyValue; maxBytes?:
     },
     clear(scope: ConversationCacheScope & { conversationId?: string }): void {
       persist(load().filter((item) => !sameScope(item.record, scope) || scope.conversationId !== undefined && item.record.conversationId !== scope.conversationId))
+      // A crash between a slot write and the index leaves an unindexed slot; slots are reused lowest first, so they stay below this bound.
+      const kept = new Set(indexed)
+      for (let slot = 0; slot <= maxConversations + 1; slot += 1) {
+        if (!kept.has(slot) && options.storage.getItem(conversationSlotKey(slot))) options.storage.setItem(conversationSlotKey(slot), '')
+      }
     },
     stats(scope: ConversationCacheScope) {
       const items = load().filter((item) => sameScope(item.record, scope))

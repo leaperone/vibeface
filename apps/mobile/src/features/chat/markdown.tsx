@@ -53,7 +53,7 @@ const fenceLine = /^ {0,3}(`{3,}|~{3,})/
  * links and HTML blocks that may span blank lines resolve across the whole text, so such text stays one block.
  */
 function markdownBlocks(text: string): string[] {
-  if (/^ {0,3}(\[[^\]\n]+\]:|<(!--|pre|script|style|textarea))/im.test(text)) return [text]
+  if (/^ {0,3}(\[[^\]\n]+\]:|<(!--|\?|![A-Za-z[]|pre|script|style|textarea))/im.test(text)) return [text]
   const blocks: string[] = []
   let start = 0, fence = '', blank = false, filled = false
   for (let at = 0; at < text.length;) {

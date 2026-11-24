@@ -119,6 +119,15 @@ test('a save writes only its own conversation and the small index; replaced and 
   assert.ok([...local.values.values()].every((value) => !/-text|-new/.test(value)), 'cleared conversations leave no readable copy')
 })
 
+test('clearing also blanks a slot a crash left written but never indexed', () => {
+  const local = storage()
+  const cache = createConversationCache({ storage: local })
+  cache.save({ ...key('A'), payload: snapshot('A', { messages: [message('A-text')] }) })
+  local.setItem(conversationSlotKey(1), local.getItem(conversationSlotKey(0)) ?? '')
+  cache.clear(scope)
+  assert.ok([...local.values.values()].every((value) => !value.includes('A-text')), 'an orphaned slot leaves no readable copy')
+})
+
 test('another cache instance keeps unchanged snapshots and rereads only the conversation that was rewritten', () => {
   const local = storage(), reads: string[] = []
   const writer = createConversationCache({ storage: local })

@@ -10,6 +10,8 @@ type DraftView = { snapshot: DraftSnapshot; text: string; files: Attachment[]; e
 const saveDelay = 500
 
 export type ChatDraftOwner = ReturnType<typeof draftOwner>
+// Typing not written yet, by draft key: a draft rebuilt for the same scope before the old one writes starts from it, not from disk.
+const unsaved = new Map<string, { text: string; typed: () => boolean }>()
 
 function draftOwner(key: string, scope: DraftScope, current: { current: unknown }) {
   let failure = ''
@@ -18,7 +20,8 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
     try { snapshot = chatDrafts.read(scope) }
     catch (cause) { failure = cause instanceof Error ? cause.message : '草稿无法读取，请重试。' }
   }
-  const owner = { scope, snapshot, text: snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>(), timer: null as ReturnType<typeof setTimeout> | null, typed: () => true }
+  const pending = unsaved.get(key)
+  const owner = { scope, snapshot, text: pending?.typed() ? pending.text : snapshot.text, files: snapshot.files, sequence: 0, tail: Promise.resolve(snapshot), failure, copies: new Map<string, Attachment>(), flushed: new WeakMap<DraftSnapshot, number>(), timer: null as ReturnType<typeof setTimeout> | null, typed: () => true }
   let view: DraftView = { snapshot, text: owner.text, files: owner.files, error: failure }
   const listeners = new Set<() => void>()
   const setView = (next: DraftView | ((previous: DraftView) => DraftView)) => {
@@ -46,6 +49,7 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
       if (sequence === owner.sequence) {
         owner.files = snapshot.files
         owner.failure = ''
+        if (unsaved.get(key)?.text === requested.text) unsaved.delete(key)
         if (current.current === draft) setView({ snapshot, text: owner.text, files: snapshot.files, error: '' })
       }
       return snapshot
@@ -72,6 +76,7 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
       owner.text = text
       if (current.current === draft) setView((previous) => ({ ...previous, snapshot: owner.snapshot, text, files: owner.files, error: '' }))
       if (!owner.timer) { owner.typed = privateFiles.lease(); owner.timer = setTimeout(save, saveDelay) }
+      unsaved.set(key, { text, typed: owner.typed })
     },
     async changeFiles(files: Attachment[]) { owner.files = files; await persist() },
     async addFiles(files: PickedAttachment[]) {
