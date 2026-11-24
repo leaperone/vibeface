@@ -51,12 +51,15 @@ use vibeface_secure::{
 };
 
 mod concurrency;
+mod snapshot;
 use concurrency::{Authority, Calls, Pushes};
 
 pub const PROLOGUE: &[u8] = b"vibeface:client:v1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+// Subscribed browsers may briefly stop answering heartbeats while in the background.
+const SUBSCRIBED_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 /// Under the browser's 10-second connect timeout, so the refusal reaches it first.
 const FORWARD_DIAL_TIMEOUT: Duration = Duration::from_secs(7);
@@ -785,7 +788,8 @@ async fn serve_session_with_heartbeat(
             _ = heartbeat.tick() => {
                 // A live call may legitimately outlast the idle interval. Completion starts a
                 // fresh interval, but a half-sent encrypted message still has its own deadline.
-                ensure!(!calls.is_empty() || received.elapsed() < IDLE_TIMEOUT, "client channel idle");
+                let idle_timeout = if session.subscribed.is_some() { SUBSCRIBED_IDLE_TIMEOUT } else { IDLE_TIMEOUT };
+                ensure!(!calls.is_empty() || received.elapsed() < idle_timeout, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
                 if session.subscribed.is_some() || session.observation.is_some() { authority.current(&node, &session)?; }
                 if guest.is_some() {
@@ -1090,6 +1094,11 @@ async fn dispatch_inner(
                         .map(String::from)
                 })
                 .flatten();
+            let snapshot_request = watched_scope
+                .as_ref()
+                .map(|_| snapshot::Request::parse(command::business_params(&params).value()))
+                .transpose()?
+                .flatten();
             let access = Access::User {
                 network_id: principal.network_id,
                 scope: crate::runtime::UserScope::Network,
@@ -1113,6 +1122,10 @@ async fn dispatch_inner(
                 match node.observe_conversation(&access, &scope, targets).await {
                     Ok(observation) => session.observation = Some(observation),
                     Err(error) => result["observation_error"] = json!(error.to_string()),
+                }
+                if let Some(request) = snapshot_request {
+                    result =
+                        request.respond(&node.identity, access.network_id(), &scope, result)?;
                 }
             }
             Ok(result)
@@ -2843,6 +2856,45 @@ mod tests {
 
             let (mut client, serving) = connect(node.clone(), &admin).await?;
             client.call("authenticate", json!({})).await?;
+            client.call("subscribe", json!({})).await?;
+            while ping(&mut client, &[]).await? {}
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            assert!(
+                !serving.is_finished(),
+                "a subscribed session survives browser inactivity beyond 90 seconds"
+            );
+            let authenticated = client.call("authenticate", json!({})).await?;
+            assert_eq!(authenticated["principal"]["source"], "membership");
+            while ping(&mut client, &[]).await? {}
+            jump(SUBSCRIBED_IDLE_TIMEOUT - HEARTBEAT).await;
+            assert!(
+                !serving.is_finished(),
+                "activity on the same socket starts a fresh subscribed idle interval"
+            );
+            jump(HEARTBEAT * 2).await;
+            assert!(
+                serving
+                    .await?
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client channel idle")
+            );
+
+            let guest = LocalIdentity::generate();
+            let (mut client, serving) = connect(node.clone(), &guest).await?;
+            while ping(&mut client, &[]).await? {}
+            jump(IDLE_TIMEOUT + HEARTBEAT).await;
+            assert!(
+                serving
+                    .await?
+                    .unwrap_err()
+                    .to_string()
+                    .contains("client channel idle")
+            );
+
+            let (mut client, serving) = connect(node.clone(), &admin).await?;
+            client.call("authenticate", json!({})).await?;
+            client.call("subscribe", json!({})).await?;
             let records = client.channel.seal_message(&vec![b'x'; 70_000])?;
             assert!(records.len() > 1);
             send_frame(&mut client.socket, records[0].clone()).await?;
