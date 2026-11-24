@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def run(*args, cwd=None):
-    return subprocess.check_output(args, cwd=cwd or ROOT, text=True).strip()
+    return subprocess.check_output(args, cwd=cwd or ROOT, text=True, encoding='utf-8').strip()
 
 
 def service_installer(target):

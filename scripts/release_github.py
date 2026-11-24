@@ -43,7 +43,7 @@ def asset_bytes(asset_id):
 
 def release_view(tag, repo):
     return subprocess.run(['gh', 'release', 'view', tag, '--repo', repo, '--json', 'isDraft,assets'],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding='utf-8')
 
 
 def release_create(tag, repo, prerelease):
