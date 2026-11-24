@@ -146,6 +146,6 @@ test('returning summary deduplicates unread results and keeps unknown execution 
   const unknown = { ...message('unknown', 2, 2, 'ask'), text: '已有进展' }
   const read = { ...message('read', 3, 3, 'ask'), text: '旧回复' }
   const changes = chatUpdates([completed, completed, unknown, read], [{ trigger: 'attempt', scope: { kind: 'main' }, state: 'reconciling', reply_message_id: 'unknown' }], new Set([completed.event_hash, unknown.event_hash]))
-  assert.deepEqual(changes, [{ id: 'done', text: '草稿已完成', state: '已完成' }, { id: 'unknown', text: '已有进展', state: '结果待确认' }])
+  assert.deepEqual(changes, [{ id: 'done', text: '草稿已完成', state: '已回复' }, { id: 'unknown', text: '已有进展', state: '结果待确认' }])
   assert.ok(changes.every((change) => !change.state.includes('测试')))
 })

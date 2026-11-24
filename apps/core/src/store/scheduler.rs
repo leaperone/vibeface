@@ -3944,7 +3944,7 @@ fn end_job_from(
                 connection, network, &job.conversation_id, &question?,
             )?, Some(crate::workspace::InputTarget::Routine { trigger, .. }) if trigger == job.trigger);
         }
-        if routine && explicit_no_change && !blocked {
+        if matches!(outcome, JobOutcome::NoChange) && routine && explicit_no_change && !blocked {
             outcome = JobOutcome::NoChange;
         } else {
             outcome = JobOutcome::Failed(ExecFailure::new(

@@ -16,7 +16,7 @@ export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readon
     id: message.message_id,
     text: message.text.trim().split('\n')[0]?.slice(0, 160) || '查看原回复',
     state: jobs.some((job) => job.reply_message_id === message.message_id && (job.pending_check || job.state === 'reconciling')) ? '结果待确认'
-      : message.status === 'completed' ? '已完成' : message.status === 'failed' ? '失败'
+      : message.status === 'completed' ? '已回复' : message.status === 'failed' ? '失败'
       : message.status === 'stopped' || message.status === 'interrupted' ? '已中断' : '新回复',
   }))
 }
