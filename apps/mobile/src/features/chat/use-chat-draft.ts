@@ -89,7 +89,7 @@ function draftOwner(key: string, scope: DraftScope, current: { current: unknown 
       } finally { selection.close() }
     },
     async flush(): Promise<DraftSnapshot> {
-      if (owner.timer) void persist().catch(() => {})
+      save()
       const sequence = owner.sequence
       const snapshot = await owner.tail
       if (owner.failure && owner.sequence === sequence) throw new Error(owner.failure)
