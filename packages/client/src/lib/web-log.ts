@@ -117,7 +117,7 @@ export function createReporter(): Reporter {
         const wait = responded === true && code === "log_rate_limited" ? 60_000 : 5_000
         pausedUntil = Date.now() + wait
         // A timer must not keep a test process or a closing page alive.
-        ;(setTimeout(schedule, wait) as { unref?: () => void }).unref?.()
+        ;(setTimeout(() => { pausedUntil = 0; schedule() }, wait) as { unref?: () => void }).unref?.()
       }
     } finally { sending = false }
     schedule()

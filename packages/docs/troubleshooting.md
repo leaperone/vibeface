@@ -58,8 +58,8 @@ Node 每分钟检查以下问题。连续两轮都发现才算问题出现，只
 | `work_stalled` | `work.stalled`（warn） | `work.recovered` | 运行中的工作超过 10 分钟没有任何进展事件，带 `work_id`、`conversation_id` |
 | `work_looping` | `work.looping`（warn） | `work.loop_ended` | 运行中的 Codex 工作在最近 5 分钟连续完成 6 次相同调用和相同结果，或连续 6 次明确工具失败；普通进度不会清除证据。重复通知不计数，换轮或窗口过期后重置。只保存有界摘要，参数和原始结果不进入健康状态或日志；不自动中断或重试 |
 | `app_server_unresponsive` | `app_server.unresponsive`（warn） | `app_server.recovered` | 已连接的 Codex App Server 在 10 秒内没有回应只读探测；不重启、不重发。App Server 未连接时这一轮不检查，保持上一轮的结论 |
-| `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 本机与对端的连接还在，或最近一次同步成功，但超过 10 分钟没有完成同步，带 `peer`。连接还在而每次同步都失败、启动以来一次都没同步成功的对端也算；连接断开且同步失败的对端按离线处理，不算 |
-| `job_stalled` | `job.stalled`（warn） | `job.recovered` | 一轮回复在排队、steer、领取、取消或对账中停在同一状态超过 30 分钟，从本机第一次看到它处于这个状态时算起，带 `trigger`、`conversation_id`。运行中的一轮由运行超时和工作检查负责，不在此列；排在一个合法的长轮次后面的输入也可能触发 |
+| `sync_stalled` | `sync.stalled`（warn） | `sync.recovered` | 本机与对端的连接还在，或最近一次同步成功，但超过 10 分钟没有完成同步，带 `peer`。连接还在而每次同步都失败、启动以来一次都没同步成功的对端也算；连接断开且同步失败的对端按离线处理，不算。10 分钟从最近一次同步成功、本机第一次看到这次连接和最近一次附件进展中最晚的那个算起，所以重新连上或下载大附件时仍有完整的 10 分钟 |
+| `job_stalled` | `job.stalled`（warn） | `job.recovered` | 一轮回复在排队、steer、领取、取消或对账中停在同一状态超过 30 分钟，从本机第一次看到它处于这个状态时算起，带 `job`（`会话 ID:trigger`）、`conversation_id`。运行中的一轮由运行超时和工作检查负责，不在此列；有轮次在运行时排队等待不算，在等待处理项的、健康提醒自己的一轮也不算 |
 
 循环检测比较 Codex 命令、MCP 和动态工具的完整调用与结果；文件变更只统计明确失败。缺少完整结果或本机证据超过 64 KiB 时不比较相等，仍可统计明确失败。其他 Provider 保留原有停滞检查。
 
@@ -67,7 +67,7 @@ Node 每分钟检查以下问题。连续两轮都发现才算问题出现，只
 
 输出当前问题（检查、对象、开始时间、详情）和最近 1 小时按事件统计的 warn、error 条数，`--json` 输出 `{checked_at_ms, problems: [{check, subject, since_ms, detail, conversation_id?}], last_hour: {warn: {事件: 条数}, error: {…}}}`。
 
-新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`。只读沙箱只防误写，不是安全边界：Shell 仍能读本机文件、访问网络（Node 工具经本机回环调用），也能连本机的 Node 维护 socket 和 Codex App Server socket 间接写入，挡不住日志内容里的提示注入；Bot 线程已被其他订阅者加载时，网页搜索和 Shell 环境可能沿用线程原有设置，只有沙箱每轮下发；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。提醒没写成时（被上限挡住、没有主 Bot、未开启 **运行 Bot**、本机不可写、不是调度主 Bot 的 Node 或写入失败），问题还在就每轮再试，直到写成或问题消失；只有第一次尝试记 `health.handoff_limited`、`health.no_primary_bot` 或 `health.not_owner`。
+新问题出现时，调度主 Bot 的那台 Node 给主 Bot 设一个一分钟后到期的提醒，正文写明发现问题的设备，让它先用 `read_health`、`read_logs` 排查，能自己处理就处理，需要本人决定时发拍板卡片。这一轮只提供只读工具（读会话、节点、日志和健康状态等）和 `propose_provider_config`，`tool_search` 也只列出这些，不能派发或控制工作，不能用 `remind` 设提醒或用 `message_bot` 给其他 Bot 发消息，不能改设置，也不能用 `fetch_url` 读外部网页。这些限制针对协调工具；产品自带的 Shell 和联网只有 Codex 能按轮收紧：Codex Bot 的这一轮在只读沙箱里跑，关闭原生网页搜索，Shell 环境不带 `VIBEFACE_CODEX_SOCKET`。只读沙箱只防误写，不是安全边界：Shell 仍能读本机文件、访问网络（Node 工具经本机回环调用），也能连本机的 Node 维护 socket 和 Codex App Server socket 间接写入，挡不住日志内容里的提示注入；Bot 线程已被其他订阅者加载时，网页搜索和 Shell 环境可能沿用线程原有设置，只有沙箱每轮下发；Claude Code、opencode、pi 和 Cursor 这一轮仍有完整的宿主权限。Bot 不能改动或删除这类提醒。同一设备的同一问题每小时最多一次，全部问题每小时最多 6 次、每天最多 24 次，只有写成的提醒计入。提醒没写成时（被上限挡住、没有主 Bot、未开启 **运行 Bot**、本机不可写、不是调度主 Bot 的 Node 或写入失败），问题还在就每轮再试，直到写成或问题消失；只有第一次尝试记 `health.handoff_limited`、`health.no_primary_bot`、`health.not_owner` 或 `health.handoff_failed`，之后的重试只记 debug。
 
 其他设备的 Node 只能为主 Bot 写本人消息引出的设置改动，没有不冒充本人就能让主 Bot 开始一轮的路径，所以它们发现的问题只记 `health.not_owner`，不占上限名额。要处理这类问题，在那台设备上看 `vibeface health`，或连接它导出诊断包。
 

@@ -248,6 +248,11 @@ pub(crate) struct HealthState {
     unhanded: BTreeSet<ProblemKey>,
     /// Each open scheduler job's state and since when this Node has seen it in that state.
     jobs: HashMap<String, (&'static str, i64)>,
+    /// Since when each connected peer has been seen connected, and its last attachment progress.
+    peer_connected: HashMap<String, i64>,
+    peer_progress: HashMap<String, i64>,
+    /// Attachments whose source went idle; each is logged at warn once until it downloads.
+    stalled_blobs: BTreeSet<String>,
 }
 
 impl HealthState {
@@ -263,11 +268,25 @@ impl HealthState {
             handed: Vec::new(),
             unhanded: BTreeSet::new(),
             jobs: HashMap::new(),
+            peer_connected: HashMap::new(),
+            peer_progress: HashMap::new(),
+            stalled_blobs: BTreeSet::new(),
         }
     }
 
     pub(crate) fn progressed(&mut self, work_id: &str, at_ms: i64) {
         self.progress.insert(work_id.to_owned(), at_ms);
+    }
+
+    /// An attachment from `peer` moved on, so a long download is no stalled sync.
+    pub(crate) fn blob_progressed(&mut self, peer: &str, hash: &str, at_ms: i64) {
+        self.peer_progress.insert(peer.to_owned(), at_ms);
+        self.stalled_blobs.remove(hash);
+    }
+
+    /// Whether this is the first idle stall of `hash` since it last moved on.
+    pub(crate) fn blob_stalled(&mut self, hash: &str) -> bool {
+        self.stalled_blobs.insert(hash.to_owned())
     }
 
     fn observed_tool(&mut self, work_id: &str, event: &Value, now: i64) {
@@ -321,7 +340,6 @@ impl HealthState {
             self.baseline_ms = now;
             self.pending.clear();
             self.tools.clear();
-            self.jobs.clear();
             self.app_server_missed = None;
         }
         asleep
@@ -414,43 +432,48 @@ impl HealthState {
 
 /// Scheduler jobs that stayed in one waiting state for `JOB_STALL_MS`, counted from when this
 /// Node first saw them there and from `baseline_ms` at the earliest. A running turn has its
-/// own timeout and its works their own check.
+/// own timeout and its works their own check. While any turn runs, a queued job may wait its
+/// turn behind it or for a slot, so a queued job counts only when nothing runs. A health
+/// reminder's own turn and a job held by a pending check, which already waits for the user,
+/// do not count.
 fn stalled_jobs(
     state: &mut HealthState,
     jobs: &[crate::scheduling::SchedulerJob],
     now: i64,
 ) -> Vec<Problem> {
+    use crate::scheduling::JobState;
+    let running = jobs
+        .iter()
+        .any(|job| matches!(job.state, JobState::Running { .. }));
     let waiting: Vec<_> = jobs
         .iter()
-        .filter(|job| !matches!(job.state, crate::scheduling::JobState::Running { .. }))
+        .filter(|job| match job.state {
+            JobState::Running { .. } => false,
+            JobState::Queued => !running,
+            _ => true,
+        })
+        .filter(|job| !job.pending_check && !health_turn(&job.trigger))
+        .map(|job| (format!("{}:{}", job.conversation_id, job.trigger), job))
         .collect();
     let seen = std::mem::take(&mut state.jobs);
-    for job in &waiting {
+    for (key, job) in &waiting {
         let name = job.state.name();
-        let since = match seen.get(&job.trigger) {
+        let since = match seen.get(key) {
             Some((known, since)) if *known == name => *since,
             _ => now,
         };
-        state.jobs.insert(job.trigger.clone(), (name, since));
+        state.jobs.insert(key.clone(), (name, since));
     }
     waiting
         .into_iter()
-        .filter_map(|job| {
-            let (name, since) = state.jobs[&job.trigger];
+        .filter_map(|(key, job)| {
+            let (name, since) = state.jobs[&key];
             let since = since.max(state.baseline_ms);
             (now - since > JOB_STALL_MS).then(|| Problem {
                 check: Check::JobStalled,
-                subject: job.trigger.clone(),
+                subject: key,
                 since_ms: since,
-                detail: format!(
-                    "{name} for over {} minutes{}",
-                    JOB_STALL_MS / 60_000,
-                    if job.pending_check {
-                        "; waits on a pending check"
-                    } else {
-                        ""
-                    }
-                ),
+                detail: format!("{name} for over {} minutes", JOB_STALL_MS / 60_000),
                 conversation_id: Some(job.conversation_id.clone()),
             })
         })
@@ -530,21 +553,41 @@ fn looping_works(
 }
 
 /// Peers this Node is connected to, or whose last sync finished, with no sync finished for
-/// `SYNC_STALL_MS`, counted from `baseline_ms` at the earliest. A peer whose syncs fail while
-/// its connection stays open counts too, and one that never finished a sync since start.
+/// `SYNC_STALL_MS`. A peer whose syncs fail while its connection stays open counts too, and one
+/// that never finished a sync since start. The time counts from the latest of the last sync,
+/// `baseline_ms`, the round this Node first saw the peer connected and its last attachment
+/// progress, so a reconnect or a long attachment download gets the full limit.
 fn stalled_peers(
+    state: &mut HealthState,
     peers: &[crate::maintenance::PeerHealth],
-    baseline_ms: i64,
     now: i64,
 ) -> Vec<Problem> {
-    peers
+    let connected: Vec<_> = peers
         .iter()
+        .filter(|peer| peer.path.is_some() || peer.reachable == Some(true))
+        .collect();
+    let seen = std::mem::take(&mut state.peer_connected);
+    for peer in &connected {
+        let since = seen.get(&peer.device_id).copied().unwrap_or(now);
+        state.peer_connected.insert(peer.device_id.clone(), since);
+    }
+    state
+        .peer_progress
+        .retain(|peer, _| state.peer_connected.contains_key(peer));
+    connected
+        .into_iter()
         .filter_map(|peer| {
-            let connected = peer.path.is_some();
-            if !connected && peer.reachable != Some(true) {
-                return None;
-            }
-            let since_ms = peer.synced_ms.unwrap_or(baseline_ms);
+            let since_ms = peer.synced_ms.unwrap_or(state.baseline_ms);
+            let start = since_ms
+                .max(state.baseline_ms)
+                .max(state.peer_connected[&peer.device_id])
+                .max(
+                    state
+                        .peer_progress
+                        .get(&peer.device_id)
+                        .copied()
+                        .unwrap_or(0),
+                );
             let detail = match (peer.synced_ms, peer.reachable) {
                 (None, _) => format!(
                     "{} is connected, but no sync has finished since start",
@@ -555,7 +598,7 @@ fn stalled_peers(
                 }
                 _ => format!("{} answers, but no sync has finished since", peer.name),
             };
-            (now - since_ms.max(baseline_ms) > SYNC_STALL_MS).then(|| Problem {
+            (now - start > SYNC_STALL_MS).then(|| Problem {
                 check: Check::SyncStalled,
                 subject: peer.device_id.clone(),
                 since_ms,
@@ -568,7 +611,7 @@ fn stalled_peers(
 
 fn record(problem: &Problem, began: bool) {
     let subject = problem.subject.as_str();
-    let (work_id, peer, trigger) = match problem.check {
+    let (work_id, peer, job) = match problem.check {
         Check::WorkStalled | Check::WorkLooping => (Some(subject), None, None),
         Check::SyncStalled => (None, Some(subject), None),
         Check::JobStalled => (None, None, Some(subject)),
@@ -581,7 +624,7 @@ fn record(problem: &Problem, began: bool) {
             work_id,
             conversation_id,
             peer,
-            trigger,
+            job,
             since_ms = problem.since_ms,
             detail = problem.detail,
             "{}",
@@ -593,7 +636,7 @@ fn record(problem: &Problem, began: bool) {
             work_id,
             conversation_id,
             peer,
-            trigger,
+            job,
             since_ms = problem.since_ms,
             "{} no longer",
             problem.check.summary()
@@ -926,8 +969,12 @@ impl Runtime {
                 });
             }
         }
-        let baseline = self.health.lock().expect("health").baseline_ms;
-        found.extend(stalled_peers(&self.peer_health().await, baseline, now));
+        let peers = self.peer_health().await;
+        found.extend(stalled_peers(
+            &mut self.health.lock().expect("health"),
+            &peers,
+            now,
+        ));
         let (began, ended) = self.health.lock().expect("health").update(&ran, found, now);
         for problem in &ended {
             record(problem, false);
@@ -937,12 +984,19 @@ impl Runtime {
         }
         // A problem the primary bot did not get, for a limit, a missing bot or a failed write,
         // goes again each round while it stays open. Only its first try logs at info.
+        // ponytail: one store transaction per open problem a minute, as on a Node that does not
+        // schedule the primary bot; back off per key if that write lock ever shows up.
         let unhanded = self.health.lock().expect("health").unhanded();
         for problem in unhanded {
             let first = began.iter().any(|new| new.key() == problem.key());
-            if let Err(error) = self.hand_to_primary_bot(&problem, now, first).await {
-                tracing::warn!(event = "health.handoff_failed", %error, check = ?problem.check,
-                    subject = problem.subject, "an open problem did not reach the primary bot");
+            match self.hand_to_primary_bot(&problem, now, first).await {
+                Err(error) if first => {
+                    tracing::warn!(event = "health.handoff_failed", %error, check = ?problem.check,
+                        subject = problem.subject, "an open problem did not reach the primary bot");
+                }
+                Err(error) => tracing::debug!(%error, subject = problem.subject,
+                    "an open problem still does not reach the primary bot"),
+                Ok(()) => {}
             }
         }
     }
@@ -1405,9 +1459,10 @@ mod tests {
             disconnects: 0,
         };
         let peers = [peer];
-        assert!(stalled_peers(&peers, after_sleep, after_sleep + SYNC_STALL_MS).is_empty());
+        assert!(stalled_peers(&mut state, &peers, after_sleep).is_empty());
+        assert!(stalled_peers(&mut state, &peers, after_sleep + SYNC_STALL_MS).is_empty());
         assert_eq!(
-            stalled_peers(&peers, after_sleep, after_sleep + SYNC_STALL_MS + 1)[0].since_ms,
+            stalled_peers(&mut state, &peers, after_sleep + SYNC_STALL_MS + 1)[0].since_ms,
             1
         );
     }
@@ -1684,7 +1739,10 @@ mod tests {
             json!({"device_id":"d","path":"relay","name":"Mac","reachable":true,"synced_ms":1,
                 "rtt_ms":42,"path_changes":3,"disconnects":1})
         );
-        let stalled = stalled_peers(&[peer], 0, 1 + SYNC_STALL_MS + 1);
+        let mut state = HealthState::new(0);
+        let peers = [peer];
+        stalled_peers(&mut state, &peers, 0);
+        let stalled = stalled_peers(&mut state, &peers, 1 + SYNC_STALL_MS + 1);
         assert_eq!(stalled.len(), 1);
         assert_eq!(
             (stalled[0].check, stalled[0].since_ms),
@@ -1720,27 +1778,43 @@ mod tests {
             path_changes: 0,
             disconnects: 0,
         };
+        let stalls = |peer: crate::maintenance::PeerHealth, baseline: i64, late: i64| {
+            let mut state = HealthState::new(baseline);
+            let peers = [peer];
+            stalled_peers(&mut state, &peers, 0);
+            !stalled_peers(&mut state, &peers, late).is_empty()
+        };
         let late = SYNC_STALL_MS + 2;
         let direct = Some(crate::net::PathKind::Direct);
+        assert!(stalls(peer(direct, Some(false), Some(1)), 0, late));
+        assert!(stalls(peer(direct, None, None), 1, late));
+        assert!(!stalls(peer(None, Some(false), Some(1)), 0, late));
+        assert!(!stalls(peer(direct, None, None), 5, late));
+        // A reconnect after an hour away gets the full limit, and so does attachment progress.
+        let mut state = HealthState::new(0);
+        let failing = [peer(direct, Some(false), Some(1))];
+        assert!(stalled_peers(&mut state, &failing, HOUR_MS).is_empty());
+        assert!(stalled_peers(&mut state, &failing, HOUR_MS + SYNC_STALL_MS).is_empty());
+        state.blob_progressed("d", "h", HOUR_MS + SYNC_STALL_MS);
+        assert!(stalled_peers(&mut state, &failing, HOUR_MS + 2 * SYNC_STALL_MS).is_empty());
         assert_eq!(
-            stalled_peers(&[peer(direct, Some(false), Some(1))], 0, late).len(),
+            stalled_peers(&mut state, &failing, HOUR_MS + 2 * SYNC_STALL_MS + 1).len(),
             1
         );
-        assert_eq!(stalled_peers(&[peer(direct, None, None)], 1, late).len(), 1);
-        assert!(stalled_peers(&[peer(None, Some(false), Some(1))], 0, late).is_empty());
-        assert!(stalled_peers(&[peer(direct, None, None)], 5, late).is_empty());
+        assert!(state.blob_stalled("h") && !state.blob_stalled("h"));
     }
 
     #[test]
     fn a_job_stalls_after_waiting_in_one_state() {
-        let job = |state| crate::scheduling::SchedulerJob {
+        use crate::scheduling::JobState;
+        let job = |trigger: &str, state| crate::scheduling::SchedulerJob {
             conversation_id: "c".into(),
             scope: crate::scheduling::SessionScope::Main,
-            trigger: "message:m".into(),
+            trigger: trigger.into(),
             kind: crate::scheduling::TriggerKind::Human,
             sequence: 1,
             basis: crate::model::VersionVector::new(),
-            reply_to: "message:m".into(),
+            reply_to: trigger.into(),
             message_id: "reply".into(),
             runtime: None,
             pending_check: false,
@@ -1748,16 +1822,38 @@ mod tests {
             state,
         };
         let mut state = HealthState::new(0);
-        let queued = [job(crate::scheduling::JobState::Queued)];
+        let queued = [job("message:m", JobState::Queued)];
         assert!(stalled_jobs(&mut state, &queued, 1_000).is_empty());
         assert!(stalled_jobs(&mut state, &queued, 1_000 + JOB_STALL_MS).is_empty());
         let stalled = stalled_jobs(&mut state, &queued, 1_001 + JOB_STALL_MS);
         assert_eq!(
-            (stalled[0].since_ms, stalled[0].conversation_id.as_deref()),
-            (1_000, Some("c"))
+            (stalled[0].subject.as_str(), stalled[0].since_ms),
+            ("c:message:m", 1_000)
         );
         assert!(stalled_jobs(&mut state, &[], 2_000 + JOB_STALL_MS).is_empty());
         assert!(state.jobs.is_empty(), "a finished job is forgotten");
+        // Queued behind a running turn, held by a pending check, or a health reminder's own turn.
+        let attempt = crate::scheduling::ManagerAttempt {
+            id: "a".into(),
+            boot: "b".into(),
+            permission_version: 1,
+        };
+        let mut held = job("message:p", JobState::Queued);
+        held.pending_check = true;
+        let others = [
+            job(
+                "message:r",
+                JobState::Running {
+                    attempt: attempt.clone(),
+                },
+            ),
+            job("message:q", JobState::Queued),
+            held,
+            job("schedule:health-x:1", JobState::Queued),
+        ];
+        let mut state = HealthState::new(0);
+        stalled_jobs(&mut state, &others, 0);
+        assert!(stalled_jobs(&mut state, &others, 2 * JOB_STALL_MS).is_empty());
     }
 
     #[test]

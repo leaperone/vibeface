@@ -546,10 +546,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
         return true
       } catch (cause) {
-        // ponytail: the first three rounds of a reconnect only, so a long time offline does not push crash records out.
-        if (target.attempt < 3) reportLog({ level: 'info', event: 'connection.attempt_failed', message: messageOf(cause).slice(0, 300), fields: {
+        // ponytail: the first three rounds after a drop only, so a long time offline does not push crash records out;
+        // a switch the person made is no failure.
+        const round = 'attempt' in linkRef.current ? linkRef.current.attempt : 0
+        if (round <= 3 && reconnect.current === target) reportLog({ level: 'info', event: 'connection.attempt_failed', message: messageOf(cause).slice(0, 300), fields: {
           path: candidate.kind, node: candidate.device_id, ...(candidate.kind === 'lan' ? { addrs: candidate.addrs } : { address: candidate.address }),
-          elapsed_ms: Date.now() - started, attempt: target.attempt, opened: active !== null, ...failureFields(cause, messageOf(cause)),
+          elapsed_ms: Date.now() - started, attempt: round, opened: active !== null, ...failureFields(cause, messageOf(cause)),
         } })
         if (active && session.current === active && !active.networkId) { generation.current += 1; session.current = null; active.channel.close() }
         if (reconnect.current !== target) return true
