@@ -196,7 +196,7 @@ function Live({ children }: { children: ReactNode }) {
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
-      blocked: shared.canSaveMessages ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读',
+      blocked: shared.canSaveMessages || shared.canQueueMessages && shared.conversationId === conversationId ? null : shared.readOnlyNotice || shared.writeNotice || '尚未完成首读',
     }
   }
 

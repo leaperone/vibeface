@@ -1208,10 +1208,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }).catch((caught) => showError(caught, '读取已保存的输入'))
   }
   flushMessagesRef.current = flushMessages
-  const canSaveMessages = !ledgerFailed && joined && booted && loadedMessageConnection.current === connection && renderedConnection.current === connection && writeState.state === 'writable' && bots.length > 0
+  const canQueueMessages = !ledgerFailed && joined && booted && current() && writeState.state === 'writable' && bots.length > 0
+  const canSaveMessages = canQueueMessages && loadedMessageConnection.current === connection && renderedConnection.current === connection
   const sendMessage = async (text: string, files: AttachmentFile[] = [], sent: Attachment[] = [], options?: InputOptions) => {
     ledgerGuard()
-    if (!canSaveMessages || !alive.current) {
+    const requestedTarget = options?.target
+    const queueable = !requestedTarget || requestedTarget.kind === 'bot_main' || requestedTarget.kind === 'channel_member'
+    if ((!canQueueMessages || !alive.current || !queueable) && (!canSaveMessages || !alive.current)) {
       await outbox.all(); ledgerGuard()
       throw new Error(writeState.state === 'writable' ? '先读取已授权的工作区，再保存输入。' : writeNotices[writeState.state])
     }
@@ -1478,7 +1481,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     },
     workspaceState, readWorkspaceState, readWorkspaceHistory, workspaceCommand, queryInput, confirmInputEntry, readScopeContext, readWork, stopInputTarget, retryPendingMessage, releaseMessagePending,
     controlInput: (input: { message_id: string; expected_event: string; action: InputControlAction }) => workspaceCommand({ kind: 'control_input', ...input }),
-    joined, synced,
+    joined, synced, canQueueMessages,
     writable: !ledgerFailed && joined && booted && current() && sameRead() && writeState.state === "writable",
     writeNotice: ledgerFailed ? outboxCorruptNotice : !sameRead() ? "正在补读这个节点的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
