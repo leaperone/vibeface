@@ -61,23 +61,29 @@ fn error_status(code: &str) -> StatusCode {
     }
 }
 
-fn authenticate(app: &App, headers: &HeaderMap) -> std::result::Result<Caller, Response> {
+fn authenticate(app: &App, headers: &HeaderMap) -> std::result::Result<Caller, Box<Response>> {
     let key = bearer(headers).ok_or_else(|| {
-        failure(
+        Box::new(failure(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "caller key required",
-        )
+        ))
     })?;
-    app.node.gateway.authenticate(key).map_err(from_error)
+    app.node
+        .gateway
+        .authenticate(key)
+        .map_err(|error| Box::new(from_error(error)))
 }
 
 fn body(
     input: std::result::Result<Json<Value>, JsonRejection>,
-) -> std::result::Result<Value, Response> {
+) -> std::result::Result<Value, Box<Response>> {
     input.map(|Json(value)| value).map_err(|error| {
-        let status = error.status();
-        failure(status, "invalid_request", "request body must be valid JSON")
+        Box::new(failure(
+            error.status(),
+            "invalid_request",
+            "request body must be valid JSON",
+        ))
     })
 }
 
@@ -104,7 +110,7 @@ async fn mint(
     }
     let value = match body(input) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let input: Mint = match serde_json::from_value(value) {
         Ok(input) => input,
@@ -147,7 +153,7 @@ async fn execute(
 ) -> Response {
     let caller = match authenticate(app, headers) {
         Ok(caller) => caller,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     if !OPERATIONS.contains(&operation) {
         return failure(
@@ -158,7 +164,7 @@ async fn execute(
     }
     let value = match body(input) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     match app.node.gateway_call(&caller, operation, value).await {
         Ok(result) => Json(result).into_response(),
@@ -207,11 +213,11 @@ async fn mcp(
 ) -> Response {
     let caller = match authenticate(&app, &headers) {
         Ok(caller) => caller,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let input = match body(input) {
         Ok(input) => input,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let id = input.get("id").cloned().unwrap_or(Value::Null);
     let error = |code, message: &str| {

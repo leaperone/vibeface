@@ -589,10 +589,11 @@ impl Runtime {
             thread: None,
         };
         loop {
-            match {
+            let started = {
                 let _work = self.enter_gateway()?;
                 self.gateway_start(caller, start())
-            } {
+            };
+            match started {
                 Err(e)
                     if e.downcast_ref::<GatewayError>()
                         .is_some_and(|e| e.code == "thread_busy") => {}
