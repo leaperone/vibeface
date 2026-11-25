@@ -1,9 +1,10 @@
+import type { AppState } from 'react-native'
 import type { NotificationRecord } from '@vibeface/client/workspace/types.ts'
 
 export function foregroundInbox() {
   let previous: Set<string> | null = null
   let interrupted: string | undefined
-  return (state: string | null, items: readonly NotificationRecord[], eligible: (item: NotificationRecord) => boolean) => {
+  return (state: typeof AppState.currentState, items: readonly NotificationRecord[], eligible: (item: NotificationRecord) => boolean) => {
     const seen = previous
     previous = new Set(items.map(item => item.notification_id))
     if (!seen || state === 'background') return null
