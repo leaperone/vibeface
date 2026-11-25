@@ -24,7 +24,6 @@ import { workspaceTaskCounts } from "@vibeface/client/workspace/presentation.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Popover,PopoverContent,PopoverTrigger } from "@vibeface/uiarc/popover/popover.tsx"
-import { Progress } from "@vibeface/uiarc/progress/progress.tsx"
 import { ArrowRightLeft,ChevronLeft,CircleAlert,CircleHelp,Hand,LoaderCircle,MessageSquare,MessagesSquare,PanelLeft,Plus,RefreshCw,RotateCw,ShieldAlert,Wifi,WifiOff,type LucideIcon } from "lucide-react"
 import { createContext,useContext,useEffect,useRef,useState,useSyncExternalStore,type ReactNode } from "react"
 import { BotForm } from "./bot-form"
@@ -157,7 +156,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
       </header>
       {workspace.joined ? null : <LocalSession onJoin={() => { if (home && home !== window.location.origin) window.location.assign(`${home}/join`); else void navigate({ to: "/join" }) }} />}
       {pathname === "/tasks" ? null : <RecoveryAlert />}
-      {workspace.data && workspace.incomplete ? <Progress value={30} label="同步中" /> : null}
+      {workspace.data && workspace.incomplete ? <p role="status" className="flex shrink-0 items-center gap-2 px-4 py-2 text-sm text-secondary"><LoaderCircle aria-hidden="true" className="size-4 animate-spin motion-reduce:animate-none" />同步中</p> : null}
       <div className={cn(layout.chat,!chatRoute && layout.chatHidden)} inert={!chatRoute} aria-hidden={!chatRoute || undefined}><div className="conversation-view"><ConversationScreen missing={missingBot} active={/^\/b\/[^/]+\/?$/.test(pathname) && !missingBot} /></div>{chatRoute ? children : null}</div>
       {chatRoute ? null : <div className={scopedChat ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden' : layout.page}>{children}</div>}
       {phoneTab ? <TabBar pathname={pathname} waiting={waiting} recovering={recovering} attention={devicesAttention} /> : null}

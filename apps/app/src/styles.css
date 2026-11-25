@@ -29,7 +29,7 @@ button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 code, kbd, pre, samp { font-family: var(--font-mono); }
 h1,h2,h3,p { margin: 0; }
-h1,h2,h3 { font-weight: 500; text-wrap: balance; }
+h1,h2,h3 { font-family: var(--font-display); font-weight: 500; text-wrap: balance; }
 p { text-wrap: pretty; }
 :where(.grid) > * { min-width: 0; }
 [hidden] { display: none !important; }
