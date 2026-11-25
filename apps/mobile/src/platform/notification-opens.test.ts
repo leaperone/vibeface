@@ -1,4 +1,4 @@
-import { latestBanner, notificationOnScreen } from './foreground-notifications.ts'
+import { foregroundInbox, notificationOnScreen } from './foreground-notifications.ts'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { notificationOpenings } from './notification-opens.ts'
@@ -120,11 +120,18 @@ test('foreground banners skip existing history, combine bursts and exclude the s
   const chat = { notification_id: 'one', conversation_id: 'chat', kind: 'bot_message', text: 'hello', target: { kind: 'bot_main', bot_id: 'bot' } } as const
   const task = { ...chat, notification_id: 'two', target: { kind: 'task', task_id: 'job' } } as const
   const items = [chat, task]
-  assert.equal(latestBanner(null, items, () => true), null)
-  assert.equal(latestBanner(new Set(), items, () => true), task)
-  assert.equal(latestBanner(new Set(['one', 'two']), items, () => true), null)
-  assert.equal(latestBanner(new Set(), items, n => !notificationOnScreen(n, '/task/job', undefined, 'bot')), chat)
-  assert.equal(latestBanner(new Set(), items, () => false), null)
+  const observe = foregroundInbox(), all = () => true
+  assert.equal(observe('active', [chat], all), null)
+  assert.equal(observe('inactive', items, all), null)
+  assert.equal(observe('background', items, all), null)
+  assert.equal(observe('active', items, all), task)
+  assert.equal(observe('active', items, all), null)
+  observe('active', [], all)
+  assert.equal(observe('active', items, all), task)
+  observe('active', [], all)
+  assert.equal(observe('active', items, n => !notificationOnScreen(n, '/task/job', undefined, 'bot')), chat)
+  observe('active', [], all)
+  assert.equal(observe('active', items, () => false), null)
   assert.equal(notificationOnScreen(chat, '/b/bot', undefined, 'bot'), true)
   assert.equal(notificationOnScreen(chat, '/b/bot/about', undefined, 'bot'), false)
 })

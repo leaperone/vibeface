@@ -1,6 +1,6 @@
 import { useGlobalSearchParams, usePathname } from 'expo-router'
 import { X } from 'lucide-react-native'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AccessibilityInfo, AppState, Platform, Pressable, View } from 'react-native'
 import { FullWindowOverlay } from 'react-native-screens'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -12,7 +12,7 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useLive, useOpenNotificationConversation } from '@/data/live'
 import { mobilePlatform } from '@/platform'
-import { latestBanner, notificationOnScreen } from '@/platform/foreground-notifications'
+import { foregroundInbox, notificationOnScreen } from '@/platform/foreground-notifications'
 
 export function NotificationBanner({ networkId }: { networkId: string }) {
   const shared = useLive()
@@ -20,7 +20,7 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
   const path = usePathname()
   const { routine } = useGlobalSearchParams<{ routine?: string }>()
   const insets = useSafeAreaInsets()
-  const previous = useRef<Set<string> | null>(null)
+  const [observe] = useState(foregroundInbox)
   const [resume, resumed] = useState(0)
   const [item, setItem] = useState<NotificationRecord | null>(null)
   const [preferenceRevision, refreshPreferences] = useState(0)
@@ -38,9 +38,8 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
   const eligible = (notice: NotificationRecord) => !shared?.ignoredNotifications.has(notice.notification_id) && !muted.includes(notice.conversation_id)
     && !notificationOnScreen(notice, path, routine, bot(notice)?.bot_id)
   useEffect(() => {
-    if (!shared?.synced || !shared.isCurrent() || !notifications || AppState.currentState === 'inactive') return
-    const next = AppState.currentState === 'active' ? latestBanner(previous.current, notifications, eligible) : null
-    previous.current = new Set(notifications.map(notice => notice.notification_id))
+    if (!shared?.synced || !shared.isCurrent() || !notifications) return
+    const next = observe(AppState.currentState, notifications, eligible)
     if (next) setItem(next)
     else setItem(current => current && notifications.some(n => n.notification_id === current.notification_id) && eligible(current) ? current : null)
   }, [notifications, shared?.synced, shared?.ignoredNotifications, shared?.bots, path, routine, muted, resume])
