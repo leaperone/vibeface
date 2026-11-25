@@ -83,9 +83,9 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     </View> : null}
     {waiting ? <Item key="pending" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/tasks" replace={replace} asChild>
-        <Pressable accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-panel border px-3 py-2.5 active:bg-surface-muted', device.pendingRecovery ? 'border-danger-border bg-danger-subtle' : 'border-warning-border bg-warning-subtle', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
+        <Pressable accessibilityRole="link" accessibilityLabel={device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`} accessibilityState={{ selected: active('/tasks') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-panel border px-3 py-2.5 active:bg-surface-muted', device.pendingRecovery ? 'border-danger-border bg-danger-subtle' : 'border-warning-border bg-warning-subtle', active('/tasks') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
           <Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={cn('size-5', device.pendingRecovery ? 'text-danger' : 'text-warning')} />
-          <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
+          <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
           <Icon as={ChevronRight} className="text-muted" />
         </Pressable>
       </Link>
@@ -100,9 +100,9 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : <UnavailableNewBot reason={shared ? shared.readOnlyNotice || shared.writeNotice || '正在同步，连接完成后才能新建。' : `${offlineCopy.title(workspace.connection.entry)}，连接后才能新建。`} />} /></View>}
-    ListFooterComponent={<><View className="mt-4 flex-row items-center px-3"><Text role="heading" className="flex-1 text-sm font-medium text-muted">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" iconOnly accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted" /></Button></Link></View>
+    ListFooterComponent={<View className="pb-3"><View className="mt-4 flex-row items-center px-3"><Text role="heading" className="flex-1 text-sm font-medium text-muted">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" iconOnly accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted" /></Button></Link></View>
       {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-control px-3 py-3 active:bg-surface-muted', active(`/channel/${channel.channel_id}`) && 'bg-surface-muted')}><Icon as={MessagesSquare} className="text-muted" /><Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Pressable></Link>)}
-      {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}<NotifyTip /></>} /></LayoutAnimationConfig>
+      {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}<NotifyTip /></View>} /></LayoutAnimationConfig>
 }
 
 /** 新 Bot in a header. While a bot cannot be made it stays tappable and says why, instead of greying out without a word. */
