@@ -79,16 +79,21 @@ function useConnection(): { session: Session; connection: Connection } {
   return { session, connection: { state, entry: name ?? '', direct: entry?.kind === 'lan' } }
 }
 
-function Device({ children }: { children: ReactNode }) {
+export function useOpenNotificationConversation() {
   const router = useRouter()
-  const device = useDevice()
-  const { ready } = device
-  if (!ready) return <Offline>{children}</Offline>
-  return <SharedWorkspace key={`${ready.principal.network_id}:${ready.principal.device_id}`} platform={mobilePlatform} connection={ready} tabs={noTabs} openConversation={(id, target?: InputTarget, focus?: string, notificationId?: string) => {
+  return (id: string, target?: InputTarget, focus?: string, notificationId?: string) => {
     if (target?.kind === 'task' || target?.kind === 'channel_task') router.push({ pathname: '/task/[taskId]', params: { taskId: target.task_id, ...(focus ? { message: focus } : {}) } })
     else if (target?.kind === 'channel_member') router.push({ pathname: '/channel/[channelId]', params: { channelId: target.channel_id, ...(focus ? { message: focus } : {}) } })
     else router.push({ pathname: '/', params: { conversation: id, ...(focus ? { message: focus } : {}), ...(notificationId ? { notification: notificationId } : {}), ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
-  }}>
+  }
+}
+
+function Device({ children }: { children: ReactNode }) {
+  const openConversation = useOpenNotificationConversation()
+  const device = useDevice()
+  const { ready } = device
+  if (!ready) return <Offline>{children}</Offline>
+  return <SharedWorkspace key={`${ready.principal.network_id}:${ready.principal.device_id}`} platform={mobilePlatform} connection={ready} tabs={noTabs} openConversation={openConversation}>
     <Live>{children}</Live>
   </SharedWorkspace>
 }

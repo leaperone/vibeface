@@ -6894,11 +6894,13 @@ test('native system notification events keep typed destinations and clear naviga
   let dismissed = 0, forgotten = 0, logsCleared = 0
   const storage = new Map<string, string>()
   const scheduled: unknown[] = []
+  const appState = { currentState: 'active', addEventListener: () => ({ remove() {} }) }
+  let presentation: (() => Promise<object>) | undefined
   const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
-    'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: { currentState: 'active', addEventListener: () => ({ remove() {} }) } },
+    'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: appState },
     'expo-file-system': fixture.native,
     'expo-notifications': {
-      setNotificationHandler() {}, AndroidImportance: { HIGH: 1 }, setNotificationChannelAsync: async () => {},
+      setNotificationHandler(handler: { handleNotification: () => Promise<object> }) { presentation = handler.handleNotification }, AndroidImportance: { HIGH: 1 }, setNotificationChannelAsync: async () => {},
       addNotificationResponseReceivedListener(listener: typeof response) { response = listener; return { remove() { response = undefined } } },
       getLastNotificationResponseAsync: async () => null, clearLastNotificationResponseAsync: async () => {},
       scheduleNotificationAsync: async (value: unknown) => { scheduled.push(value); return 'scheduled' },
@@ -6916,6 +6918,10 @@ test('native system notification events keep typed destinations and clear naviga
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
   const opened: NotificationDestination[] = []
   const unwatch = mobilePlatform.notifier.watchOpen?.(async value => { opened.push(value); return true })
+  await mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
+  assert.deepEqual(scheduled, [])
+  assert.deepEqual(JSON.parse(JSON.stringify(await presentation?.())), { shouldShowBanner: false, shouldShowList: false, shouldPlaySound: false, shouldSetBadge: false })
+  appState.currentState = 'background'
   await mobilePlatform.notifier.show({ title: 'fixture', body: 'fixture', tag: 'same', destination }, () => {})
   await privateFiles.run(async () => {})
   const event: Response = { notification: { date: 1, request: { identifier: 'same', content: { data: { destination } } } }, actionIdentifier: 'open' }
