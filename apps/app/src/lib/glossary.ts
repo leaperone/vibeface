@@ -1,7 +1,7 @@
 import {
-  AppWindow, Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
-  Key, KeyRound, Laptop, Link, ListChecks, Lock, MessageSquareShare, MonitorSmartphone, QrCode, RefreshCw, ScanEye, Settings, ShieldCheck,
-  Smartphone, Sparkles, Star, ArchiveRestore,
+  AppWindow, Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Crown, FolderOpen, Globe, Hand, Inbox,
+  Key, Laptop, ListChecks, Lock, MessageSquareShare, MonitorSmartphone, RefreshCw, ScanEye, Settings, ShieldCheck,
+  Sparkles, Star,
 } from "lucide-react"
 
 /** One icon and one word per concept, see packages/docs/design/web-ux.md. */
@@ -9,19 +9,13 @@ export const terms = {
   myDevices: { label: "我的设备", icon: MonitorSmartphone },
   thisComputer: { label: "这个节点", icon: Laptop },
   browser: { label: "浏览器", icon: AppWindow },
-  phone: { label: "手机", icon: Smartphone },
   address: { label: "访问地址", icon: Globe },
   canRunBot: { label: "能运行 Bot", icon: Bot },
   encrypted: { label: "已加密", icon: ShieldCheck },
-  joinLink: { label: "加入链接", icon: Link },
-  qr: { label: "二维码", icon: QrCode },
   safetyCode: { label: "安全码", icon: ScanEye },
   admin: { label: "管理设备", tag: "管理", icon: Crown },
   remove: { label: "移除设备", icon: Ban },
-  recoveryFile: { label: "恢复文件", icon: FileKey },
-  recoveryPassword: { label: "恢复密码", icon: KeyRound },
   secret: { label: "密钥", icon: Key },
-  restore: { label: "用恢复文件找回", icon: ArchiveRestore },
   bot: { label: "Bot", icon: Bot },
   primaryBot: { label: "主 Bot", icon: Star },
   ai: { label: "Bot 与任务", icon: Sparkles },
@@ -34,7 +28,6 @@ export const terms = {
   readOnly: { label: "只读", icon: Lock },
   paused: { label: "已暂停", icon: CirclePause },
   syncing: { label: "同步中", icon: RefreshCw },
-  sending: { label: "发送中", icon: Clock },
   undelivered: { label: "未送达", icon: CircleAlert },
   settings: { label: "设置", icon: Settings },
 } as const
