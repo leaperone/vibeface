@@ -205,7 +205,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
     remote && ownerUnknown ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
-    ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-secondary">可能已经执行过，先核对结果，再决定是否重试。</p></ActionCard>),
+    ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-secondary">可能已经执行过，先查看结果，再决定是否重试。</p></ActionCard>),
     ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
   // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here. The owner-unknown card has no action.
@@ -270,7 +270,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} attention={attention} open={activityOpen} onOpenChange={setActivityOpen} onOpen={openActivity} from={activityFrom}
     before={<>
-      {cards.length || requery ? <ActivitySection title="要处理">{cards}{requery && !reconciling.length ? <div className="grid gap-2"><p className="text-sm text-secondary">结果尚未确认，可能已经执行过。先核对结果，再决定是否重试。</p><ActionButton variant="ghost" className="justify-self-start" disabled={!workspace.connectionOnline} action={() => workspace.refresh()}>再查一次</ActionButton></div> : null}</ActivitySection> : null}
+      {cards.length || requery ? <ActivitySection title="要处理">{cards}{requery && !reconciling.length ? <div className="grid gap-2"><p className="text-sm text-secondary">结果还没确认，可能已经执行过。先查看结果，再决定是否重试。</p><ActionButton variant="ghost" className="justify-self-start" disabled={!workspace.connectionOnline} action={() => workspace.refresh()}>再查一次</ActionButton></div> : null}</ActivitySection> : null}
       {sending.length ? <ActivitySection title="发送中">{sending.map(inputStatus)}</ActivitySection> : null}
       {inputTarget ? <InputQueue target={inputTarget} /> : null}
     </>}
