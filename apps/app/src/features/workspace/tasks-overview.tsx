@@ -114,9 +114,11 @@ export function TasksOverview() {
     </div> : null}
     <div className={loading ? "hidden" : "contents"}>
       <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-      {globallyEmpty ? null : <TaskRunSummary attention={read ? visibleGroups.attention.length + heldGroups.attention + taskCounts.attention : null} working={read ? visibleGroups.working.length + heldGroups.working + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + heldGroups.waiting + taskCounts.waiting : null} online={workspace.connectionOnline} />}
-      <p className="text-sm text-secondary">{scope}</p>
-      {globallyEmpty ? null : <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />}
+      <div className="grid gap-3">
+        {globallyEmpty ? null : <TaskRunSummary attention={read ? visibleGroups.attention.length + heldGroups.attention + taskCounts.attention : null} working={read ? visibleGroups.working.length + heldGroups.working + taskCounts.working : null} waiting={read ? visibleGroups.waiting.length + heldGroups.waiting + taskCounts.waiting : null} online={workspace.connectionOnline} />}
+        <p className="text-sm text-secondary">{scope}</p>
+        {globallyEmpty ? null : <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />}
+      </div>
       <WorkspaceTasks botFilter={botFilter} filter={filter} onReadError={handleReadError} showEmpty={globallyEmpty} />
       {taskGroups.map(({ group, title }) => {
         if (!visible(group)) return null
@@ -140,8 +142,7 @@ function TurnActivity({ activity, lookup }: { activity: Extract<WorkspaceActivit
   if (!job) return null
   const purpose = job.trigger.startsWith("message:") ? "处理消息" : job.trigger.startsWith("task:") ? "推进任务" : job.trigger.startsWith("schedule:") ? "定时工作" : "后台工作"
   return <RecordPanel className="min-w-0"><RecordBody className="grid min-w-0 gap-2 [overflow-wrap:anywhere]">
-    <p className="font-medium">{purpose}</p>
-    <p className="text-sm text-secondary">{schedulerStatus(job.state).label}</p>
+    <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1"><p className="text-sm font-medium">{purpose}</p><p className="text-sm text-secondary">{schedulerStatus(job.state).label}</p></div>
     {job.source_node ? <p className="text-sm text-secondary">来源设备 · {nodeName(job.source_node, lookup, "未知设备")}</p> : null}
     <Details label="技术详情" className="min-w-0 [overflow-wrap:anywhere]"><dl className="grid min-w-0 gap-1 text-sm"><dt>状态标识</dt><dd>{job.state}</dd><dt>触发记录</dt><dd>{job.trigger || "未提供"}</dd>{job.source_node ? <><dt>来源设备标识</dt><dd>{job.source_node}</dd></> : null}</dl></Details>
   </RecordBody></RecordPanel>
@@ -168,8 +169,8 @@ function WorkspaceEmpty({ title, bot, onCreate, onClear }: { title: string; bot?
 }
 
 function OverviewSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
-  return <section className="grid gap-3" aria-labelledby={`tasks-${title}`}>
-    <div className="flex items-center gap-2 px-1"><h2 id={`tasks-${title}`} className="text-lg font-medium">{title}</h2><CountBadge count={count} label={`${count} 项`} className="bg-surface-muted text-secondary" /></div>
+  return <section className="grid gap-2" aria-labelledby={`tasks-${title}`}>
+    <div className="flex items-center gap-2 px-1"><h2 id={`tasks-${title}`} className="text-sm font-medium text-secondary">{title}</h2><CountBadge count={count} label={`${count} 项`} className="bg-surface-muted text-secondary" /></div>
     <div className="grid gap-3">{children}</div>
   </section>
 }
