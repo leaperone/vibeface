@@ -23,6 +23,7 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace, useLive, useWaiting } from '@/data/live'
+import { NotificationBanner } from '@/features/home/notification-banner'
 import { HomeList } from '@/features/home/list'
 import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
@@ -133,6 +134,7 @@ function Screens() {
           notice: href === '/tasks' ? <Badge count={waiting} /> : undefined,
         }))} /> : null}
         {/* Keep background notifications clear of navigation and the composer. */}
+        {ready && shared && workspace.networkId ? <NotificationBanner key={JSON.stringify([workspace.networkId, workspace.deviceId, shared.generation])} networkId={workspace.networkId} /> : null}
         <Toaster bottom={(tabbed ? 68 : 88) + insets.bottom} />
       </View>
     </View>
