@@ -49,7 +49,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const empty = emptyHome({ synced: Boolean(shared?.synced), link: device.link })
   const waiting = useWaiting()
-  const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
+  const bots = [...workspace.bots].sort((a, b) => Number(workspace.primary === b.conversation_id) - Number(workspace.primary === a.conversation_id) || (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
@@ -90,10 +90,6 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
         </Pressable>
       </Link>
     </Item> : null}
-    <NotifyTip />
-    <View className="mt-2 flex-row items-center px-3"><Text role="heading" className="flex-1 text-sm font-medium text-muted">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" iconOnly accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted" /></Button></Link></View>
-    {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-control px-3 py-3 active:bg-surface-muted', active(`/channel/${channel.channel_id}`) && 'bg-surface-muted')}><Icon as={MessagesSquare} className="text-muted" /><Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Pressable></Link>)}
-    {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}
     <Text role="heading" className="mb-1 mt-4 px-3 text-sm font-medium text-muted">Bot</Text>
     </>}
     ListEmptyComponent={empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title={offlineCopy.title(workspace.connection.entry)} action={
@@ -103,7 +99,10 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-pill" /><Skeleton className="h-3 w-2/3 rounded-pill" /></View>
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
-    </Link> : undefined} /></View>} /></LayoutAnimationConfig>
+    </Link> : <UnavailableNewBot reason={shared ? shared.readOnlyNotice || shared.writeNotice || '正在同步，连接完成后才能新建。' : `${offlineCopy.title(workspace.connection.entry)}，连接后才能新建。`} />} /></View>}
+    ListFooterComponent={<><View className="mt-4 flex-row items-center px-3"><Text role="heading" className="flex-1 text-sm font-medium text-muted">频道</Text><Link href="/channels" replace={replace} asChild><Button variant="ghost" iconOnly accessibilityLabel="管理频道"><Icon as={Plus} className="text-muted" /></Button></Link></View>
+      {(shared?.workspaceState?.channels ?? []).map((channel) => <Link key={channel.channel_id} href={`/channel/${channel.channel_id}`} replace={replace} asChild><Pressable accessibilityRole="link" accessibilityState={{ selected: active(`/channel/${channel.channel_id}`) }} className={cn('min-h-14 flex-row items-center gap-3 rounded-control px-3 py-3 active:bg-surface-muted', active(`/channel/${channel.channel_id}`) && 'bg-surface-muted')}><Icon as={MessagesSquare} className="text-muted" /><Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{channel.title}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Pressable></Link>)}
+      {!shared?.workspaceState?.channels.length ? <Link href="/channels" replace={replace} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-panel px-3 py-2 active:bg-surface-muted"><Icon as={MessagesSquare} className="text-muted" /><Text className="text-sm text-muted">查看频道</Text></Pressable></Link> : null}<NotifyTip /></>} /></LayoutAnimationConfig>
 }
 
 /** 新 Bot in a header. While a bot cannot be made it stays tappable and says why, instead of greying out without a word. */
@@ -114,6 +113,10 @@ export function NewBotButton({ className }: { className?: string }) {
   const reason = shared ? shared.readOnlyNotice || shared.writeNotice || '稍等，正在同步' : `${offlineCopy.title(connection.entry)}，连上后才能新建`
   return <Button variant="ghost" iconOnly className={cn('opacity-50', className)} accessibilityLabel="新 Bot" accessibilityState={{ disabled: true }} accessibilityHint={reason}
     onPress={() => Alert.alert('暂时不能新建 Bot', reason)}><Icon as={Plus} /></Button>
+}
+
+function UnavailableNewBot({ reason }: { reason: string }) {
+  return <View className="items-center gap-2 px-6"><Text className="text-center text-sm text-muted">{reason}</Text><Button variant="secondary" className="min-h-11" onPress={() => Alert.alert('暂时不能新建 Bot', reason)}><Icon as={Plus} /><Text>查看原因</Text></Button></View>
 }
 
 const tipClosed = 'notify-tip-closed'
@@ -154,11 +157,11 @@ function Row({ href, replace, active, avatar, name, mark, label, preview, unread
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">
-          <View className="min-w-0 flex-1 flex-row items-center gap-1.5"><Text numberOfLines={1} className={cn('shrink', unread ? 'font-medium' : 'font-medium')}>{name}</Text>{mark}</View>
-          {time ? <Text maxFontSizeMultiplier={1.4} className={cn('text-sm', unread ? 'text-accent' : 'text-muted')} style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
+          <View className="min-w-0 flex-1 flex-row items-center gap-1.5"><Text numberOfLines={2} className="min-w-0 shrink font-medium">{name}</Text>{mark}</View>
+          {time ? <Text className={cn('text-sm', unread ? 'text-accent' : 'text-muted')} style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">
-          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-sm', unread ? 'text-foreground' : 'text-muted')}>{preview}</Text>
+          <Text numberOfLines={2} className={cn('min-w-0 flex-1 text-sm', unread ? 'text-foreground' : 'text-muted')}>{preview}</Text>
           <Badge count={unread} />
         </View>
       </View>
