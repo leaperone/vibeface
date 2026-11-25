@@ -64,7 +64,7 @@ function SettingsPage() {
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
-    {principal?.can_manage ? <SecurityStatus open={Boolean(device.directory?.pending || device.review?.kind === 'recovery' || device.recovered)}>
+    {principal?.can_manage ? <SecurityStatus>
       {device.review?.kind === 'recovery' || device.recovered ? null : <><CurrentRecoveryFile /><PhoneRecovery /><RecoveryControls /></>}
     </SecurityStatus> : null}
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : null : null}
@@ -134,28 +134,25 @@ function SettingsPage() {
  * 安全 in one group: how many devices can manage, whether a recovery waits (also after 是我 hid its reminder), then the
  * recovery file and password; `children` holds those controls.
  */
-function SecurityStatus({ children, open }: { children: ReactNode; open?: boolean }) {
+function SecurityStatus({ children }: { children: ReactNode }) {
   const { directory, nodeClockOffset } = useDevice()
   const managers = directory?.members.filter((member) => member.manage).length ?? 0
   const pending = directory?.pending
   const link = 'interactive-row block'
-  const summary = pending ? <span className="text-danger">需要处理</span> : directory ? <span className="tabular-nums">{securityCopy.managerCount(managers)}</span> : undefined
-  return <SettingsGroup>
-    <SettingsDisclosure icon={pending ? ShieldAlert : ShieldCheck} label={securityCopy.title} value={summary} open={open}>
-      {directory ? <><Link to="/devices" className={link}>
-        <SettingsRow icon={terms.admin.icon} label={securityCopy.managers}>
-          <span className={cn('inline-flex items-center gap-1 tabular-nums', managers === 1 && 'text-warning')}>{managers === 1 ? <TriangleAlert aria-hidden="true" className="size-4" /> : null}{securityCopy.managerCount(managers)}</span>
-          <ChevronRight aria-hidden="true" className="size-4" />
-        </SettingsRow>
-      </Link>
-      {pending ? <Link to="/tasks" className={link}>
-        <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
-          <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
-          <ChevronRight aria-hidden="true" className="size-4" />
-        </SettingsRow>
-      </Link> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}>{securityCopy.noRecovery}</SettingsRow>}</> : null}
-      {children}
-    </SettingsDisclosure>
+  return <SettingsGroup title={securityCopy.title}>
+    {directory ? <><Link to="/devices" className={link}>
+      <SettingsRow icon={terms.admin.icon} label={securityCopy.managers}>
+        <span className={cn('inline-flex items-center gap-1 tabular-nums', managers === 1 && 'text-warning')}>{managers === 1 ? <TriangleAlert aria-hidden="true" className="size-4" /> : null}{securityCopy.managerCount(managers)}</span>
+        <ChevronRight aria-hidden="true" className="size-4" />
+      </SettingsRow>
+    </Link>
+    {pending ? <Link to="/tasks" className={link}>
+      <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
+        <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
+        <ChevronRight aria-hidden="true" className="size-4" />
+      </SettingsRow>
+    </Link> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}>{securityCopy.noRecovery}</SettingsRow>}</> : null}
+    {children}
   </SettingsGroup>
 }
 
