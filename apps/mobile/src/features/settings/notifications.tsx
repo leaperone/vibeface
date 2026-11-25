@@ -40,8 +40,8 @@ export function NotificationSettings() {
   }
   const disabled = busy !== null || !ready || !networkId
   return <>
-    <SettingsRow icon={BellRing} label="接收此网络的提醒" description={shared?.notificationButton.state === 'denied' ? '系统权限未开启，请前往系统设置。' : 'Bot 回复和需要你决定的事项。'}>
-      <Switch accessibilityLabel="接收此网络的提醒" value={settings.enabled} disabled={disabled} onValueChange={(enabled) => void run('notifications', () => save({ ...settings, enabled }))} />
+    <SettingsRow icon={BellRing} label="后台系统通知" description={shared?.notificationButton.state === 'denied' ? '系统权限未开启，请前往系统设置。' : '使用应用时只显示应用内横幅。'}>
+      <Switch accessibilityLabel="后台系统通知" value={settings.enabled} disabled={disabled} onValueChange={(enabled) => void run('notifications', () => save({ ...settings, enabled }))} />
     </SettingsRow>
     <SettingsRow icon={Volume2} label="提醒声音"><Switch accessibilityLabel="提醒声音" value={settings.sound} disabled={disabled} onValueChange={(sound) => void run('notification-sound', () => save({ ...settings, sound }))} /></SettingsRow>
     <SettingsRow icon={CircleDot} label="应用未读角标"><Switch accessibilityLabel="应用未读角标" value={settings.badge} disabled={disabled} onValueChange={(badge) => void run('notification-badge', () => save({ ...settings, badge }))} /></SettingsRow>
