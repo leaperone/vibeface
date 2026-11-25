@@ -137,7 +137,7 @@ export function TaskDetail({ botId, workId, from, focus }: { botId: string; work
   const cause = work ? workFailure(work) : ""
   const result = failed ? cause || "这个任务没有成功。" : work?.result_text || cause
   // It may have done its writes anyway, so it is checked first; running it again could do them twice.
-  const unknown = Boolean(work && (state === "dispatch_unverified" || outcomeUnknown(work.failure, work.failure_reason)))
+  const unknown = Boolean(work && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || outcomeUnknown(work.failure, work.failure_reason)))
   const next = followUp(state ?? "", unknown)
   const taskTarget = work?.target?.kind === 'task' || work?.target?.kind === 'channel_task' ? work.target : null
   const followUpLabel = unknown ? followUpCopy[next].action : taskTarget ? '继续所属任务' : state === 'interrupted' ? '新任务继续' : '新任务重做'
