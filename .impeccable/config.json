@@ -40,5 +40,6 @@
         "reason": "Agent: black is an alpha-mask stop for truncated code, not a painted UI color or palette addition."
       }
     ]
-  }
+  },
+  "buildPath": "code"
 }
