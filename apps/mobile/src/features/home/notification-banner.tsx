@@ -1,7 +1,8 @@
 import { useGlobalSearchParams, usePathname } from 'expo-router'
 import { X } from 'lucide-react-native'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { AccessibilityInfo, AppState, Pressable, View } from 'react-native'
+import { AccessibilityInfo, AppState, Platform, Pressable, View } from 'react-native'
+import { FullWindowOverlay } from 'react-native-screens'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { notificationPreferences, notificationPreview, watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import type { NotificationRecord } from '@vibeface/client/workspace/types.ts'
@@ -20,12 +21,14 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
   const { routine } = useGlobalSearchParams<{ routine?: string }>()
   const insets = useSafeAreaInsets()
   const previous = useRef<Set<string> | null>(null)
+  const [resume, resumed] = useState(0)
   const [item, setItem] = useState<NotificationRecord | null>(null)
   const [preferenceRevision, refreshPreferences] = useState(0)
   useEffect(() => watchNotificationPreferences(networkId, () => refreshPreferences(n => n + 1)), [networkId])
   useEffect(() => {
     const subscription = AppState.addEventListener('change', state => {
-      if (state !== 'active') setItem(null)
+      if (state === 'active') resumed(n => n + 1)
+      else setItem(null)
     })
     return () => subscription.remove()
   }, [])
@@ -35,12 +38,12 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
   const eligible = (notice: NotificationRecord) => !shared?.ignoredNotifications.has(notice.notification_id) && !muted.includes(notice.conversation_id)
     && !notificationOnScreen(notice, path, routine, bot(notice)?.bot_id)
   useEffect(() => {
-    if (!shared?.synced || !shared.isCurrent() || !notifications) return
+    if (!shared?.synced || !shared.isCurrent() || !notifications || AppState.currentState === 'inactive') return
     const next = AppState.currentState === 'active' ? latestBanner(previous.current, notifications, eligible) : null
     previous.current = new Set(notifications.map(notice => notice.notification_id))
     if (next) setItem(next)
     else setItem(current => current && notifications.some(n => n.notification_id === current.notification_id) && eligible(current) ? current : null)
-  }, [notifications, shared?.synced, shared?.ignoredNotifications, shared?.bots, path, routine, muted])
+  }, [notifications, shared?.synced, shared?.ignoredNotifications, shared?.bots, path, routine, muted, resume])
   const title = item ? bot(item)?.name || 'Bot' : ''
   const preview = item ? item.text.trim().slice(0, 180) || notificationPreview(item) : ''
   useEffect(() => {
@@ -50,7 +53,7 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
     return () => clearTimeout(timeout)
   }, [item, title, preview])
   if (!item || !shared?.isCurrent() || !eligible(item)) return null
-  return <View pointerEvents="box-none" className="absolute items-center px-3" style={{ top: insets.top + 4, left: insets.left, right: insets.right }}>
+  const banner = <View pointerEvents="box-none" className="absolute items-center px-3" style={{ top: insets.top + 4, left: insets.left, right: insets.right }}>
     <ToastNotice>
       <Pressable accessibilityRole="button" accessibilityLabel={title + '，' + preview} accessibilityHint="打开对话" className="min-h-12 min-w-0 flex-1 justify-center" onPress={() => {
         setItem(null)
@@ -62,4 +65,5 @@ export function NotificationBanner({ networkId }: { networkId: string }) {
       <Button variant="ghost" iconOnly accessibilityLabel="关闭提醒" onPress={() => setItem(null)}><Icon as={X} className="size-4 text-muted" /></Button>
     </ToastNotice>
   </View>
+  return Platform.OS === 'ios' ? <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>{banner}</FullWindowOverlay> : banner
 }
