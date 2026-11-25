@@ -7034,17 +7034,16 @@ test('Web input actions send explicit intents and keep a selected work after it 
   const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, sendMessage: async (_text: string, _files: unknown, _sent: unknown, options: InputOptions) => { sends.push(options); return true } }
   shared.data!.works = [parityWork()]
   const app = conversationHarness(() => shared)
-  const options = () => {
-    const children = workspaceModel.record(workspaceModel.record(app.composer()?.target).props).children
-    assert.ok(Array.isArray(children))
-    const menu = children.find((child) => workspaceModel.record(child).type === 'DropdownMenu')
-    const items = workspaceModel.record(workspaceModel.record(menu).props).items
-    assert.ok(Array.isArray(items)); return items.map(workspaceModel.record)
-  }
-  const choose = (label: string) => { const callback = options().find((option) => option.label === label)?.onSelect; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
+  const options = () => app.render().filter(({ type, props }) => type === 'Button' && typeof props['aria-pressed'] === 'boolean')
+  const choose = (label: string) => { const callback = options().find((option) => componentText(option.props.children) === label)?.props.onClick; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
   const change = (text: string) => { const action = app.composer()?.onChange; assert.ok(typeof action === 'function'); action(text) }
   const submit = () => { const action = app.composer()?.onSubmit; assert.ok(typeof action === 'function'); action() }
   try {
+    assert.match(componentText(app.composer()?.target), /发送给 · 项目 Bot · 主聊天/)
+    assert.equal(app.composer()?.label, '发送给 项目 Bot · 主聊天')
+    const groups = app.render().filter(({ type, props }) => type === 'section' && ['发送方式', '进行中的工作'].includes(String(props['aria-label'])))
+    assert.equal(groups.length, 2, 'input intent and active works are separate named groups')
+    assert.ok(app.render().some(({ type, props }) => type === 'div' && typeof props.className === 'string' && props.className.includes('max-h-60') && props.className.includes('overflow-y-auto')), 'the active-work list has its own scroll boundary')
     for (const intent of ['defer', 'new_task'] as const) {
       change('不带特殊前缀的交代')
       choose(intent === 'defer' ? '稍后处理' : '另开一件')
@@ -7053,11 +7052,15 @@ test('Web input actions send explicit intents and keep a selected work after it 
       assert.equal(sends.at(-1)?.conversation_id, 'chat')
     }
     choose('补充：核对项目')
+    assert.equal(app.composer()?.sendLabel, '补充当前工作')
+    assert.match(componentText(app.composer()?.target), /补充给 · 核对项目/)
+    shared.data!.works = [parityWork({ state: 'unverified', outcome: 'unverified' })]
+    assert.match(componentText(app.composer()?.children), /先处理动态中的确认/)
     shared.data!.works = [parityWork({ state: 'finished', outcome: 'completed' })]
     change('原工作的新说明')
     submit(); await settleComponent()
     assert.deepEqual(JSON.parse(JSON.stringify(sends.at(-1)?.target)), { kind: 'work', work_id: 'work' })
-    const stale = options().find((option) => option.label === '稍后处理')?.onSelect
+    const stale = options().find((option) => componentText(option.props.children) === '稍后处理')?.props.onClick
     shared.generation++
     app.composer()
     if (typeof stale === 'function') stale()
@@ -7298,8 +7301,7 @@ test('leaving routine view clears its route and preserves the next Web send draf
       assert.ok(app.render().some(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord'))
       const change = composer()?.onChange, attach = composer()?.onFiles; assert.ok(typeof change === 'function' && typeof attach === 'function')
       change('切回后保留的草稿'); const files = [{ name: 'draft.txt', arrayBuffer: async () => new Uint8Array([1, 2]).buffer }]; attach(files)
-      if (action === '改回主聊天') { const click = app.render().find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onClick; assert.ok(typeof click === 'function'); click() }
-      else { const menu = app.render().find(({ type }) => type === 'DropdownMenu'); const items = workspaceModel.record(menu?.props).items; assert.ok(Array.isArray(items)); const choice = items.map(workspaceModel.record).find((item) => item.label === action)?.onSelect; assert.ok(typeof choice === 'function'); choice() }
+      const click = app.render().find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onClick; assert.ok(typeof click === 'function'); click()
       await settleComponent(); const elements = app.render()
       assert.deepEqual(search, {})
       assert.equal(elements.some(({ type }) => typeof type === 'function' && type.name === 'RoutineRecord'), false)

@@ -27,9 +27,9 @@ import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { InputIntent,InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
-import { DropdownMenu } from '@vibeface/uiarc/dropdown-menu/dropdown-menu.tsx'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
-import { ArrowDown,ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
+import { Popover,PopoverClose,PopoverContent,PopoverTrigger } from '@vibeface/uiarc/popover/popover.tsx'
+import { ArrowDown,ArrowRightLeft,Bot,ChevronDown,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
 import { useEffect,useMemo,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
@@ -94,8 +94,9 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : selectedTarget.startsWith('work:') ? { kind: 'work', work_id: selectedTarget.slice(5) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
   const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : inputTarget?.kind === 'work' ? Boolean(data?.works.some((work) => work.work_id === inputTarget.work_id && taskActive(work.state))) : botBusy
   const currentInput = data?.messages.find((message) => activeJobs.some((job) => job.message_id === message.message_id))
-  const targetLabel = inputTarget?.kind === 'routine' ? scheduleName(inputTarget.trigger, data?.bot_settings, data?.changes) : inputTarget?.kind === 'work' ? data?.works.find((work) => work.work_id === inputTarget.work_id)?.title || '原工作' : currentInput?.text.slice(0, 48) || `${bot?.name ?? 'Bot'} · 主聊天`
   const intent = selectedIntent ?? promptIntent(text)
+  const targetLabel = inputTarget?.kind === 'routine' ? `例行任务 · ${scheduleName(inputTarget.trigger, data?.bot_settings, data?.changes)}` : inputTarget?.kind === 'work' ? data?.works.find((work) => work.work_id === inputTarget.work_id)?.title || '原工作' : intent === 'continue' && currentInput?.text ? `当前工作 · ${currentInput.text.slice(0, 48)}` : `${bot?.name ?? 'Bot'} · 主聊天`
+  const targetAction = intent === 'continue' && targetBusy ? '补充给' : '发送给'
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
@@ -114,6 +115,11 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     return { id: work.work_id, state, attention, device: work.target_node, work }
   })
   const runningTasks = tasks.filter((task) => workspace.connectionOnline && !task.attention && !(task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)) && (taskActive(task.state) || task.state === 'awaiting_children')).length
+  const selectedWork = inputTarget?.kind === 'work' ? tasks.find((task) => task.id === inputTarget.work_id) : undefined
+  const composerRisk = selectedWork?.state === 'awaiting_confirmation' ? '这个工作需要先处理动态中的确认。'
+    : selectedWork && ['unknown', 'unverified', 'dispatch_unverified'].includes(selectedWork.state) ? '这个工作结果尚未确认，先查结果再继续。'
+    : ''
+  const activeWorks = works.filter((work) => taskActive(work.state))
 
   const changes = data?.changes ?? emptyList
   const placedChanges = useMemo(() => placeChanges(data?.messages ?? [], changes), [data?.messages, changes])
@@ -199,7 +205,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     </>}>{lastUnanswered ? <p className="line-clamp-2 text-secondary">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
     remote && ownerUnknown ? <ActionCard key="owner-unknown" icon={Unplug} title={`${nodeName(remote.owner, lookup)} 连不上，回复情况未知`} /> : null,
-    ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>} />),
+    ...reconciling.map((job) => <ActionCard key={`reconcile:${job.trigger}`} icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>}><p className="text-secondary">可能已经执行过，先核对结果，再决定是否重试。</p></ActionCard>),
     ...pendingMessages.filter(undecided).map(inputStatus),
   ].filter(Boolean)
   // Waiting tasks surface as question cards and confirming ones as ConfirmCards; the rest are counted here. The owner-unknown card has no action.
@@ -264,7 +270,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} attention={attention} open={activityOpen} onOpenChange={setActivityOpen} onOpen={openActivity} from={activityFrom}
     before={<>
-      {cards.length || requery ? <ActivitySection title="要处理">{cards}{requery && !reconciling.length ? <ActionButton variant="ghost" className="justify-self-start" disabled={!workspace.connectionOnline} action={() => workspace.refresh()}>再查一次</ActionButton> : null}</ActivitySection> : null}
+      {cards.length || requery ? <ActivitySection title="要处理">{cards}{requery && !reconciling.length ? <div className="grid gap-2"><p className="text-sm text-secondary">结果尚未确认，可能已经执行过。先核对结果，再决定是否重试。</p><ActionButton variant="ghost" className="justify-self-start" disabled={!workspace.connectionOnline} action={() => workspace.refresh()}>再查一次</ActionButton></div> : null}</ActivitySection> : null}
       {sending.length ? <ActivitySection title="发送中">{sending.map(inputStatus)}</ActivitySection> : null}
       {inputTarget ? <InputQueue target={inputTarget} /> : null}
     </>}
@@ -327,8 +333,27 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         hint={notice}
         reason={reason}
         disabled={sendDisabled}
+        label={`${targetAction} ${targetLabel}`}
         sendLabel={inputIntentLabel(intent, targetBusy)}
-        target={<div className="flex min-w-0 flex-wrap items-center gap-2"><span className="min-w-0 flex-1 truncate text-sm text-secondary">{targetLabel}</span><DropdownMenu label={inputIntentLabel(intent, targetBusy)} items={[...inputIntents.map((item) => ({ label: item.label, onSelect: () => chooseInput(selectedTarget, item.intent) })), ...works.filter((work) => taskActive(work.state)).map((work) => ({ label: `补充：${work.title || '工作'}`, onSelect: () => chooseInput(`work:${work.work_id}`, 'continue') })), ...(selectedTarget !== 'main' ? [{ label: '回到主聊天', onSelect: () => chooseInput('main', null) }] : [])]} /></div>}
+        target={<div className="flex w-full min-w-0 flex-wrap items-center gap-2">
+          <span className="min-w-0 flex-1 truncate text-sm text-secondary" title={`${targetAction} ${targetLabel}`}>{targetAction} · {targetLabel}</span>
+          <Popover>
+            <PopoverTrigger asChild><Button type="button" variant="secondary" size="sm">发送方式与目标<ChevronDown aria-hidden="true" className="size-4" /></Button></PopoverTrigger>
+            <PopoverContent align="end" className="grid max-h-(--radix-popover-content-available-height) gap-4 overflow-y-auto">
+              <section aria-label="发送方式" className="grid gap-1">
+                <h3 className="px-3 text-sm text-secondary">发送方式</h3>
+                {inputIntents.map((item) => <PopoverClose key={item.intent} asChild><Button type="button" variant={intent === item.intent ? 'secondary' : 'ghost'} size="sm" className="justify-start" aria-pressed={intent === item.intent} onClick={() => chooseInput(selectedTarget, item.intent)}>{item.label}</Button></PopoverClose>)}
+              </section>
+              {activeWorks.length ? <section aria-label="进行中的工作" className="grid min-h-0 gap-1">
+                <h3 className="px-3 text-sm text-secondary">进行中的工作 · {activeWorks.length}</h3>
+                <div className="grid max-h-60 gap-1 overflow-y-auto">
+                  {activeWorks.map((work) => <PopoverClose key={work.work_id} asChild><Button type="button" variant={selectedTarget === `work:${work.work_id}` ? 'secondary' : 'ghost'} size="sm" className="h-auto! min-w-0 justify-start py-2! [&_span]:min-w-0 [&_span]:max-w-full" aria-pressed={selectedTarget === `work:${work.work_id}`} title={work.title || '工作'} onClick={() => chooseInput(`work:${work.work_id}`, 'continue')}><span className="line-clamp-2 whitespace-normal! text-start">补充：{work.title || '工作'}</span></Button></PopoverClose>)}
+                </div>
+              </section> : null}
+              {selectedTarget !== 'main' ? <PopoverClose asChild><Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main', null)}>回到主聊天</Button></PopoverClose> : null}
+            </PopoverContent>
+          </Popover>
+        </div>}
         onStop={workspace.writable && (inputTarget.kind === 'bot_main' ? stopJob : targetBusy) ? () => { setSendError(null); workspace.stopInputTarget({ target: inputTarget }).catch(setSendError) } : undefined}
         onChange={setText}
         files={files}
@@ -344,7 +369,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {inputTarget.kind === 'routine' ? <p className="flex basis-full items-center gap-2"><span className="min-w-0 flex-1 truncate">{targetBusy ? '补充给' : '发送给'} · 例行任务 · {scheduleName(inputTarget.trigger, data?.bot_settings, changes)}</span><Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main', null)}>改回主聊天</Button></p> : null}
+        {composerRisk ? <p className="basis-full text-warning">{composerRisk}</p> : null}
+        {inputTarget.kind === 'routine' ? <Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main', null)}>改回主聊天</Button> : null}
         {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
