@@ -164,18 +164,18 @@ function TaskRow({ work, projected, waiting, bot, lookup, connected, progress }:
     {bot ? <BotFace bot={bot} mood="idle" size={28} still /> : <View className="size-8 items-center justify-center"><Icon as={Bot} className="text-muted" /></View>}
     <View className="min-w-0 flex-1 gap-0.5">
       <View className="flex-row items-center gap-2">
-        <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{title}</Text>
+        <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{title}</Text>
         <View className="flex-row items-center gap-1">
           <Icon as={icon} className={cn('size-3.5', failed ? 'text-danger' : unknown ? 'text-warning' : active ? 'text-foreground' : 'text-muted')} />
           <Text numberOfLines={1} className={cn('text-sm', failed ? 'text-danger' : unknown ? 'text-warning' : 'text-muted')}>{state}</Text>
         </View>
       </View>
       <View className="flex-row flex-wrap items-center gap-x-1.5 gap-y-0.5">
-        <Text numberOfLines={1} className="max-w-[45%] shrink text-sm text-muted">{bot ? bot.name : '已删除的 Bot'}</Text>
+        <Text numberOfLines={2} className="max-w-[45%] shrink text-sm text-muted">{bot ? bot.name : '已删除的 Bot'}</Text>
         {agent ? <><Text className="text-sm text-muted">·</Text><Icon as={providerIcons[agent]} className="size-3.5 text-muted" /><Text className="text-sm text-muted">{providerNames[agent]}</Text></> : null}
         <Text className="text-sm text-muted">·</Text><Icon as={Laptop} className="size-3.5 text-muted" /><Text numberOfLines={1} className="shrink text-sm text-muted">{device}</Text>
       </View>
-      {line ? <Text numberOfLines={1} className={cn('text-sm', failed ? 'text-danger' : 'text-muted')}>{line}</Text> : null}
+      {line ? <Text numberOfLines={2} className={cn('text-sm', failed ? 'text-danger' : 'text-muted')}>{line}</Text> : null}
     </View>
     {href ? <Icon as={ChevronRight} className="size-4 text-muted" /> : null}
   </>
