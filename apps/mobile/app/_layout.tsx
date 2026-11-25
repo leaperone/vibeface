@@ -127,7 +127,7 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
-        {tabbed ? <NavigationTabs bottom={insets.bottom} items={tabs.map(([href, label, icon]) => ({
+        {tabbed ? <NavigationTabs bottom={insets.bottom} left={insets.left} right={insets.right} items={tabs.map(([href, label, icon]) => ({
           href: { pathname: href, params: { tab: '1' } }, label, icon, selected: pathname === href,
           accessibilityLabel: href === '/tasks' && waiting ? `${label}，${waiting} 件事等你决定` : label,
           notice: href === '/tasks' ? <Badge count={waiting} /> : undefined,

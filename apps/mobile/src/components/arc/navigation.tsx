@@ -8,8 +8,8 @@ import { cn } from '@/lib/utils'
 
 type NavigationItem = { href: Href; label: string; icon: LucideIcon; selected: boolean; notice?: ReactNode; accessibilityLabel?: string }
 /** Native route tabs port Arc tabs' quiet rail and selected accent treatment. */
-export function NavigationTabs({ items, bottom }: { items: NavigationItem[]; bottom: number }) {
-  return <View accessibilityRole="tabbar" className="flex-row gap-1 border-t border-border bg-surface px-3 pt-2" style={{ paddingBottom: bottom }}>
+export function NavigationTabs({ items, bottom, left = 0, right = 0 }: { items: NavigationItem[]; bottom: number; left?: number; right?: number }) {
+  return <View accessibilityRole="tabbar" className="flex-row gap-1 border-t border-border bg-surface pt-2" style={{ paddingBottom: bottom, paddingLeft: Math.max(12, left), paddingRight: Math.max(12, right) }}>
     {items.map((item) => <Link key={item.label} href={item.href} replace asChild>
       <Pressable role="button" accessibilityLabel={item.accessibilityLabel ?? item.label} accessibilityState={{ selected: item.selected }} className="min-h-14 flex-1 items-center justify-center gap-1 rounded-control py-2 active:bg-surface-muted">
         <View className={cn('flex-row items-center gap-1', item.selected && 'border-b-2 border-accent pb-1')}>
