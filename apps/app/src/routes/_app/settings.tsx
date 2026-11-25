@@ -1,4 +1,4 @@
-import { BusyIcon,CountBadge,Segmented,SegmentedValue,SettingsGroup,SettingsRow } from '@/components/arc/product-kit'
+import { BusyIcon,CountBadge,Segmented,SegmentedValue,SettingsDisclosure,SettingsGroup,SettingsRow } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
 import { useOpenJoins } from '@/features/devices/join'
 import { TriageSettings } from '@/features/devices/triage-settings'
@@ -64,7 +64,7 @@ function SettingsPage() {
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
-    {principal?.can_manage ? <SecurityStatus>
+    {principal?.can_manage ? <SecurityStatus open={Boolean(device.directory?.pending || device.review?.kind === 'recovery' || device.recovered)}>
       {device.review?.kind === 'recovery' || device.recovered ? null : <><CurrentRecoveryFile /><PhoneRecovery /><RecoveryControls /></>}
     </SecurityStatus> : null}
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : null : null}
@@ -76,27 +76,29 @@ function SettingsPage() {
         <SettingsRow icon={LifeBuoy} label="连接与恢复排查" description="连不上设备或结果未确认时，按当前状态排查"><ArrowUpRight aria-hidden="true" className="size-4" /><span className="sr-only">在新标签页打开</span></SettingsRow>
       </a>
     </SettingsGroup>
-    <SettingsGroup title="高级">
-      <ConnectionSettings />
-      <Link to="/settings/lab" className="interactive-row block">
-        <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
-      </Link>
-    </SettingsGroup>
-    <SettingsGroup title="问题排查" footer={operator ? "诊断包不含登录信息和加入链接" : undefined}>
-      <ReportProblem />
-      {operator ? <><Link to="/settings/logs" className="interactive-row block">
-        <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
-      </Link>
-      <SettingsRow icon={Download} label="诊断包">
-        <span className="flex">
-          <Select label="诊断包的时间范围" className="focus-within:z-10" value={"arc:" + String(range)} onValueChange={selected => { const value = selected.slice(4);  setRange(Number(value))  }} options={ranges.map(([value, label]) => ({ value: "arc:" + String(value), label: label }))} />
-          <Button type="button" size="sm" variant="secondary" className="relative -ms-px focus-visible:z-10" disabled={exported === 'busy'} onClick={() => {
-            setExported('busy')
-            void workspace.run(async () => { saveDiagnostics(await workspace.diagnostics(Date.now() - range)); setExported('done') }, "导出诊断包")
-              .finally(() => setExported((state) => state === 'busy' ? 'idle' : state))
-          }}>{exported === 'done' ? <><Check aria-hidden="true" className="text-success" /><span role="status">已导出</span></> : <><BusyIcon busy={exported === 'busy'} />导出</>}</Button>
-        </span>
-      </SettingsRow></> : null}
+    <SettingsGroup title="更多设置" footer={operator ? "诊断包不含登录信息和加入链接" : undefined}>
+      <SettingsDisclosure icon={FlaskConical} label="高级" value="连接与实验功能">
+        <ConnectionSettings />
+        <Link to="/settings/lab" className="interactive-row block">
+          <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
+        </Link>
+      </SettingsDisclosure>
+      <SettingsDisclosure icon={LifeBuoy} label="问题排查" value={operator ? "日志和诊断" : "报告问题"}>
+        <ReportProblem />
+        {operator ? <><Link to="/settings/logs" className="interactive-row block">
+          <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
+        </Link>
+        <SettingsRow icon={Download} label="诊断包">
+          <span className="flex">
+            <Select label="诊断包的时间范围" className="focus-within:z-10" value={"arc:" + String(range)} onValueChange={selected => { const value = selected.slice(4);  setRange(Number(value))  }} options={ranges.map(([value, label]) => ({ value: "arc:" + String(value), label: label }))} />
+            <Button type="button" size="sm" variant="secondary" className="relative -ms-px focus-visible:z-10" disabled={exported === 'busy'} onClick={() => {
+              setExported('busy')
+              void workspace.run(async () => { saveDiagnostics(await workspace.diagnostics(Date.now() - range)); setExported('done') }, "导出诊断包")
+                .finally(() => setExported((state) => state === 'busy' ? 'idle' : state))
+            }}>{exported === 'done' ? <><Check aria-hidden="true" className="text-success" /><span role="status">已导出</span></> : <><BusyIcon busy={exported === 'busy'} />导出</>}</Button>
+          </span>
+        </SettingsRow></> : null}
+      </SettingsDisclosure>
     </SettingsGroup>
     <SettingsGroup>
       <SettingsRow ref={leaveTrigger} icon={LogOut} tone="danger" label="断开这个浏览器" onClick={() => setLeaving(true)} />
@@ -132,25 +134,28 @@ function SettingsPage() {
  * 安全 in one group: how many devices can manage, whether a recovery waits (also after 是我 hid its reminder), then the
  * recovery file and password; `children` holds those controls.
  */
-function SecurityStatus({ children }: { children: ReactNode }) {
+function SecurityStatus({ children, open }: { children: ReactNode; open?: boolean }) {
   const { directory, nodeClockOffset } = useDevice()
   const managers = directory?.members.filter((member) => member.manage).length ?? 0
   const pending = directory?.pending
   const link = 'interactive-row block'
-  return <SettingsGroup title={securityCopy.title}>
-    {directory ? <><Link to="/devices" className={link}>
-      <SettingsRow icon={terms.admin.icon} label={securityCopy.managers}>
-        <span className={cn('inline-flex items-center gap-1 tabular-nums', managers === 1 && 'text-warning')}>{managers === 1 ? <TriangleAlert aria-hidden="true" className="size-4" /> : null}{securityCopy.managerCount(managers)}</span>
-        <ChevronRight aria-hidden="true" className="size-4" />
-      </SettingsRow>
-    </Link>
-    {pending ? <Link to="/tasks" className={link}>
-      <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
-        <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
-        <ChevronRight aria-hidden="true" className="size-4" />
-      </SettingsRow>
-    </Link> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}>{securityCopy.noRecovery}</SettingsRow>}</> : null}
-    {children}
+  const summary = pending ? <span className="text-danger">需要处理</span> : directory ? <span className="tabular-nums">{securityCopy.managerCount(managers)}</span> : undefined
+  return <SettingsGroup>
+    <SettingsDisclosure icon={pending ? ShieldAlert : ShieldCheck} label={securityCopy.title} value={summary} open={open}>
+      {directory ? <><Link to="/devices" className={link}>
+        <SettingsRow icon={terms.admin.icon} label={securityCopy.managers}>
+          <span className={cn('inline-flex items-center gap-1 tabular-nums', managers === 1 && 'text-warning')}>{managers === 1 ? <TriangleAlert aria-hidden="true" className="size-4" /> : null}{securityCopy.managerCount(managers)}</span>
+          <ChevronRight aria-hidden="true" className="size-4" />
+        </SettingsRow>
+      </Link>
+      {pending ? <Link to="/tasks" className={link}>
+        <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
+          <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
+          <ChevronRight aria-hidden="true" className="size-4" />
+        </SettingsRow>
+      </Link> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}>{securityCopy.noRecovery}</SettingsRow>}</> : null}
+      {children}
+    </SettingsDisclosure>
   </SettingsGroup>
 }
 

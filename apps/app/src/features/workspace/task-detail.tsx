@@ -20,7 +20,7 @@ import type { WorkDetail } from '@vibeface/client/workspace/types.ts'
 import { subagentToolLabels, subagentUsageLabel } from '@vibeface/client/workspace/labels.ts'
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
-import { Bot,ChevronLeft,Circle,CircleCheck,CircleDot,CircleQuestionMark,CircleStop,FolderOpen,Laptop,Link2,ListChecks,Play,RotateCw,SearchCheck,Settings,X } from "lucide-react"
+import { Bot,ChevronLeft,Circle,CircleAlert,CircleCheck,CircleDot,CircleQuestionMark,CircleStop,FolderOpen,Laptop,Link2,ListChecks,Play,RotateCw,SearchCheck,Settings,X } from "lucide-react"
 import { useEffect,useId,useRef,useState,useSyncExternalStore } from "react"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
@@ -172,6 +172,20 @@ export function TaskDetail({ botId, workId, from, focus }: { botId: string; work
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
       {progressHeadline ? <p className="line-clamp-2 break-words text-sm text-secondary">{stale ? '最近进展：' : ''}{progressHeadline}</p> : null}
+      {!check && (failed || unknown || state === "interrupted") ? <TaskAttentionSummary state={state} unknown={unknown} next={followUpLabel} /> : null}
+      {check ? <section className="grid gap-3 rounded-panel border border-warning-border bg-warning-subtle p-3">
+        <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
+        <dl className="grid gap-2 text-sm"><div><dt className="font-medium">发生了什么</dt><dd className="text-secondary">{confirmText(check, nodeName(device, lookup))}</dd></div><div><dt className="font-medium">影响</dt><dd className="text-secondary">可能已经做过改动，直接重试可能重复执行。</dd></div><div><dt className="font-medium">下一步</dt><dd className="text-secondary">先查结果，再决定要不要继续。</dd></div></dl>
+        {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
+        <ActionButton variant="primary" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={checkResult}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
+        <Details label="我已自行核对">
+          <p className="text-sm text-secondary">只记录你的核对结论，不会重新执行任务。</p>
+          <div className="flex flex-wrap justify-end gap-2">
+            <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
+            <ActionButton variant="primary" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
+          </div>
+        </Details>
+      </section> : null}
       {work.kind === 'task' ? <Details label="协调回合">
         {coordination ? <>
           <p>{!workspace.connectionOnline || workspace.nodes.find((node) => node.device_id === device)?.online === false ? '当前状态未知，显示最近记录' : schedulerStatus(coordination.state).label}{coordination.lane ? ` · ${agentLaneLabels[coordination.lane]}` : ''}</p>
@@ -189,19 +203,6 @@ export function TaskDetail({ botId, workId, from, focus }: { botId: string; work
       </section>)}</div></Details> : null}
       {asked.summary ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">交代的事</h3><p className="break-words">{asked.summary}</p></section> : null}
       {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">{failed || !work.result_text ? "原因" : "结果"}</h3>{!failed && work.result_text ? <Markdown text={result} /> : <p className={`whitespace-pre-wrap break-words ${failed ? "text-danger" : ""}`}>{result}</p>}</section> : null}
-      {check ? <section className="grid gap-3 rounded-panel border border-warning-border bg-warning-subtle p-3">
-        <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
-        <p className="text-sm text-secondary">{confirmText(check, nodeName(device, lookup))}</p>
-        {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
-        <ActionButton variant="primary" className="w-fit justify-self-end" disabled={!canAskCheck || action.busy !== null} action={checkResult}><SearchCheck aria-hidden="true" />先查结果</ActionButton>
-        <Details label="我已自行核对">
-          <p className="text-sm text-secondary">只记录你的核对结论，不会重新执行任务。</p>
-          <div className="flex flex-wrap justify-end gap-2">
-            <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
-            <ActionButton variant="primary" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
-          </div>
-        </Details>
-      </section> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-sm font-medium text-secondary">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
       {question || focusQuestion ? <div ref={questionRef} className="scroll-mt-4">{question ? <QuestionCard key={question.question_id} question={question} inTask /> : <p role="status" className="text-sm text-secondary">{!workspace.synced ? '最近记录尚未同步完，原问题状态待确认。' : '原问题已不在这个工作的待处理记录中。请查看这里的最新结果，旧提醒不会再次执行。'}</p>}</div> : null}
@@ -265,4 +266,16 @@ function SummarySteps({ steps: items }: { steps: SummaryStep[] }) {
     const step = steps[item.state]
     return <li key={`${item.state}:${index}`} className={cn("flex min-w-0 items-start gap-2", item.state === "pending" && "text-secondary")}><step.icon aria-hidden="true" className={cn("mt-0.5 size-4 shrink-0", step.className)} /><span className="sr-only">{step.label} </span><span className="break-words">{item.text}</span></li>
   })}</ol>
+}
+
+function TaskAttentionSummary({ state, unknown, next }: { state: string; unknown: boolean; next: string }) {
+  const interrupted = state === "interrupted"
+  const Icon = unknown ? CircleQuestionMark : interrupted ? CircleStop : CircleAlert
+  const title = unknown ? "结果需要确认" : interrupted ? "任务已中断" : "任务没有完成"
+  const happened = unknown ? "设备还没有确认这项任务的结果。" : interrupted ? "这项任务已经停止。" : state === "dispatch_rejected" ? "负责设备没有接下这项任务。" : "这项任务没有成功。"
+  const impact = unknown ? "可能已经做过改动，直接重试可能重复执行。" : interrupted ? "停止只影响后续执行，已经产生的内容不会自动撤回。" : "这次任务没有完成，已保存的记录仍会保留。"
+  return <section className={cn("grid gap-2 rounded-panel border p-3", unknown || interrupted ? "border-warning-border bg-warning-subtle" : "border-danger-border bg-danger-subtle")}>
+    <h3 className="flex items-center gap-2 font-medium"><Icon aria-hidden="true" className={cn("size-4 shrink-0", unknown || interrupted ? "text-warning" : "text-danger")} />{title}</h3>
+    <dl className="grid gap-2 text-sm"><div><dt className="font-medium">发生了什么</dt><dd className="text-secondary">{happened}</dd></div><div><dt className="font-medium">影响</dt><dd className="text-secondary">{impact}</dd></div><div><dt className="font-medium">下一步</dt><dd className="text-secondary">{unknown ? "先查结果，再决定要不要继续。" : next}</dd></div></dl>
+  </section>
 }
