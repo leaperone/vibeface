@@ -741,11 +741,26 @@ impl Runtime {
                 | "join_changed"
                 | "input_receipt"
                 | "scope_context"
+                | "health_problems"
+                | "read_logs"
+                | "read_health"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
+            "health_problems" | "read_logs" | "read_health"
+                if !self.schedules_primary_bot(network, origin).await? =>
+            {
+                bail!("only the Node that schedules the primary bot reads another Node's health")
+            }
+            "health_problems" => Ok(self.shared_problems()),
+            // A member Node's primary bot diagnosing this one; the logs are already redacted.
+            "read_logs" => {
+                let (dir, args) = (self.data_dir.clone(), input["args"].clone());
+                tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args)).await?
+            }
+            "read_health" => self.read_health().await,
             "work_evidence" => {
                 let conversation = field(input, "conversation_id")?;
                 let work_id = field(input, "work_id")?;

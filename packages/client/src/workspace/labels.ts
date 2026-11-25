@@ -183,6 +183,22 @@ export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | 
 export const shownState = (work: WorkCard, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? (work.state === "finished" ? "unknown" : work.state)
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
+// Callers ask for every work of one snapshot in turn, so its children are grouped once per works array.
+const childIndex = new WeakMap<readonly WorkCard[], ReadonlyMap<string, readonly WorkCard[]>>()
+function childrenOf(works: readonly WorkCard[]) {
+  let index = childIndex.get(works)
+  if (!index) {
+    const groups = new Map<string, WorkCard[]>()
+    for (const work of works) {
+      if (typeof work.parent !== "string") continue
+      const group = groups.get(work.parent)
+      if (group) group.push(work)
+      else groups.set(work.parent, [work])
+    }
+    childIndex.set(works, index = groups)
+  }
+  return index
+}
 /**
  * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
  * says so, so this reads only the works this device holds; a child not synced yet does not hold its parent.
@@ -190,9 +206,9 @@ export const taskActive = (state: string) => ["accepted", "running", "interrupti
 export function chatTaskState(work: WorkCard, works: readonly WorkCard[], nodes: NodeInfo[] = []): string {
   const state = shownState(work, nodes)
   if (state !== "completed") return state
-  const seen = new Set([work.work_id])
-  const open = (id: string): boolean => works.some((child) => {
-    if (child.parent !== id || seen.has(child.work_id)) return false
+  const seen = new Set([work.work_id]), children = childrenOf(works)
+  const open = (id: string): boolean => (children.get(id) ?? []).some((child) => {
+    if (seen.has(child.work_id)) return false
     seen.add(child.work_id)
     const shown = shownState(child, nodes)
     return taskActive(shown) || shown === "awaiting_confirmation" || open(child.work_id)

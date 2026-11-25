@@ -129,51 +129,52 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
 }
 
 #[test]
-fn an_empty_human_completion_still_leaves_a_reply() -> Result<()> {
-    let net = net()?;
-    let mut store = store(&net)?;
-    bot_conversation(&mut store, &net)?;
-    store.post_input_fixture(
-        &net.a,
-        &net.network,
-        signed_user(&net, "m1", "first", true)?,
-        2,
-    )?;
-    let claimed = store
-        .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
-        .context("job")?;
-    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-    let rejected = store.finish_job(
-        &net.a,
-        &net.network,
-        "c",
-        &claimed.job.trigger,
-        &attempt,
-        JobOutcome::NoChange,
-        "",
-        3,
-    );
-    assert!(
-        rejected
-            .expect_err("no-change must be limited to routines")
-            .to_string()
-            .contains("empty routine replies")
-    );
-    store.finish_job(
-        &net.a,
-        &net.network,
-        "c",
-        &claimed.job.trigger,
-        &attempt,
-        JobOutcome::Completed,
-        "",
-        3,
-    )?;
-    let reply = store
-        .message(&net.network, "c", &claimed.job.message_id)?
-        .context("reply")?;
-    assert_eq!(reply.status, Some(ReplyStatus::Completed));
-    assert_eq!(reply.text, "（没有回复内容）");
+fn human_completions_cannot_hide_a_reply_with_a_routine_signal() -> Result<()> {
+    for (text, outcome, status) in [
+        ("", JobOutcome::Completed, ReplyStatus::Completed),
+        (
+            crate::scheduling::ROUTINE_NO_CHANGE,
+            JobOutcome::NoChange,
+            ReplyStatus::Failed,
+        ),
+    ] {
+        let net = net()?;
+        let mut store = store(&net)?;
+        bot_conversation(&mut store, &net)?;
+        store.post_input_fixture(
+            &net.a,
+            &net.network,
+            signed_user(&net, "m1", "first", true)?,
+            2,
+        )?;
+        let claimed = store
+            .claim_next_fixture(&net.a, &net.network, "c", "boot-1", "cfg")?
+            .context("job")?;
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &claimed.job.trigger,
+            &attempt,
+            outcome,
+            text,
+            3,
+        )?;
+        let job = store
+            .scheduler_job("c", &claimed.job.trigger)?
+            .context("job")?;
+        assert!(matches!(
+            job.state,
+            JobState::Completed { .. } | JobState::Failed { .. }
+        ));
+        let reply = store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .context("reply")?;
+        assert_eq!(reply.status, Some(status));
+        assert!(!reply.text.trim().is_empty());
+        assert_ne!(reply.text, crate::scheduling::ROUTINE_NO_CHANGE);
+    }
     Ok(())
 }
 

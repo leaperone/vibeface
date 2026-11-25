@@ -422,26 +422,27 @@ pub(crate) fn work_is_main_from(
 pub(crate) fn notification_target_from(
     connection: &Connection,
     network: &str,
-    hash: &str,
+    event: &Event,
 ) -> Result<Option<InputTarget>> {
-    let Some(event) = log::event_from(connection, network, hash)? else {
-        return Ok(None);
-    };
-    match event.body {
+    match &event.body {
         EventBody::MessagePosted { message_id, .. } | EventBody::BotMessaged { message_id, .. } => {
             Ok(target_from(
                 connection,
                 network,
                 &event.scope_id,
-                Source::Message(message_id),
+                Source::Message(message_id.clone()),
             )?
             .target())
         }
-        EventBody::WorkFinished { work_id, .. } => {
-            Ok(target_from(connection, network, &event.scope_id, Source::Work(work_id))?.target())
-        }
+        EventBody::WorkFinished { work_id, .. } => Ok(target_from(
+            connection,
+            network,
+            &event.scope_id,
+            Source::Work(work_id.clone()),
+        )?
+        .target()),
         EventBody::QuestionAsked { .. } => {
-            question_event_input_target_from(connection, network, &event)
+            question_event_input_target_from(connection, network, event)
         }
         EventBody::SessionAttributed { .. } => {
             Ok(main_target_from(connection, network, &event.scope_id)?.target())

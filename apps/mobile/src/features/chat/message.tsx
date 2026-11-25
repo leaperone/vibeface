@@ -37,8 +37,8 @@ function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
  * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
- * `retry`: 重试 after this reply failed or was stopped. Memoised: history messages keep their identity while a reply
- * streams, so only the streaming one re-renders.
+ * `retry`: 重试 after this reply failed or was stopped. Memoised, and the chat passes callbacks that keep their identity:
+ * while a reply streams, a row re-renders only when its own message object, time or retry changes.
  */
 export const Message = memo(function Message({ message, bot, time: shown, offline, retry, attachmentScope, readAttachment, onCopy, onShare, onQuote }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown>; attachmentScope?: string; readAttachment?: ReadAttachment } & MessageActionsProps) {
   const user = message.role === 'user'
