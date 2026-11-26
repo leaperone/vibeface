@@ -161,7 +161,7 @@ export function BotPanelButton() {
           {request ? <SettingsGroup title="修改请求草稿"><div className="p-4"><BotRequestDraft key={`${workspace.generation}:${bot.conversation_id}:${request.key}`} bot={bot} initialText={request.text} onClose={() => setRequest(null)} /></div></SettingsGroup> : null}
           {rows.length ? <SettingsGroup title={`定时任务 · ${view.schedules.length}`}>
             <p className="px-4 pt-3 text-sm text-secondary">{contactCopy.pause}</p>
-            {!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? <p role="status" className="px-4 text-sm text-secondary">以下为最近保存的约定与时间，连上后核对。</p> : null}
+            {!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? <p role="status" className="px-4 text-sm text-secondary">当前显示上次保存的约定和时间。连接后可查看最新内容。</p> : null}
             {rows.map(({ schedule, deleted }, index) => {
               const once = schedule.every_minutes === undefined
               const detail = scheduleDetail(schedule)

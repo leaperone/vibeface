@@ -4,7 +4,7 @@ import { networkKey, storageOf } from '../workspace/storage.ts'
 
 export const cooperationExamples = [
   { label: '需要选择时再问我', text: '能继续的先做，需要我选择、补充信息或确认结果时告诉我。' },
-  { label: '先给结论和下一步', text: '先给结论，再说下一步，需要时附上能核对的依据。' },
+  { label: '先给结论和下一步', text: '先给结论，再说下一步，需要时附上出处。' },
 ] as const
 
 /** Remember only that this device has shown the optional guide, never a permission or a sent message. */

@@ -70,7 +70,7 @@ export function ShareScreen() {
     if (!shareInbox.read().some(candidate => shareVisible(candidate, workspace))) close()
   }
   const removeReceipt = () => {
-    Alert.alert('移除这条分享记录？', '只移除本机分享页中的记录，不会撤回、停止或重新发送原消息。仍可在原对话中核对。', [
+    Alert.alert('移除这条分享记录？', '只移除本机分享页中的记录，不会撤回、停止或重新发送原消息。仍可在原对话中查看送达状态。', [
       { text: '保留', style: 'cancel' },
       { text: '移除记录', style: 'destructive', onPress: dismiss },
     ])
@@ -105,7 +105,7 @@ export function ShareScreen() {
 
     {item.kind === 'draft' ? <View className="gap-3">
       <Text role="heading" className="text-base font-medium">确认接收的 Bot</Text>
-      <Text className="text-sm text-secondary">{workspace.networkId ? `个人网络 · ${workspace.networkId.slice(0, 8)}${entryName ? `，通过 ${entryName}` : ''}` : '尚未加入个人网络'}</Text>
+      <Text className="text-sm text-secondary">{workspace.networkId ? `设备网络 · ${workspace.networkId.slice(0, 8)}${entryName ? `，通过 ${entryName}` : ''}` : '先连接自己的设备'}</Text>
       {!workspace.bots.length ? <Text className="text-secondary">{workspace.session.phase === 'ready' ? '还没有可选择的 Bot，请连接并读取自己的网络。' : '请先加入自己的网络。这份资料尚未排队。'}</Text> : workspace.bots.map(bot => {
         const checked = Boolean(selectedHere && selected?.botId === bot.bot_id)
         return <SelectionItem key={bot.bot_id} accessibilityRole="radio" accessibilityLabel={botLabel(bot.bot_id, bot.name)} accessibilityState={{ checked }} className="min-h-12" disabled={busy !== null} onPress={() => {
@@ -115,19 +115,19 @@ export function ShareScreen() {
           <RadioMark checked={checked} /><Text className="min-w-0 flex-1 font-medium">{botLabel(bot.bot_id, bot.name)}</Text>
         </SelectionItem>
       })}
-      {selectedHere && selected ? <Text accessibilityLiveRegion="polite" className="text-sm text-secondary">将发给这个个人网络中的「{botLabel(selected.botId, selected.botName)}」。</Text> : null}
+      {selectedHere && selected ? <Text accessibilityLiveRegion="polite" className="text-sm text-secondary">将发给这个网络中的「{botLabel(selected.botId, selected.botName)}」。</Text> : null}
       {!shared?.canSaveMessages ? <Text className="text-sm text-secondary">尚未排队。{shared?.readOnlyNotice || shared?.writeNotice || '工作区就绪后才能保存，请先连接自己的网络。'}</Text> : workspace.connection.state !== 'online' ? <Text className="text-sm text-secondary">可以先保存到本机，联网后再继续送达。</Text> : null}
       <Button disabled={busy !== null || !selectedHere || !shared?.canSaveMessages} onPress={() => void run('send', send)}><Text>确认目标并发送资料</Text></Button>
       <Button variant="ghost" disabled={busy !== null} onPress={dismiss}><Text>取消分享</Text></Button>
     </View> : <View className="gap-3">
       <Text role="heading" className="text-base font-medium">{botLabel(item.target.botId, item.target.botName)}</Text>
-      <Text className="text-sm text-secondary">个人网络 · {item.target.networkId.slice(0, 8)}{item.target.entryName ? `，通过 ${item.target.entryName}` : ''}</Text>
+      <Text className="text-sm text-secondary">设备网络 · {item.target.networkId.slice(0, 8)}{item.target.entryName ? `，通过 ${item.target.entryName}` : ''}</Text>
       <Text accessibilityLiveRegion="polite">{busy === 'send' ? '正在保存到本机，完成后再离开。' : shareDelivery(item, pending, queried?.id === item.material.id ? queried.receipt : undefined)}</Text>
       {liveTarget && shared ? <Button variant="secondary" disabled={busy !== null} onPress={() => void run('query-share', async claim => {
         const receipt = await shared.queryInput({ message_id: item.messageId, conversation_id: item.target.conversationId, target: { kind: 'bot_main', bot_id: item.target.botId } })
         if (claim.current() && 'stage' in receipt) setQueried({ id: item.material.id, receipt })
       })}><Text>查询原消息状态</Text></Button> : null}
-      {pending && liveTarget && shared ? <Button variant="secondary" disabled={busy !== null || !shared.writable} onPress={() => void run('retry-share', () => shared.retryPendingMessage(item.messageId))}><Text>核对并重试原消息</Text></Button> : null}
+      {pending && liveTarget && shared ? <Button variant="secondary" disabled={busy !== null || !shared.writable} onPress={() => void run('retry-share', () => shared.retryPendingMessage(item.messageId))}><Text>检查状态并重试原消息</Text></Button> : null}
       <Button variant="secondary" disabled={busy !== null || !liveTarget} onPress={() => router.push({ pathname: '/b/[botId]', params: { botId: item.target.botId, message: item.messageId } })}><Text>查看原对话</Text></Button>
       <Button variant="ghost" disabled={busy !== null} onPress={removeReceipt}><Text>移除本机分享记录</Text></Button>
     </View>}

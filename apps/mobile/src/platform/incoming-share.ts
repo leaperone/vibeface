@@ -79,8 +79,8 @@ export function shareDelivery(item: IncomingShare, pending?: PendingMessage, rec
     if (receipt.stage === 'refused') return receipt.reason || '目标设备未接收，请查看原对话。'
     return '原消息已有接收回执。Bot 的处理结果请查看原对话。'
   }
-  if (item.kind === 'saving') return '上次本地保存的结果尚未确认。先核对原对话，避免重复发送。'
-  if (!pending) return '本机已保存这条消息；当前送达状态请在原对话中核对。'
+  if (item.kind === 'saving') return '上次本地保存的结果尚未确认。请先查看原对话，不要重复发送。'
+  if (!pending) return '本机已保存这条消息；请在原对话中查看是否送达。'
   if (pending.rejected || pending.receipt?.stage === 'refused') return pending.rejected || pending.receipt?.reason || '目标设备未接收，请查看原对话。'
   if (pending.delivery === 'unknown' || pending.delivery === 'submitting' || pending.receipt?.stage === 'unknown') return '送达结果待确认。查询原消息，不会另发一份。'
   if (pending.delivery === 'accepted') return '接入设备已收到。Bot 的处理结果请查看原对话。'
@@ -117,7 +117,7 @@ export function incomingShares(storage: KeyValue, newId: () => string = () => gl
   function saved(id: string, messageId: string) {
     if (!read().items.some(item => item.material.id === id)) return
     replace(id, item => {
-      if (item.kind === 'draft' || item.messageId !== messageId) throw new Error('本地消息编号不匹配，请核对原对话。')
+      if (item.kind === 'draft' || item.messageId !== messageId) throw new Error('本地消息编号不匹配，请查看原对话。')
       return { ...item, kind: 'saved' }
     })
   }
@@ -141,14 +141,14 @@ export function incomingShares(storage: KeyValue, newId: () => string = () => gl
     inputOptions(id: string, destination: ShareTarget): InputOptions {
       if (!target(destination)) throw new Error('请选择完整的网络和 Bot 目标。')
       const draft = read().items.find(item => item.material.id === id)
-      if (!draft || draft.kind !== 'draft') throw new Error('这份资料已变更或已经提交保存，请核对原消息。')
+      if (!draft || draft.kind !== 'draft') throw new Error('这份资料已变更或已经提交保存，请查看原消息。')
       return {
         conversation_id: destination.conversationId,
         target: { kind: 'bot_main', bot_id: destination.botId },
         onPrepared(input) {
           if (!input.message_id || input.conversation_id !== destination.conversationId || input.target.kind !== 'bot_main' || input.target.bot_id !== destination.botId) throw new Error('准备保存的目标不匹配，请重新确认。')
           replace(id, item => {
-            if (item.kind !== 'draft') throw new Error('这份资料已经提交保存，请核对原消息。')
+            if (item.kind !== 'draft') throw new Error('这份资料已经提交保存，请查看原消息。')
             return { kind: 'saving', material: item.material, target: destination, messageId: input.message_id }
           })
         },

@@ -97,7 +97,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
     {request ? <Section icon={ScrollText} title="修改请求草稿"><BotRequestDraft key={`${shared.generation}:${bot.conversation_id}:${request.key}`} bot={bot} initialText={request.text} onClose={() => setRequest(null)} /></Section> : null}
     {schedules.length ? <Section icon={CalendarClock} title="定时任务" count={schedules.length}>
       <Text className="text-sm text-muted">{contactCopy.pause}</Text>
-      {!shared.connectionOnline || shared.dataOrigin === 'cache' ? <Text role="status" className="text-sm text-muted">以下为最近保存的约定与时间，连上后核对。</Text> : null}
+      {!shared.connectionOnline || shared.dataOrigin === 'cache' ? <Text role="status" className="text-sm text-muted">当前显示上次保存的约定和时间。连接后可查看最新内容。</Text> : null}
       {schedules.map((schedule) => {
         const cause = [...shared.data?.changes ?? []].reverse().find(record => record.change.kind === 'schedule' && record.change.schedule_id === schedule.schedule_id && record.cause)?.cause
         const sourceBot = cause ? shared.bots.find(item => item.conversation_id === cause.conversation_id) : undefined

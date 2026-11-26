@@ -18,7 +18,7 @@ export function feedbackLabel(source: FeedbackSource) {
 export function feedbackReference(source: FeedbackSource) {
   return source.kind === 'task_result' ? `任务 ${source.task_id} · 第 ${source.revision} 版\n结果事件 ${source.event_hash}`
     : source.kind === 'work_result' ? `工作 ${source.work_id}\n结果事件 ${source.event_hash}`
-    : `附件 ${source.name} · ${source.size} 字节\nSHA-256 ${source.hash}`
+    : `附件 ${source.name} · ${source.size} 字节\n文件指纹 ${source.hash}`
 }
 
 export function feedbackMessage(source: FeedbackSource, conversationId: string, text: string) {
