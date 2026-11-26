@@ -6,9 +6,36 @@ import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord, MemoryMetadata } from "./types.ts"
 import type { OutboxItem, OutboxStore } from "../lib/outbox.ts"
 import { requestKey } from "../lib/secure.ts"
-import { DATA_EPOCH, memoryBase, memoryController, memoryResultLabel, memorySaved, parseMemoryControlResult, parseMemoryStateResult } from "./memory.ts"
+import { DATA_EPOCH, canRememberMessage, memoryBase, memoryController, memoryResultLabel, memorySaved, parseMemoryControlResult, parseMemoryStateResult } from "./memory.ts"
+import { feedbackMessage, validFeedbackSource, type FeedbackSource } from './feedback.ts'
+import type { TranscriptMessage } from '../chat/types.ts'
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
+
+test('explicit preferences require this authenticated author and exclude quoted or attached material', () => {
+  const message: TranscriptMessage = { message_id: 'message', event_hash: 'a'.repeat(64), author: 'client', role: 'user', text: '以后请用中文', created_at_ms: 1, target: { kind: 'bot_main', bot_id: 'bot' } }
+  assert.equal(canRememberMessage(message, 'client', 'bot'), true)
+  const changes: Partial<TranscriptMessage & { state?: string }>[] = [{ author: undefined }, { author: 'other' }, { role: 'assistant' }, { text: '> 转贴的偏好' }, { attachments: [{ hash: 'b'.repeat(64), name: 'quote.txt', size: 1 }] }, { state: 'sending' }, { target: { kind: 'task', task_id: 'task' } }, { answers: 'question' }]
+  for (const changed of changes) {
+    assert.equal(canRememberMessage({ ...message, ...changed }, 'client', 'bot'), false)
+  }
+  assert.equal(canRememberMessage(message, undefined, 'bot'), false)
+  assert.equal(canRememberMessage(message, 'client', 'another-bot'), false)
+})
+
+test('feedback quotes an immutable task revision or scoped attachment without a restart request', () => {
+  const result: FeedbackSource = { kind: 'task_result', scope_id: 'workspace', task_id: 'task', revision: 2, event_hash: 'a'.repeat(64) }
+  const message = feedbackMessage(result, 'bot-chat', '请讨论结果中的措辞')
+  assert.match(message, /第 2 版/)
+  assert.match(message, /引用范围 workspace/)
+  assert.match(message, /不继续或重新执行原任务/)
+  assert.match(message, new RegExp(result.event_hash))
+  const original = feedbackMessage({ kind: 'attachment', scope_id: 'chat', hash: 'b'.repeat(64), name: 'report.txt', size: 4 }, 'chat', '第一段需要说明')
+  const updated = feedbackMessage({ kind: 'attachment', scope_id: 'chat', hash: 'c'.repeat(64), name: 'report.txt', size: 4 }, 'chat', '第一段需要说明')
+  assert.notEqual(original, updated)
+  assert.equal(validFeedbackSource({ ...result, revision: 0 }), false)
+  assert.throws(() => feedbackMessage(result, 'chat', ' '))
+})
 
 test("unknown running providers still show effort-only Bot preferences without duplicates", () => {
   assert.deepEqual(botModelRows({ models: {}, reasoning_efforts: { codex: "high" } }, null), [["codex", ""]])

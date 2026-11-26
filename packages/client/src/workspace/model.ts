@@ -153,7 +153,7 @@ export function parseNotificationContent(value: unknown, expected: { notificatio
 
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), author: optionalText(data.author), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender), ...(data.target == null ? {} : { target: parseInputTarget(data.target) }) }
 }
 export const mainMessage = (message: Pick<TranscriptMessage, 'target'>) => message.target === undefined || message.target.kind === 'bot_main'
 const mainQuestion = (question: Pick<Question, 'target'>) => question.target?.kind === 'bot_main'

@@ -10,7 +10,7 @@ export type ChatEntry =
   | { key: string; anchor?: undefined; node: ReactNode }
 
 /** Arc chat-thread with unread navigation, anchored history and live streamed content. */
-export function Chat({ entries, empty, focus }: { entries: ChatEntry[]; empty: ReactNode; focus?: string }) {
+export function Chat({ entries, empty, focus, remember = false }: { entries: ChatEntry[]; empty: ReactNode; focus?: string; remember?: boolean }) {
   const viewport = useRef<HTMLDivElement>(null)
   const content = useRef<HTMLDivElement>(null)
   const anchor = useRef<{ key: string; offset: number } | null>(null)
@@ -61,5 +61,5 @@ export function Chat({ entries, empty, focus }: { entries: ChatEntry[]; empty: R
   useEffect(() => { const node = content.current, view = viewport.current; if (!node || !view) return; const resize = new ResizeObserver(place); resize.observe(node); resize.observe(view); return () => resize.disconnect() },[entries.length === 0])
   const times = messageTimes(entries.flatMap(entry => 'message' in entry && entry.message.created_at_ms ? [entry.message] : []),now)
   if (!entries.length) return <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{empty}</div>
-  return <div className={styles.thread}><div ref={viewport} onScroll={capture} className={styles.viewport} role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions"><div ref={content} className={styles.messages}>{entries.map(entry => <div key={entry.key} data-history-key={entry.key} className={styles.entry}>{'message' in entry ? <Message message={entry.message} conversationId={entry.conversationId} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} /> : entry.node}</div>)}</div></div>{away ? <Button type="button" variant="secondary" className={styles.latest} aria-label="回到最新消息" title="回到最新" onClick={latest}><ArrowDown aria-hidden="true" /></Button> : null}</div>
+  return <div className={styles.thread}><div ref={viewport} onScroll={capture} className={styles.viewport} role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions"><div ref={content} className={styles.messages}>{entries.map(entry => <div key={entry.key} data-history-key={entry.key} className={styles.entry}>{'message' in entry ? <Message message={entry.message} conversationId={entry.conversationId} schedule={entry.schedule} time={times.get(entry.message.message_id)} retry={entry.retry} detail={entry.detail} remember={remember} /> : entry.node}</div>)}</div></div>{away ? <Button type="button" variant="secondary" className={styles.latest} aria-label="回到最新消息" title="回到最新" onClick={latest}><ArrowDown aria-hidden="true" /></Button> : null}</div>
 }

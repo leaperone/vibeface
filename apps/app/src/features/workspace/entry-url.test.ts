@@ -53,9 +53,124 @@ import { attachmentSize, validAttachment, downloadAttachment } from '../../../..
 import { createChatDrafts } from '../../../../../apps/mobile/src/platform/chat-drafts.ts'
 import * as conversationCache from '@vibeface/client/workspace/conversation-cache.ts'
 import * as systemNotifications from '@vibeface/client/workspace/system-notifications.ts'
+import * as preferenceMemory from '../../../../../packages/client/src/workspace/memory.ts'
+import * as resultFeedback from '../../../../../packages/client/src/workspace/feedback.ts'
 
 const isMessageOutbox = (item: OutboxItem): item is OutboxRecord<'message'> => item.method === 'message'
 const isWorkspaceCommandOutbox = (item: OutboxItem): item is OutboxRecord<'workspace_command'> => item.method === 'workspace_command'
+
+test('companion preference previews on Web and Mobile retain unknown and conflicting drafts until a confirmed save', async () => {
+  for (const native of [false, true]) {
+    const metadata: import('@vibeface/client/workspace/types.ts').MemoryMetadata = { epoch: 1, revision: 'b'.repeat(64), control_revision: 2, source_event_hash: 'c'.repeat(64), origin: 'user', user_controlled: true, essential: true }
+    const calls: { id: string; base: unknown; text: string }[] = []
+    let response: 'unknown' | 'conflict' | 'applied' = 'unknown', busy: string | null = null, error = '', work = Promise.resolve()
+    const shared = { generation: 1, bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }], conversationId: 'chat', writable: true, data: { bot_settings: { memory: [] } },
+      controlMemory: async (_conversation: string, id: string, base: unknown, text: string) => {
+        calls.push({ id, base, text })
+        if (response === 'unknown') throw new Error('结果未知')
+        return { state: response, operation_id: 'd'.repeat(64), current: { memory_id: id, text: response === 'conflict' ? '其他设备已更正' : text, metadata } }
+      },
+    }
+    const useAction = () => ({ busy, error, clear: () => { error = '' }, run: (key: string, action: () => Promise<void>) => { busy = key; error = ''; work = action().catch(cause => { error = String(cause) }).finally(() => { busy = null }); return work } })
+    const dependencies = {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { principal: { network_id: 'network', device_id: 'client' } } }) },
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared },
+      '@vibeface/client/workspace/storage.ts': { newId: () => 'preference' },
+      '@/components/arc/product-kit': { useAction, InlineError: 'InlineError' }, '@/components/action': { useAction, ErrorText: 'ErrorText' },
+    }
+    const app = componentHarness(native ? '../../../../../apps/mobile/src/features/chat/memory-preference.tsx' : '../chat/elements/memory-preference.tsx', dependencies)
+    const message = { message_id: 'own', event_hash: 'a'.repeat(64), author: 'client', role: 'user', text: '以后请用中文', created_at_ms: 1, target: { kind: 'bot_main', bot_id: 'bot' } }
+    const props = { message, conversationId: 'chat', botId: 'bot', onClose() {} }
+    const render = () => app.render('MemoryPreference', props)
+    const button = (label: string) => render().find(item => item.type === 'Button' && componentText(item.props.children) === label)?.props
+    const press = (label: string) => { const action = button(label)?.[native ? 'onPress' : 'onClick']; assert.ok(typeof action === 'function', label); action() }
+    const field = () => render().find(item => item.type === (native ? 'TextInput' : 'Textarea'))?.props
+    try {
+      render(); assert.equal(calls.length, 0)
+      if (!native) press('记为这个 Bot 的偏好')
+      const change = field()?.[native ? 'onChangeText' : 'onChange']; assert.ok(typeof change === 'function')
+      change(native ? '确认后的偏好' : { currentTarget: { value: '确认后的偏好' } })
+      press('确认保存偏好'); await work
+      assert.equal(field()?.value, '确认后的偏好', 'an unknown result keeps the draft')
+      response = 'conflict'; press('确认保存偏好'); await work
+      assert.equal(field()?.value, '确认后的偏好', 'a conflict keeps the draft')
+      press('按当前版本继续编辑')
+      response = 'applied'; press('确认保存偏好'); await work
+      assert.equal(field(), undefined)
+      assert.ok(button('查看或更正偏好'))
+      assert.equal(calls.length, 3)
+      assert.equal(calls[2]?.id, 'preference')
+      assert.deepEqual(JSON.parse(JSON.stringify(calls[2]?.base)), preferenceMemory.memoryBase(metadata))
+      press('查看或更正偏好')
+      assert.equal(field()?.value, '确认后的偏好')
+    } finally { app.close() }
+  }
+})
+
+test('companion feedback freezes the clicked result and Bot on both platforms without replacing an ordinary draft or reopening a task', async () => {
+  for (const native of [false, true]) {
+    const calls: { text: string; options: InputOptions }[] = []
+    let work = Promise.resolve(), error = ''
+    const shared = { generation: 1, canSaveMessages: true, bots: [{ bot_id: 'alpha', conversation_id: 'chat-a', name: 'Alpha' }, { bot_id: 'beta', conversation_id: 'chat-b', name: 'Beta' }], sendMessage: async (text: string, _files: unknown[], _sent: unknown, options: InputOptions) => { calls.push({ text, options }); return true } }
+    const useAction = () => ({ busy: null, error, clear: () => { error = '' }, run: (_key: string, action: () => Promise<void>) => { work = action().catch(cause => { error = String(cause) }); return work } })
+    const dependencies = { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared }, '@/components/arc/product-kit': { useAction, Details: 'Details', InlineError: 'InlineError' }, '@/components/action': { useAction, ErrorText: 'ErrorText' } }
+    const app = componentHarness(native ? '../../../../../apps/mobile/src/features/chat/result-feedback.tsx' : '../chat/elements/result-feedback.tsx', dependencies)
+    let source: resultFeedback.FeedbackSource = { kind: 'task_result', scope_id: 'workspace', task_id: 'finished-task', revision: 2, event_hash: 'a'.repeat(64) }, conversationId = 'chat-a'
+    const render = () => app.render('ResultFeedback', { source, conversationId })
+    const button = (label: string) => render().find(item => item.type === 'Button' && componentText(item.props.children) === label)?.props
+    const press = (label: string) => { const action = button(label)?.[native ? 'onPress' : 'onClick']; assert.ok(typeof action === 'function', label); action() }
+    const scope = { networkId: 'network', deviceId: 'client', conversationId: 'chat-a', inputTarget: 'main' }
+    try {
+      await app.drafts.write(scope, { text: '原来的聊天草稿', files: [] })
+      press('针对这个结果补充')
+      const field = render().find(item => item.type === (native ? 'TextInput' : 'Textarea'))?.props
+      const change = field?.[native ? 'onChangeText' : 'onChange']; assert.ok(typeof change === 'function')
+      change(native ? '先讨论措辞' : { currentTarget: { value: '先讨论措辞' } })
+      source = { ...source, revision: 3, event_hash: 'b'.repeat(64) }; conversationId = 'chat-b'
+      assert.match(componentText(render()), /第 2 版任务结果反馈给 Alpha/)
+      assert.equal(calls.length, 0, 'a click only previews the feedback')
+      press('发送反馈到主聊天'); await work
+      assert.equal(calls.length, 1)
+      assert.deepEqual(JSON.parse(JSON.stringify(calls[0]?.options)), { target: { kind: 'bot_main', bot_id: 'alpha' }, intent: 'continue', conversation_id: 'chat-a' })
+      assert.match(calls[0]?.text ?? '', /第 2 版/)
+      assert.match(calls[0]?.text ?? '', new RegExp('a'.repeat(64)))
+      assert(!calls[0]?.text.includes('b'.repeat(64)))
+      assert.equal(app.drafts.read(scope).text, '原来的聊天草稿')
+      assert.match(componentText(render()), /反馈已保存在 Alpha/)
+      assert.ok(render().some(item => item.props.to === '/tasks/$taskId' || item.props.href === '/task/finished-task'))
+    } finally { app.close() }
+  }
+})
+
+test('companion preferences are a deliberate iOS or Android message menu action and stale menus cannot save another message', async () => {
+  for (const os of ['ios', 'android']) {
+    const sheet: { options: string[]; select: (index: number) => void } = { options: [], select: () => {} }
+    const alerts: { text: string; onPress?: () => void }[][] = []
+    let remembered = 0
+    const app = componentHarness('../../../../../apps/mobile/src/features/chat/message-actions.tsx', {
+      'react-native': { Platform: { OS: os }, View: 'View', ActionSheetIOS: { showActionSheetWithOptions: (options: { options: string[] }, select: (index: number) => void) => { sheet.options = options.options; sheet.select = select } }, Alert: { alert: (_title: string, _description: string | undefined, buttons: { text: string; onPress?: () => void }[]) => { alerts.push(buttons) } } },
+    })
+    let message = { message_id: 'own', event_hash: 'a'.repeat(64), role: 'user', text: '以后请用中文', created_at_ms: 1 }
+    const render = () => app.render('MessageActions', { message, onQuote() {}, onRemember() { remembered++ } })
+    const open = () => { const button = render().find(item => item.type === 'Button')?.props.onPress; assert.ok(typeof button === 'function'); button() }
+    const chooseMemory = () => {
+      if (os === 'ios') sheet.select(sheet.options.indexOf('记为这个 Bot 的偏好'))
+      else {
+        assert.equal(alerts.at(-1)?.length, 3, 'Android alerts retain at most three buttons')
+        alerts.at(-1)?.find(item => item.text === '更多操作')?.onPress?.()
+        alerts.at(-1)?.find(item => item.text === '记为这个 Bot 的偏好')?.onPress?.()
+      }
+    }
+    try {
+      open(); assert.equal(remembered, 0); chooseMemory(); await settleComponent(); assert.equal(remembered, 1)
+      open()
+      const stale = os === 'ios' ? () => sheet.select(sheet.options.indexOf('记为这个 Bot 的偏好')) : alerts.at(-1)?.find(item => item.text === '更多操作')?.onPress
+      message = { ...message, message_id: 'other', event_hash: 'b'.repeat(64) }; render()
+      stale?.(); await settleComponent()
+      assert.equal(remembered, 1)
+    } finally { app.close() }
+  }
+})
 
 test("bulk inbox actions re-arm focus after an intervening list update", () => {
   const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "pending-section.tsx"), "utf8")
@@ -2026,6 +2141,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return loadComponentModule(filename)
     }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
+    if (specifier === '@vibeface/client/workspace/memory.ts') return preferenceMemory
+    if (specifier === '@vibeface/client/workspace/feedback.ts') return resultFeedback
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))

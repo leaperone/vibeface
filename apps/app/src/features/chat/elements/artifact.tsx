@@ -8,6 +8,7 @@ import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Download,Eye,EyeOff,File } from 'lucide-react'
 import { useRef,useState } from 'react'
+import { ResultFeedback } from './result-feedback'
 
 /** A file the user attached: read it here as text, or download it under its own name. */
 export function Artifact({ file: { hash, size, name }, conversationId }: { file: Attachment; conversationId?: string }) {
@@ -68,6 +69,7 @@ export function Artifact({ file: { hash, size, name }, conversationId }: { file:
       </div>
       {opened ? <>
         <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '文件是空的'}</pre>
+        {conversationId ? <ResultFeedback source={{ kind: 'attachment', scope_id: conversationId, hash, name, size }} conversationId={conversationId} /> : null}
         {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-sm text-secondary">已显示全部内容</p>}
       </> : null}
     </RecordBody>

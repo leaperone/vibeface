@@ -14,6 +14,7 @@ import { useNotificationRecord } from '@vibeface/client/chat/use-notification-re
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { chatUpdates, messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { canRememberMessage } from '@vibeface/client/workspace/memory.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
@@ -280,8 +281,8 @@ export default function ChatScreen() {
   const retry = asked && live && !blocked && !unknown ? retryAsked : undefined
   const read = live ? readAttachment : undefined
   const renderItem = useCallback(({ item }: { item: Entry }) => !('message' in item) ? <>{item.node}</> : bot
-    ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} attachmentScope={attachmentScope} readAttachment={read} onQuote={quote} />
-    : null, [bot, offline, newest, retry, attachmentScope, read, quote])
+    ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} attachmentScope={attachmentScope} readAttachment={read} onQuote={quote} remember={!routine && canRememberMessage(item.message, device.ready?.principal.device_id, bot.bot_id)} conversationId={id} />
+    : null, [bot, offline, newest, retry, attachmentScope, read, quote, routine, id, device.ready?.principal.device_id])
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
