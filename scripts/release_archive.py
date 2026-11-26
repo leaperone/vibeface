@@ -12,7 +12,6 @@ import tarfile
 import zipfile
 import release_context
 import release_format
-from ios_device import SHARE_BUNDLE_ID, SHARE_TARGET, share_receipt, verify_bundle_info
 
 
 MAX_ARCHIVE = 384 * 1024 * 1024
@@ -178,6 +177,7 @@ def verify_desktop_receipt(directory, target, pins, runtime_digest=None):
 
 
 def verify_ios_assets(directory, pins):
+    from ios_device import SHARE_BUNDLE_ID, SHARE_TARGET, share_receipt, verify_bundle_info
     version_value = pins['version']
     signed = (directory / f'vibeface-{version_value}-ios.ipa').is_file()
     mobile = json.loads((release_context.ROOT / 'apps/mobile/app.json').read_text(encoding='utf-8'))['expo']

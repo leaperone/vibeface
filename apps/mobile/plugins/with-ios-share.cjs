@@ -11,6 +11,14 @@ module.exports = (config) => withXcodeProject(config, (mod) => {
   if (!project.pbxTargetByName(target) || !project.pbxTargetByName('Vibeface')) {
     throw new Error('The iOS app and sharing extension targets are required')
   }
+  const version = mod.version
+  const buildNumber = mod.ios?.buildNumber
+  if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)
+    || typeof buildNumber !== 'string' || !/^[1-9][0-9]{0,3}(?:\.[0-9]{1,2}){0,2}$/.test(buildNumber)) {
+    throw new Error('The sharing extension requires valid app version and iOS build number metadata')
+  }
+  project.updateBuildProperty('MARKETING_VERSION', JSON.stringify(version), undefined, target)
+  project.updateBuildProperty('CURRENT_PROJECT_VERSION', JSON.stringify(buildNumber), undefined, target)
   const infoPath = path.join(mod.modRequest.platformProjectRoot, target, 'Info.plist')
   const info = plist.parse(fs.readFileSync(infoPath, 'utf8'))
   info.CFBundleDisplayName = 'Vibeface'

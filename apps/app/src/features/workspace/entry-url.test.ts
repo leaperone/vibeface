@@ -2151,6 +2151,11 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@vibeface/client/chat/companion-recap.ts') return companionRecap
     if (specifier === '@/features/workspace/inbox') return { useInbox: () => [], ...dependencies[specifier] as object }
     if (specifier === '@/data/live') return { useInbox: () => [], useOpenNotificationConversation: () => () => {}, ...dependencies[specifier] as object }
+    if (specifier === '@vibeface/client/workspace/context.tsx' && path.endsWith('/chat/conversation-screen.tsx')) {
+      const provided = workspaceModel.record(dependencies[specifier]), read = provided.useWorkspace
+      assert.ok(typeof read === 'function')
+      return { ...provided, useWorkspace: () => ({ notifications: [], ignoredNotifications: new Set<string>(), openWorks: [], fresh: new Set<string>(), workspaceState: null, ...read() }) }
+    }
     if (specifier === '@vibeface/client/lib/selection.ts') return { selectionOwner }
     if (specifier === '@vibeface/client/workspace/conversation-cache.ts') return conversationCache
     if (specifier === '@/platform/native-chat-drafts') return { chatDrafts }
@@ -7041,7 +7046,7 @@ test('native system notification events keep typed destinations and clear naviga
   const { privateFiles } = owned.module as typeof import('../../../../../apps/mobile/src/platform/files.ts')
   type Response = { notification: { date: number; request: { identifier: string; content: { data: { destination: NotificationDestination } } } }; actionIdentifier: string }
   let response: ((value: Response) => void) | undefined
-  let dismissed = 0, forgotten = 0, logsCleared = 0
+  let dismissed = 0, forgotten = 0, logsCleared = 0, sharesCleared = 0
   const storage = new Map<string, string>()
   const scheduled: unknown[] = []
   const appState = { currentState: 'active', addEventListener: () => ({ remove() {} }) }
@@ -7049,6 +7054,7 @@ test('native system notification events keep typed destinations and clear naviga
   const app = componentHarness('../../../../../apps/mobile/src/platform/index.ts', {
     'react-native': { Platform: { OS: 'ios', isPad: false }, AppState: appState },
     'expo-file-system': fixture.native,
+    'expo-sharing': { clearSharedPayloads: async () => { sharesCleared++ } },
     'expo-notifications': {
       setNotificationHandler(handler: { handleNotification: () => Promise<object> }) { presentation = handler.handleNotification }, AndroidImportance: { HIGH: 1 }, setNotificationChannelAsync: async () => {},
       addNotificationResponseReceivedListener(listener: typeof response) { response = listener; return { remove() { response = undefined } } },
@@ -7086,6 +7092,7 @@ test('native system notification events keep typed destinations and clear naviga
   assert.equal(dismissed, 1)
   assert.equal(forgotten, 1)
   assert.equal(logsCleared, 1, 'erase clears the phone log buffer')
+  assert.equal(sharesCleared, 1, 'erase clears system share payloads too')
   unwatch?.()
 })
 
