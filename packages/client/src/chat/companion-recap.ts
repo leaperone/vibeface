@@ -14,6 +14,12 @@ export type BotRecapItem = {
   target: InputTarget; focus?: string; notificationId?: string
 }
 
+/** Routine work stays in activity; one decision or unread result earns space above the composer. */
+export function recapPreview(items: readonly BotRecapItem[]) {
+  const primary = items.find(item => item.group === 'decision') ?? items.find(item => item.group === 'result')
+  return primary ? { primary, more: items.filter(item => item.key !== primary.key) } : null
+}
+
 const line = (text: string, fallback: string) => text.trim().split('\n')[0]?.slice(0, 160) || fallback
 
 /** An existing fact with its original source; this view cannot acknowledge, approve or repeat work. */

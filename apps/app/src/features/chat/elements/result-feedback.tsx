@@ -7,12 +7,13 @@ import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { useRef,useState } from 'react'
 
 type Draft = { source: FeedbackSource; botId: string; botName: string; conversationId: string; generation: number; text: string }
+type Saved = Draft & { messageId: string | null }
 
 export function ResultFeedback({ source, conversationId }: { source: FeedbackSource; conversationId: string }) {
   const workspace = useWorkspace()
   const bot = workspace.bots.find(item => item.conversation_id === conversationId)
   const [draft, setDraft] = useState<Draft | null>(null)
-  const [saved, setSaved] = useState<Draft | null>(null)
+  const [saved, setSaved] = useState<Saved | null>(null)
   const sending = useRef(false)
   const action = useAction()
   if (!bot || !validFeedbackSource(source)) return null
@@ -22,9 +23,10 @@ export function ResultFeedback({ source, conversationId }: { source: FeedbackSou
     sending.current = true
     void action.run('feedback', async () => {
       try {
-        const recorded = await workspace.sendMessage(feedbackMessage(draft.source, draft.conversationId, draft.text), [], undefined, { target: { kind: 'bot_main', bot_id: draft.botId }, intent: 'continue', conversation_id: draft.conversationId })
+        let messageId: string | null = null
+        const recorded = await workspace.sendMessage(feedbackMessage(draft.source, draft.conversationId, draft.text), [], undefined, { target: { kind: 'bot_main', bot_id: draft.botId }, intent: 'continue', conversation_id: draft.conversationId, onSaved: input => { if (input.conversation_id === draft.conversationId && input.target.kind === 'bot_main' && input.target.bot_id === draft.botId && input.message_id) messageId = input.message_id } })
         if (!recorded) throw new Error('反馈尚未保存，草稿已保留。')
-        setSaved(draft); setDraft(null)
+        setSaved({ ...draft, messageId }); setDraft(null)
       } finally { sending.current = false }
     })
   }
@@ -38,6 +40,6 @@ export function ResultFeedback({ source, conversationId }: { source: FeedbackSou
       <div className="flex flex-wrap gap-2"><Button type="button" disabled={!workspace.canSaveMessages || action.busy !== null || changed || !draft.text.trim()} onClick={save}>{action.busy ? '正在保存反馈…' : '发送反馈到主聊天'}</Button><Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => { setDraft(null); action.clear() }}>取消反馈</Button></div>
     </div>}
     <InlineError error={action.error} />
-    {saved ? <div role="status" className="grid gap-1 text-sm text-secondary"><p>反馈已保存在 {saved.botName} 的主聊天，送达状态请查看消息。</p><Link to="/b/$botId" params={{ botId: saved.botId }} className="inline-flex min-h-11 w-fit items-center underline underline-offset-4">查看反馈消息</Link>{saved.source.kind === 'task_result' ? <Link to="/tasks/$taskId" params={{ taskId: saved.source.task_id }} className="inline-flex min-h-11 w-fit items-center underline underline-offset-4">返回原任务</Link> : null}</div> : null}
+    {saved ? <div role="status" className="grid gap-1 text-sm text-secondary"><p>{saved.messageId ? `反馈已保存在 ${saved.botName} 的主聊天，送达状态请查看原消息。` : `反馈已保存，但未取得消息位置；请打开 ${saved.botName} 的主聊天核对送达状态。`}</p><Link to="/b/$botId" params={{ botId: saved.botId }} search={saved.messageId ? { message: saved.messageId } : {}} className="inline-flex min-h-11 w-fit items-center underline underline-offset-4">{saved.messageId ? '查看反馈消息' : '打开主聊天'}</Link>{saved.source.kind === 'task_result' ? <Link to="/tasks/$taskId" params={{ taskId: saved.source.task_id }} className="inline-flex min-h-11 w-fit items-center underline underline-offset-4">返回原任务</Link> : null}</div> : null}
   </div>
 }

@@ -10,12 +10,13 @@ import { Details } from '@/components/kit'
 import { useLive } from '@/data/live'
 
 type Draft = { source: FeedbackSource; botId: string; botName: string; conversationId: string; generation: number; text: string }
+type Saved = Draft & { messageId: string | null }
 
 export function ResultFeedback({ source, conversationId }: { source: FeedbackSource; conversationId: string }) {
   const workspace = useLive()
   const bot = workspace?.bots.find(item => item.conversation_id === conversationId)
   const [draft, setDraft] = useState<Draft | null>(null)
-  const [saved, setSaved] = useState<Draft | null>(null)
+  const [saved, setSaved] = useState<Saved | null>(null)
   const sending = useRef(false)
   const action = useAction()
   if (!workspace || !bot || !validFeedbackSource(source)) return null
@@ -25,9 +26,10 @@ export function ResultFeedback({ source, conversationId }: { source: FeedbackSou
     sending.current = true
     void action.run('feedback', async () => {
       try {
-        const recorded = await workspace.sendMessage(feedbackMessage(draft.source, draft.conversationId, draft.text), [], undefined, { target: { kind: 'bot_main', bot_id: draft.botId }, intent: 'continue', conversation_id: draft.conversationId })
+        let messageId: string | null = null
+        const recorded = await workspace.sendMessage(feedbackMessage(draft.source, draft.conversationId, draft.text), [], undefined, { target: { kind: 'bot_main', bot_id: draft.botId }, intent: 'continue', conversation_id: draft.conversationId, onSaved: input => { if (input.conversation_id === draft.conversationId && input.target.kind === 'bot_main' && input.target.bot_id === draft.botId && input.message_id) messageId = input.message_id } })
         if (!recorded) throw new Error('反馈尚未保存，草稿已保留。')
-        setSaved(draft); setDraft(null)
+        setSaved({ ...draft, messageId }); setDraft(null)
       } finally { sending.current = false }
     })
   }
@@ -41,6 +43,6 @@ export function ResultFeedback({ source, conversationId }: { source: FeedbackSou
       <View className="flex-row flex-wrap gap-2"><Button disabled={!workspace.canSaveMessages || action.busy !== null || changed || !draft.text.trim()} onPress={save}><Text>{action.busy ? '正在保存反馈…' : '发送反馈到主聊天'}</Text></Button><Button variant="ghost" disabled={action.busy !== null} onPress={() => { setDraft(null); action.clear() }}><Text>取消反馈</Text></Button></View>
     </View>}
     <ErrorText error={action.error} />
-    {saved ? <View accessibilityLiveRegion="polite" className="gap-1"><Text className="text-sm text-muted">反馈已保存在 {saved.botName} 的主聊天，送达状态请查看消息。</Text><Link href={`/b/${saved.botId}`} asChild><Button variant="ghost" className="self-start"><Text>查看反馈消息</Text></Button></Link>{saved.source.kind === 'task_result' ? <Link href={`/task/${saved.source.task_id}`} asChild><Button variant="ghost" className="self-start"><Text>返回原任务</Text></Button></Link> : null}</View> : null}
+    {saved ? <View accessibilityLiveRegion="polite" className="gap-1"><Text className="text-sm text-muted">{saved.messageId ? `反馈已保存在 ${saved.botName} 的主聊天，送达状态请查看原消息。` : `反馈已保存，但未取得消息位置；请打开 ${saved.botName} 的主聊天核对送达状态。`}</Text><Link href={{ pathname: '/b/[botId]', params: { botId: saved.botId, ...(saved.messageId ? { message: saved.messageId } : {}) } }} asChild><Button variant="ghost" className="self-start"><Text>{saved.messageId ? '查看反馈消息' : '打开主聊天'}</Text></Button></Link>{saved.source.kind === 'task_result' ? <Link href={`/task/${saved.source.task_id}`} asChild><Button variant="ghost" className="self-start"><Text>返回原任务</Text></Button></Link> : null}</View> : null}
   </View>
 }

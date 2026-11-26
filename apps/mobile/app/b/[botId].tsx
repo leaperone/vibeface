@@ -13,7 +13,7 @@ import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, input
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
-import { botRecap, recapGroups, routineState } from '@vibeface/client/chat/companion-recap.ts'
+import { botRecap, recapGroups, recapPreview, routineState } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples, useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { canRememberMessage } from '@vibeface/client/workspace/memory.ts'
@@ -26,7 +26,7 @@ import { questionOpen, questionParts } from '@vibeface/client/workspace/question
 import { chatStatusLine } from '@vibeface/client/workspace/labels.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
-import { EmptyState } from '@/components/kit'
+import { Details, EmptyState } from '@/components/kit'
 import { PopoverPanel } from '@/components/arc/popover'
 import { privateFiles } from '@/platform/files'
 import { Button } from '@/components/arc/button'
@@ -373,6 +373,7 @@ export default function ChatScreen() {
   const statusLine = routine ? '' : chatStatusLine(extras)
   const nextQuestion = routine ? undefined : [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
   const recap = botRecap({ bot, data: live?.data ?? null, inbox, notifications: live?.notifications ?? [], ignoredNotifications: live?.ignoredNotifications ?? new Set(), workspaceState: live?.workspaceState ?? null, openWorks: live?.openWorks ?? (chat?.works ?? []).map(work => ({ ...work, conversation_id: id })), fresh: live?.fresh ?? new Set(), connected: !offline && live?.dataOrigin === 'network' })
+  const recapView = recapPreview(recap)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
@@ -478,10 +479,10 @@ export default function ChatScreen() {
           const index = rows.findIndex((row) => row.key === `q:${nextQuestion.question_id}`)
           if (index >= 0) toUnread(index)
         }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : null}
-        {!routine && recap.length ? <ScrollView accessibilityLabel="回来接着办" className="max-h-48 w-full max-w-3xl self-center" contentContainerClassName="gap-3 px-4 py-2" keyboardShouldPersistTaps="handled"><Text className="text-sm text-muted">{offline || live?.dataOrigin !== 'network' ? '最近记录 · 连上后核对状态' : '回来接着办'}</Text>{recapGroups.map(({ group, label }) => {
-          const items = recap.filter(item => item.group === group)
+        {!routine && recapView ? <View accessibilityLabel="回来接着办" className="w-full max-w-3xl gap-1 self-center px-4 py-2"><Button variant={recapView.primary.group === 'decision' ? 'secondary' : 'ghost'} className="justify-start" onPress={() => openRecap(id, recapView.primary.target, recapView.primary.focus, recapView.primary.notificationId)}><Text numberOfLines={2} className="min-w-0 flex-1 text-left text-sm">{offline || live?.dataOrigin !== 'network' ? '最近记录 · ' : ''}{recapView.primary.state} · {recapView.primary.text}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Button>{recapView.more.length ? <Details key={id} label={`其余更新与进行中 · ${recapView.more.length}`}><ScrollView className="max-h-48" contentContainerClassName="gap-3" keyboardShouldPersistTaps="handled">{recapGroups.map(({ group, label }) => {
+          const items = recapView.more.filter(item => item.group === group)
           return items.length ? <View key={group} className="gap-1"><Text role="heading" className="text-sm font-medium">{label} · {items.length}</Text>{items.map(item => <Button key={item.key} variant="ghost" className="justify-start" onPress={() => openRecap(id, item.target, item.focus, item.notificationId)}><Text numberOfLines={2} className="min-w-0 flex-1 text-left text-sm">{item.state} · {item.text}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Button>)}</View> : null
-        })}</ScrollView> : null}
+        })}</ScrollView></Details> : null}</View> : null}
         {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
           <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
             <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />

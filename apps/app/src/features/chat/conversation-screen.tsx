@@ -1,7 +1,7 @@
 import { BotFace,botMood } from '@/components/app/bot-face'
 import { PromptInput } from '@/components/arc/conversation-composer'
 import { Chat,type ChatEntry } from '@/components/arc/conversation-thread'
-import { ActionCard,Dot,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
+import { ActionCard,Details,Dot,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
 import { ActionButton } from '@/features/workspace/present'
 import { useInbox } from '@/features/workspace/inbox'
@@ -16,7 +16,7 @@ import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,input
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
-import { botRecap,recapGroups,routineState,type BotRecapItem } from '@vibeface/client/chat/companion-recap.ts'
+import { botRecap,recapGroups,recapPreview,routineState,type BotRecapItem } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples,useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -74,6 +74,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const [selectedMainTarget, setSelectedTarget] = useState('main')
   const selectedTarget = routeRoutine ? `routine:${routeRoutine}` : selectedMainTarget
   const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
+  const [focusRequest, setFocusRequest] = useState(0)
   const [activityOpen, setActivityOpen] = useState(false)
   // The control that opened the activity drawer gets focus back, or the header button once it is gone, unless a link in it navigated away.
   const activityFrom = useRef<HTMLElement | null>(null)
@@ -191,6 +192,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
   const recap = bot ? botRecap({ bot, data, inbox, notifications: workspace.notifications, ignoredNotifications: workspace.ignoredNotifications, workspaceState: workspace.workspaceState, openWorks: workspace.openWorks, fresh: workspace.fresh, connected: workspace.connectionOnline && workspace.dataOrigin === 'network' }) : []
+  const recapView = recapPreview(recap)
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
   if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-sm text-foreground before:h-px before:flex-1 before:bg-foreground/40 after:h-px after:flex-1 after:bg-foreground/40">新消息</p> })
 
@@ -274,6 +276,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const chooseFirst = (example: string) => { if (text.trim() || files.length) return; setText(example); welcome.dismiss(); document.getElementById('message-text')?.focus() }
   const openRecap = (item: BotRecapItem) => {
     const target = item.target
+    if (target.kind === 'bot_main' && item.focus === routeMessage) setFocusRequest(value => value + 1)
     if (target.kind === 'task' || target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: target.task_id }, search: item.focus ? { message: item.focus } : {} })
     else if (target.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id }, search: item.focus ? { message: item.focus } : {} })
     else if (target.kind === 'work' && bot) void navigate({ to: '/b/$botId/work/$workId', params: { botId: bot.bot_id, workId: target.work_id }, search: item.focus ? { message: item.focus } : {} })
@@ -299,18 +302,19 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     <section className="conversation-screen" aria-label="对话">
       {history}
       {location.kind !== 'found' ? <div role="status" className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2 text-sm text-secondary"><p>{location.text}</p>{location.kind === 'failed' ? <Button type="button" variant="secondary" size="sm" onClick={location.retry}>重新定位原记录</Button> : null}</div> : null}
-      {!routeRoutine && recap.length ? <div aria-label="回来接着办" className="mx-auto grid max-h-64 w-full max-w-3xl gap-3 overflow-y-auto px-4 py-2 text-sm">
-        <p className="text-secondary">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录 · 连上后核对状态' : '回来接着办'}</p>
-        {recapGroups.map(({ group, label }) => {
-          const items = recap.filter(item => item.group === group)
+      {!routeRoutine && recapView ? <div aria-label="回来接着办" className="mx-auto grid w-full max-w-3xl gap-1 px-4 py-2 text-sm">
+        <Button type="button" variant={recapView.primary.group === 'decision' ? 'secondary' : 'ghost'} size="sm" className="h-auto! justify-start py-2! text-left" onClick={() => openRecap(recapView.primary)}><span className="line-clamp-2 whitespace-normal!">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录 · ' : ''}<span className="font-medium">{recapView.primary.state}</span> · {recapView.primary.text}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Button>
+        {recapView.more.length ? <Details key={conversationId} label={`其余更新与进行中 · ${recapView.more.length}`}><div className="grid max-h-64 gap-3 overflow-y-auto">{recapGroups.map(({ group, label }) => {
+          const items = recapView.more.filter(item => item.group === group)
           return items.length ? <section key={group} aria-label={label} className="grid gap-1"><h2 className="font-medium">{label} · {items.length}</h2>{items.map(item => <Button key={item.key} type="button" variant="ghost" size="sm" className="h-auto! justify-start py-2! text-left" onClick={() => openRecap(item)}><span className="line-clamp-2 whitespace-normal!">{item.state} · {item.text}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Button>)}</section> : null
-        })}
+        })}</div></Details> : null}
       </div> : null}
       {routeRoutine && bot ? <RoutineRecord workspace={workspace} botId={bot.bot_id} trigger={routeRoutine} notificationId={routeNotification} /> : <Chat
         key={conversationId}
         entries={entries}
         remember
         focus={routeMessage ?? undefined}
+        focusRequest={focusRequest}
         empty={bot ? <div className="mx-auto my-auto grid w-full min-w-0 max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotFace bot={bot} mood={botMood(bot, workspace)} size={96} />
           <div className="grid min-w-0 max-w-full justify-items-center gap-1">

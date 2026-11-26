@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { botRecap, routineState } from './companion-recap.ts'
+import { botRecap, recapPreview, routineState, type BotRecapItem } from './companion-recap.ts'
 import { completeHistory } from '../workspace/history-fixture.ts'
 import { parseConversation } from '../workspace/model.ts'
 import type { InboxItem } from '../workspace/inbox.ts'
@@ -101,4 +101,15 @@ test('an active routine has one original scope before it has a result notificati
   data.scopeJobs = [{ ...job, state: 'completed' }]
   assert.equal(routineState(data, job.trigger, true), '本轮已结束')
   assert.equal(routineState(data, 'schedule:other:1', true), null)
+})
+
+test('recap preview reserves one action for decisions or new results and leaves routine work in activity', () => {
+  const item = (key: string, group: BotRecapItem['group']): BotRecapItem => ({ key, group, state: '记录', text: key, target: { kind: 'bot_main', bot_id: 'bot' } })
+  const working = item('ongoing', 'working'), result = item('new-result', 'result'), decision = item('choice', 'decision'), another = item('another-choice', 'decision')
+  assert.equal(recapPreview([]), null)
+  assert.equal(recapPreview([working]), null)
+  const preview = recapPreview([working, result, decision, another])
+  assert.equal(preview?.primary, decision)
+  assert.deepEqual(preview?.more, [working, result, another])
+  assert.equal(recapPreview([working, result])?.primary, result)
 })
