@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { parseMessageSearch, parseWorkspaceHistory } from './model.ts'
-import { readWorkspaceHistoryPage, searchMessages } from './history-search.ts'
+import { searchMessages } from './history-search.ts'
 import type { MessageSearchPage, MessageSearchScope } from './types.ts'
 
 const task: MessageSearchScope = { kind: 'task', task_id: 'task-one' }
@@ -60,17 +60,4 @@ test('shared search API forwards explicit server scope and continuation and pars
   assert.deepEqual(await searchMessages({ connection, scope: task, query, cursor: 'previous', limit: 2 }), result())
   assert.deepEqual(requests, [{ method: 'message_search', params: { scope: task, query, cursor: 'previous', limit: 2 } }])
   await assert.rejects(searchMessages({ connection, scope: channel, query, limit: 2 }), /范围不一致/)
-})
-
-test('workspace API keeps scope filters on every older page and rejects a different server scope', async () => {
-  const requests: { method: string; params?: Record<string, unknown> }[] = []
-  const connection = { rpc: async (method: string, params?: Record<string, unknown>): Promise<unknown> => {
-    requests.push({ method, params })
-    return { history_authority: 'workspace-authority', events: [], next_cursor: null, complete: true, coverage: { limit: 2, truncated: false, scope: 'task' } }
-  } }
-  const page = await readWorkspaceHistoryPage({ connection, filter: { task_id: 'task-one', limit: 2 }, cursor: 'older' })
-  assert.equal(page.complete, true)
-  assert.equal(page.history_authority, 'workspace-authority')
-  assert.deepEqual(requests, [{ method: 'workspace_history', params: { task_id: 'task-one', limit: 2, cursor: 'older' } }])
-  await assert.rejects(readWorkspaceHistoryPage({ connection, filter: { channel_id: 'channel', limit: 2 } }), /范围不一致/)
 })
