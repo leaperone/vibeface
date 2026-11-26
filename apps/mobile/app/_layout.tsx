@@ -24,6 +24,7 @@ import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace, useLive, useWaiting } from '@/data/live'
 import { NotificationBanner } from '@/features/home/notification-banner'
+import { IncomingShareEntry } from '@/features/share/incoming'
 import { HomeList } from '@/features/home/list'
 import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
@@ -79,6 +80,7 @@ function Screens() {
   // The Stack keeps its place in the tree whether or not the sidebar shows, so a rotation never resets the route.
   return <>
     <StatusBar style="auto" />
+    <IncomingShareEntry />
     <View className="flex-1 flex-row bg-background">
       {/* Kept mounted when narrow, hidden with its effects stopped and its updates deferred, so a rotation only flips its display. */}
       {ready ? <View className="w-80 border-e border-border bg-surface-muted" style={{ display: wide ? 'flex' : 'none' }}><Activity mode={wide ? 'visible' : 'hidden'}><HomeList sidebar /></Activity></View> : null}
@@ -94,6 +96,7 @@ function Screens() {
           headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '500', color: foreground },
           contentStyle: { backgroundColor: background },
         }}>
+          <Stack.Screen name="share" options={{ title: '分享给 Bot', presentation: 'modal' }} />
           <Stack.Protected guard={!ready}>
             <Stack.Screen name="join" options={{ headerShown: false }} />
           </Stack.Protected>

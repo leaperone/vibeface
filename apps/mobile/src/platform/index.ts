@@ -187,6 +187,7 @@ export const mobilePlatform: Platform = {
       await Notifications.dismissAllNotificationsAsync()
       await Notifications.clearLastNotificationResponseAsync()
       openings.clear()
+      Sharing.clearSharedPayloads()
       store.clearAll()
       clearLogs()
     })
