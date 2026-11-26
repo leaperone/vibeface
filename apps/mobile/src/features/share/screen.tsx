@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { ScrollView, View } from 'react-native'
+import { Alert, ScrollView, View } from 'react-native'
 import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { parsePendingMessage } from '@vibeface/client/workspace/model.ts'
+import type { InputReceipt } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { Button } from '@/components/arc/button'
 import { RadioMark, SelectionItem } from '@/components/arc/selection'
@@ -34,7 +35,10 @@ export function ShareScreen() {
   const [expanded, setExpanded] = useState(false)
   const [details, setDetails] = useState(false)
   const [recoveryError, setRecoveryError] = useState('')
+  const [queried, setQueried] = useState<{ id: string; receipt: InputReceipt } | null>(null)
   const sending = useRef(false)
+  const scope = useRef(workspace)
+  scope.current = workspace
   useEffect(() => { setExpanded(false); setDetails(false); setRecoveryError('') }, [item?.material.id])
   const selected = selection?.materialId === item?.material.id ? selection?.target : null
   const belongsHere = (target: ShareTarget) => target.networkId === workspace.networkId && target.deviceId === workspace.deviceId
@@ -61,21 +65,23 @@ export function ShareScreen() {
 
   const close = () => { if (router.canGoBack()) router.back(); else router.replace('/') }
   const dismiss = () => {
-    if (item && item.kind !== 'saving') shareInbox.dismiss(item.material.id)
-    if (!shareInbox.read().some(candidate => shareVisible(candidate, workspace)) || item?.kind === 'saving') close()
+    if (item && !shareVisible(item, scope.current)) { close(); return }
+    if (item) shareInbox.dismiss(item.material.id)
+    if (!shareInbox.read().some(candidate => shareVisible(candidate, workspace))) close()
+  }
+  const removeReceipt = () => {
+    Alert.alert('移除这条分享记录？', '只移除本机分享页中的记录，不会撤回、停止或重新发送原消息。仍可在原对话中核对。', [
+      { text: '保留', style: 'cancel' },
+      { text: '移除记录', style: 'destructive', onPress: dismiss },
+    ])
   }
   const send = async () => {
     if (sending.current || !item || item.kind !== 'draft' || !selected || !selectedHere || !shared?.canSaveMessages || !shared.isCurrent() || !device.ready?.isCurrent()) throw new Error('目标或工作区尚未就绪，请重新确认网络和 Bot。')
     sending.current = true
     const id = item.material.id
     try {
-      shareInbox.start(id, selected)
       const bytes = new TextEncoder().encode(item.material.text)
-      await shared.sendMessage(sharedMaterialMessage, [{ name: shareAttachmentName(id), arrayBuffer: async () => bytes.buffer }], [], {
-        conversation_id: selected.conversationId,
-        target: { kind: 'bot_main', bot_id: selected.botId },
-        onSaved: input => shareInbox.saved(id, input.message_id),
-      })
+      await shared.sendMessage(sharedMaterialMessage, [{ name: shareAttachmentName(id), arrayBuffer: async () => bytes.buffer }], [], shareInbox.inputOptions(id, selected))
     } catch (cause) {
       const current = shareInbox.read().find(candidate => candidate.material.id === id)
       if (current?.kind === 'saving') await recover(current)
@@ -116,10 +122,14 @@ export function ShareScreen() {
     </View> : <View className="gap-3">
       <Text role="heading" className="text-base font-medium">{botLabel(item.target.botId, item.target.botName)}</Text>
       <Text className="text-sm text-secondary">个人网络 · {item.target.networkId.slice(0, 8)}{item.target.entryName ? `，通过 ${item.target.entryName}` : ''}</Text>
-      <Text accessibilityLiveRegion="polite">{busy === 'send' ? '正在保存到本机，完成后再离开。' : shareDelivery(item, pending)}</Text>
-      {item.kind === 'saved' && pending && liveTarget && shared ? <Button variant="secondary" disabled={busy !== null || !shared.writable} onPress={() => void run('retry-share', () => shared.retryPendingMessage(item.messageId))}><Text>核对并重试原消息</Text></Button> : null}
-      <Button variant="secondary" disabled={busy !== null || !liveTarget} onPress={() => router.push({ pathname: '/b/[botId]', params: { botId: item.target.botId, ...(item.kind === 'saved' ? { message: item.messageId } : {}) } })}><Text>查看原对话</Text></Button>
-      <Button variant="ghost" disabled={busy !== null} onPress={dismiss}><Text>关闭分享页</Text></Button>
+      <Text accessibilityLiveRegion="polite">{busy === 'send' ? '正在保存到本机，完成后再离开。' : shareDelivery(item, pending, queried?.id === item.material.id ? queried.receipt : undefined)}</Text>
+      {liveTarget && shared ? <Button variant="secondary" disabled={busy !== null} onPress={() => void run('query-share', async claim => {
+        const receipt = await shared.queryInput({ message_id: item.messageId, conversation_id: item.target.conversationId, target: { kind: 'bot_main', bot_id: item.target.botId } })
+        if (claim.current() && 'stage' in receipt) setQueried({ id: item.material.id, receipt })
+      })}><Text>查询原消息状态</Text></Button> : null}
+      {pending && liveTarget && shared ? <Button variant="secondary" disabled={busy !== null || !shared.writable} onPress={() => void run('retry-share', () => shared.retryPendingMessage(item.messageId))}><Text>核对并重试原消息</Text></Button> : null}
+      <Button variant="secondary" disabled={busy !== null || !liveTarget} onPress={() => router.push({ pathname: '/b/[botId]', params: { botId: item.target.botId, message: item.messageId } })}><Text>查看原对话</Text></Button>
+      <Button variant="ghost" disabled={busy !== null} onPress={removeReceipt}><Text>移除本机分享记录</Text></Button>
     </View>}
     {item.kind !== 'draft' || selectedHere ? <View className="gap-2">
       <Button variant="ghost" className="self-start" accessibilityState={{ expanded: details }} onPress={() => setDetails(value => !value)}><Text>{details ? '收起目标标识' : '查看目标标识'}</Text></Button>

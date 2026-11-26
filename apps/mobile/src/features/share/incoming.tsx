@@ -6,7 +6,7 @@ import { usePathname, useRootNavigationState, useRouter } from 'expo-router'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { useWorkspace } from '@/data/context'
 import { mobilePlatform } from '@/platform'
-import { incomingShares, shareVisible } from '@/platform/incoming-share'
+import { clearNativeShare, incomingShares, shareVisible } from '@/platform/incoming-share'
 
 export const shareInbox = incomingShares(mobilePlatform.storage)
 
@@ -30,21 +30,24 @@ export function IncomingShareEntry() {
     }
     const receive = () => {
       let raw: string | undefined
+      let localId: string | undefined
       try {
         const payloads = getSharedPayloads()
         raw = JSON.stringify(payloads)
-        shareInbox.receive(payloads)
-        if (payloads.length) {
-          clearSharedPayloads()
-          shareInbox.receive([])
-        }
+        localId = shareInbox.receive(payloads)
+        if (payloads.length) clearNativeShare({ raw, read: getSharedPayloads, clear: clearSharedPayloads, inbox: shareInbox })
         open()
       } catch (cause) {
-        Alert.alert('资料尚未保存', messageOf(cause), [
+        Alert.alert(localId ? '资料已保留，分享尚未处理完' : '资料尚未保存', messageOf(cause), [
           { text: '保留，稍后处理', style: 'cancel' },
           ...(raw && raw !== '[]' ? [{ text: '放弃这次分享', style: 'destructive' as const, onPress: () => {
-            // Another app may have shared something else while the alert was open.
-            if (JSON.stringify(getSharedPayloads()) === raw) clearSharedPayloads()
+            if (!raw) return
+            try {
+              if (clearNativeShare({ raw, read: getSharedPayloads, clear: clearSharedPayloads, inbox: shareInbox })) {
+                const draft = shareInbox.read().find(item => item.material.id === localId)
+                if (draft?.kind === 'draft') shareInbox.dismiss(draft.material.id)
+              }
+            } catch (cause) { Alert.alert('这次分享尚未放弃', messageOf(cause)) }
           } }] : []),
         ])
       }

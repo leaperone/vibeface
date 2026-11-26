@@ -1,11 +1,12 @@
 import type { KeyValue } from '@vibeface/client/lib/platform.ts'
 import type { PendingMessage } from '@vibeface/client/chat/types.ts'
+import type { InputOptions, InputReceipt } from '@vibeface/client/workspace/types.ts'
 
 export type ShareTarget = { networkId: string; deviceId: string; botId: string; conversationId: string; botName: string; entryName: string }
 type Material = { id: string; text: string }
 export type IncomingShare =
   | { kind: 'draft'; material: Material }
-  | { kind: 'saving'; material: Material; target: ShareTarget }
+  | { kind: 'saving'; material: Material; target: ShareTarget; messageId: string }
   | { kind: 'saved'; material: Material; target: ShareTarget; messageId: string }
 type Inbox = { native: string | null; items: IncomingShare[] }
 const storageKey = 'vibeface.incoming-shares'
@@ -28,7 +29,7 @@ function share(value: unknown): value is IncomingShare {
   if (!material || typeof material !== 'object' || !('id' in material) || typeof material.id !== 'string' || !/^[\w-]{1,64}$/.test(material.id)
     || !('text' in material) || typeof material.text !== 'string' || !material.text.trim() || material.text.length > maxText) return false
   return value.kind === 'draft' || (('target' in value && target(value.target))
-    && (value.kind === 'saving' || (value.kind === 'saved' && 'messageId' in value && typeof value.messageId === 'string' && Boolean(value.messageId))))
+    && (value.kind === 'saving' || value.kind === 'saved') && 'messageId' in value && typeof value.messageId === 'string' && Boolean(value.messageId))
 }
 
 /** Read raw shares only: resolving a URL would fetch external content before the person confirms. */
@@ -68,11 +69,16 @@ export function shareBotLabel(input: { botId: string; name: string; bots: readon
 export function sharePending(item: Exclude<IncomingShare, { kind: 'draft' }>, pending: readonly PendingMessage[]) {
   return pending.find(input => input.conversation_id === item.target.conversationId
     && input.target.kind === 'bot_main' && input.target.bot_id === item.target.botId
-    && (item.kind === 'saved' ? input.message_id === item.messageId : input.attachments?.some(file => file.name === shareAttachmentName(item.material.id))))
+    && input.message_id === item.messageId)
 }
 
-export function shareDelivery(item: IncomingShare, pending?: PendingMessage): string {
+export function shareDelivery(item: IncomingShare, pending?: PendingMessage, receipt?: InputReceipt): string {
   if (item.kind === 'draft') return '尚未排队。确认目标并发送后，才会保存到本机待发队列。'
+  if (receipt) {
+    if (receipt.stage === 'unknown') return receipt.reason || '送达结果仍待确认，不会另发一份。'
+    if (receipt.stage === 'refused') return receipt.reason || '目标设备未接收，请查看原对话。'
+    return '原消息已有接收回执。Bot 的处理结果请查看原对话。'
+  }
   if (item.kind === 'saving') return '上次本地保存的结果尚未确认。先核对原对话，避免重复发送。'
   if (!pending) return '本机已保存这条消息；当前送达状态请在原对话中核对。'
   if (pending.rejected || pending.receipt?.stage === 'refused') return pending.rejected || pending.receipt?.reason || '目标设备未接收，请查看原对话。'
@@ -108,6 +114,13 @@ export function incomingShares(storage: KeyValue, newId: () => string = () => gl
     if (!current.items.some(item => item.material.id === id)) throw new Error('分享资料已变更或清除，请重新查看。')
     write({ ...current, items: current.items.map(item => item.material.id === id ? change(item) : item) })
   }
+  function saved(id: string, messageId: string) {
+    if (!read().items.some(item => item.material.id === id)) return
+    replace(id, item => {
+      if (item.kind === 'draft' || item.messageId !== messageId) throw new Error('本地消息编号不匹配，请核对原对话。')
+      return { ...item, kind: 'saved' }
+    })
+  }
   return {
     read: () => read().items,
     watch(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener) } },
@@ -119,21 +132,37 @@ export function incomingShares(storage: KeyValue, newId: () => string = () => gl
       }
       const text = sharedText(payloads)
       const signature = text
-      if (current.native === signature) return
+      if (current.native === signature) return current.items.findLast(item => item.material.text === text)?.material.id
       if (current.items.length >= 20) throw new Error('请先处理现有分享，再接收新的资料。')
-      write({ native: signature, items: [...current.items, { kind: 'draft', material: { id: newId(), text } }] })
+      const id = newId()
+      write({ native: signature, items: [...current.items, { kind: 'draft', material: { id, text } }] })
+      return id
     },
-    start(id: string, destination: ShareTarget) {
+    inputOptions(id: string, destination: ShareTarget): InputOptions {
       if (!target(destination)) throw new Error('请选择完整的网络和 Bot 目标。')
-      replace(id, item => {
-        if (item.kind !== 'draft') throw new Error('这份资料已经提交保存，请核对原消息。')
-        return { kind: 'saving', material: item.material, target: destination }
-      })
+      const draft = read().items.find(item => item.material.id === id)
+      if (!draft || draft.kind !== 'draft') throw new Error('这份资料已变更或已经提交保存，请核对原消息。')
+      return {
+        conversation_id: destination.conversationId,
+        target: { kind: 'bot_main', bot_id: destination.botId },
+        onPrepared(input) {
+          if (!input.message_id || input.conversation_id !== destination.conversationId || input.target.kind !== 'bot_main' || input.target.bot_id !== destination.botId) throw new Error('准备保存的目标不匹配，请重新确认。')
+          replace(id, item => {
+            if (item.kind !== 'draft') throw new Error('这份资料已经提交保存，请核对原消息。')
+            return { kind: 'saving', material: item.material, target: destination, messageId: input.message_id }
+          })
+        },
+        onSaved: input => saved(id, input.message_id),
+      }
     },
-    saved(id: string, messageId: string) {
-      if (!messageId) throw new Error('本地消息缺少编号，先核对原对话。')
-      replace(id, item => item.kind === 'saving' ? { ...item, kind: 'saved', messageId } : item)
-    },
+    saved,
     dismiss(id: string) { const current = read(); write({ ...current, items: current.items.filter(item => item.material.id !== id) }) },
   }
+}
+
+export function clearNativeShare(input: { raw: string; read(): unknown; clear(): void; inbox: Pick<ReturnType<typeof incomingShares>, 'receive'> }) {
+  if (JSON.stringify(input.read()) !== input.raw) return false
+  input.clear()
+  input.inbox.receive([])
+  return true
 }
