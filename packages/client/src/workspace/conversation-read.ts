@@ -1,7 +1,7 @@
 import type { TranscriptMessage } from '../chat/types.ts'
 import type { NotificationRecord } from './types.ts'
 import { unreadReply } from '../chat/timeline.ts'
-import { parseConversation } from './model.ts'
+import { readValidatedSnapshot, type ValidatedSnapshot, type SnapshotCondition } from './conversation-snapshot.ts'
 import { mergeConversationSnapshot } from './history.ts'
 import type { ConversationPayload } from './types.ts'
 
@@ -37,7 +37,9 @@ export async function readConversationSnapshot(input: {
   conversationId: string
   owner: ConversationReadOwner
   current(): boolean
-  read(): Promise<unknown>
+  snapshot: { current: ValidatedSnapshot | null }
+  scope: string
+  read(previous?: SnapshotCondition): Promise<unknown>
   shown(): ConversationPayload | null
   loading(value: boolean): void
   failed(caught: unknown): void
@@ -47,8 +49,8 @@ export async function readConversationSnapshot(input: {
   const baseline = input.shown(), request = input.owner.start(input.current)
   input.loading(true)
   try {
-    const next = parseConversation(await input.read(), input.conversationId)
-    if (!request.current()) return null
+    const next = await readValidatedSnapshot({ ...input, current: request.current })
+    if (!next || !request.current()) return null
     const shown = input.shown()
     if (shown && shown.history_authority !== next.history_authority) {
       input.owner.clearConfirmation()

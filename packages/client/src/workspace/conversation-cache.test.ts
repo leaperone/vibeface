@@ -184,7 +184,7 @@ function reader() {
   const read = (reply: Promise<unknown>) => {
     const id = activeId, expectedGeneration = generation, expectedNetwork = network
     return readConversationSnapshot({
-      conversationId: id, owner, current: () => activeId === id && generation === expectedGeneration && network === expectedNetwork,
+      conversationId: id, owner, scope: JSON.stringify([network, id]), snapshot: { current: null }, current: () => activeId === id && generation === expectedGeneration && network === expectedNetwork,
       read: () => reply, shown: () => displayed, loading: (value) => { loading = value }, failed: (caught) => { error = caught }, authorityChanged: () => { authorityChanges += 1 },
       apply: async (payload) => { displayed = payload; cache.save({ ...key(id), networkId: network, payload }); return payload },
     })

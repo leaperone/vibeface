@@ -19,7 +19,7 @@ import { unreachableText } from "@vibeface/client/lib/transport.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { backTo,tabs } from "@vibeface/client/workspace/home.ts"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
-import { addressName,entryLabel,hostOf,isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { addressName,entryLabel,hostOf,isLoopback,nodeName } from "@vibeface/client/workspace/labels.ts"
 import { workspaceTaskCounts } from "@vibeface/client/workspace/presentation.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
@@ -37,6 +37,22 @@ const subscribeWidth = (listener: () => void) => {
   media.addEventListener("change", listener)
   return () => media.removeEventListener("change", listener)
 }
+const warmReconnect = ({ ready, phase, link }: ReturnType<typeof useDevice>) => Boolean(ready && phase === 'reconnecting' && (link.kind === 'connecting' || link.kind === 'offline') && link.attempt <= 1)
+
+/** A lost live channel keeps its screen; only a failed retry needs the offline recovery controls. */
+export function ConnectionNotice() {
+  const device = useDevice()
+  const workspace = useWorkspace()
+  if (workspace.connectionOnline) return null
+  if (warmReconnect(device)) return <p role="status" className="flex min-h-8 max-w-full items-center gap-1.5 px-2.5 text-sm text-secondary max-md:min-h-11">
+    <RefreshCw aria-hidden="true" className="size-4 shrink-0" /><span>{device.queued ? `恢复连接中，排队第 ${device.queued} 位` : '正在恢复连接，显示最近记录'}</span>
+  </p>
+  return <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-panel border bg-surface ps-2.5 pe-1 text-sm font-medium max-md:min-h-11">
+    <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{device.ready ? nodeName(device.ready.entry.device_id, { nodes: workspace.nodes, directory: device.directory }) : '设备'}</span>
+    <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={device.retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+  </p>
+}
+
 export function WorkspaceShell({ children, landing = false }: { children: ReactNode; landing?: boolean }) {
   const [open,setOpen] = useState(true)
   return <ShellNavigation.Provider value={{ open,setOpen }}><div className={layout.shell}><WorkspaceLayout landing={landing}>{children}</WorkspaceLayout></div></ShellNavigation.Provider>
@@ -188,7 +204,9 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
   const name = entryLabel({ joined: workspace.joined, directory: device.directory, entryId: device.ready?.entry.device_id, ownName: workspace.info?.name, address })
   // Devices of another network this browser opened before; the current network fails over by itself.
   const others = device.entries.filter((item) => item.kind !== "local" && !device.directory?.members.some((member) => member.device_id === item.device_id))
-  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting" || name === null
+  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = warmReconnect(device)
+    ? { label: "恢复连接中", icon: RefreshCw, tone: "text-secondary" }
+    : link.kind === "connecting" || name === null
     ? { label: entrances.length > 1 && name !== null ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-secondary" }
@@ -210,7 +228,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
       <PopoverContent side={side} align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-panel border bg-surface-raised p-3 text-sm text-foreground shadow-lg">
         <p className="font-medium">{terms.address.label}</p>
         <p className="break-all text-secondary" title={address}>{hostOf(address) || address}</p>
-        {link.kind === "offline" ? <div className="grid gap-2"><p className="text-secondary">{link.reason === unreachableText ? "连不上这台电脑" : "所有访问地址都连不上"}，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
+        {warmReconnect(device) ? <p className="text-secondary">正在恢复连接，显示最近记录</p> : link.kind === "offline" ? <div className="grid gap-2"><p className="text-secondary">{link.reason === unreachableText ? "连不上这台电脑" : "所有访问地址都连不上"}，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><terms.encrypted.icon aria-hidden="true" className="size-4" />{terms.encrypted.label}，设备已验证</p> : null}
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}

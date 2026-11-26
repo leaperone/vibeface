@@ -367,6 +367,66 @@ test('a queued read receives its full response deadline when sent and a stalled 
   } finally { channel.close(); await completed; t.mock.timers.reset() }
 })
 
+for (const responsive of [false, true]) test(`a sent-read deadline delayed by suspension ${responsive ? 'drains an already queued reply without reconnecting' : 'closes a still-dead connection after one grace window'}`, async t => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 })
+  const calls = Array.from({ length: 8 }, () => channel.request('write_state'))
+  let completed = Promise.allSettled(calls)
+  try {
+    t.mock.timers.tick(59000)
+    calls.push(channel.request('directory'))
+    completed = Promise.allSettled(calls)
+    if (responsive) app.reply('1', { read: 1 })
+    // Move the wall clock without running JS, then run the expired timers before socket microtasks.
+    t.mock.timers.setTime(62000)
+    t.mock.timers.tick(0)
+    assert.equal(app.open(), 1)
+    assert.equal(channel.idle(), false)
+    assert.equal(app.requests.length, 8, 'the drain window keeps every remote read slot occupied')
+    if (responsive) {
+      await settle()
+      assert.equal(app.requests.length, 9, 'only the real reply frees a slot for the queued read')
+      for (let id = 2; id <= 9; id++) app.reply(String(id), { read: id })
+      assert.deepEqual(await completed, Array.from({ length: 9 }, (_, index) => ({ status: 'fulfilled', value: { read: index + 1 } })))
+      t.mock.timers.tick(1000)
+      assert.equal(app.open(), 1, 'reply processing cancels the deferred deadlines')
+      assert.equal(channel.idle(), true)
+    } else {
+      // Even another suspension cannot extend the same request's grace a second time.
+      t.mock.timers.setTime(120000)
+      t.mock.timers.tick(0)
+      const settled = await completed
+      assert.equal(settled.every(item => item.status === 'rejected'), true)
+      const queued = settled[8]
+      if (queued.status === 'rejected') assert.match(queued.reason.message, /尚未发出/)
+      assert.equal(app.open(), 0)
+      assert.equal(channel.idle(), true)
+      assert.equal(app.requests.length, 8, 'a late timeout neither releases a remote slot nor resends a request')
+    }
+  } finally { channel.close(); await completed; t.mock.timers.reset() }
+})
+
+test('a suspended write deadline remains unknown immediately and never receives read grace or replay', async t => {
+  const app = await harness({ holdRequests: true })
+  const channel = await app.connect()
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 })
+  const sent = channel.request('rpc', { method: 'send_message', input_id: 'suspended-write' })
+  const unknown = assert.rejects(sent, (error: Error & { responded?: boolean }) => {
+    assert.match(error.message, /还没确认结果/)
+    assert.equal(error.responded, undefined)
+    return true
+  })
+  try {
+    t.mock.timers.setTime(62000)
+    t.mock.timers.tick(0)
+    await unknown
+    assert.equal(channel.idle(), true)
+    assert.equal(app.open(), 1)
+    assert.equal(app.requests.length, 1)
+  } finally { channel.close(); await unknown; t.mock.timers.reset() }
+})
+
 test('pending model and write calls do not hold the read budget', async () => {
   const app = await harness({ holdRequests: true })
   const channel = await app.connect()

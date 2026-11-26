@@ -68,6 +68,7 @@ const page = () => (globalThis as { location?: { origin: string; protocol: strin
 const readMethods = new Set(['info', 'directory', 'write_state', 'node_settings', 'triage_settings', 'relay_settings', 'share_link', 'entrances'])
 const readRpcMethods = new Set(['nodes', 'conversations', 'conversation_history', 'message_search', 'open_works', 'work_detail', 'workspace_overview', 'workspace_state', 'workspace_history', 'workspace_command_receipt', 'signed_receipt', 'input_receipt', 'scope_context', 'read_artifact', 'bots', 'questions', 'memory_state', 'notifications'])
 const readCalls = 8, queuedReads = 64, requestTimeoutMs = 60000
+const suspendedReadGraceMs = 1000
 const isRead = (method: string, params: Record<string, unknown>) => readMethods.has(method) || (method === 'rpc' && typeof params.method === 'string' && readRpcMethods.has(params.method))
 
 export function validTarget(value: unknown): string {
@@ -381,13 +382,22 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     const open = channel, wire = carrier
     function send(id: string, plaintext: Uint8Array, read: boolean, resolve: Reply['resolve'], reject: Reply['reject'], onSent?: () => void) {
       if (read) activeReads++
-      const timer = setTimeout(() => {
+      const expire = () => {
         pending.delete(id)
         const error = new Error('设备还没确认结果。先确认原操作的结果，别重复提交。')
         reject(error)
         // A local timeout does not cancel work on the Node. Close a stalled read
         // connection instead of releasing its slot and exceeding the remote budget.
         if (read) wire.close(error)
+      }
+      const dueAt = Date.now() + requestTimeoutMs
+      const timer = setTimeout(() => {
+        const item = pending.get(id)
+        if (!item) return
+        // Suspension can delay both this deadline and an already queued reply. Keep the remote slot
+        // occupied for one drain window; the second deadline expires without another extension.
+        if (read && Date.now() - dueAt > suspendedReadGraceMs) item.timer = setTimeout(expire, suspendedReadGraceMs)
+        else expire()
       }, requestTimeoutMs)
       pending.set(id, { resolve, reject, timer, read, onSent })
       onSent?.()

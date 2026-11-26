@@ -26,6 +26,7 @@ import { mergeConversation, mergeWorkspaceState } from "./records.ts"
 import { HistoryRequests, mergeHistoryPage, readConversationHistory } from "./history.ts"
 import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
+import type { ValidatedSnapshot } from "./conversation-snapshot.ts"
 import { notificationPreferences, notificationPreview, systemNotifications } from "./system-notifications.ts"
 import { answerId, questionInboxDismissible, questionInboxKey } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
@@ -54,6 +55,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const emptyNodes: NodeInfo[] = []
+const workspaceRefreshInterval = 5 * 60_000
 const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const inputMissingReason = '这条输入的送达结果仍未确认，原内容已保留。请连接原设备，再确认原设备并查询。'
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
@@ -77,6 +79,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const prefix = `${networkId}.${clientId}:`
   const [ledgerFailed, setLedgerFailed] = useState(false)
   const ledgerFailure = useRef(false)
+  const initialReads = useRef<{ local: boolean; workspace: boolean } | null>(null)
   const ledgerLease = useRef(platform.outbox.lease?.()).current
   const ledgerGuard = () => {
     requireCurrent()
@@ -187,10 +190,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
-  const dataScope = useRef({ networkId, clientId })
+  const dataScope = useRef<string | null>(null)
   const readConnection = useRef<ReadyConnection | null>(null)
   const readGeneration = useRef<number | null>(null)
   const conversationReads = useRef(new ConversationReadOwner())
+  const latestSnapshot = useRef<ValidatedSnapshot | null>(null)
+  const snapshotScope = (id: string) => JSON.stringify([networkId, clientId, connection.principal.epoch, connection.principal.source, connection.principal.can_manage, connection.entry.device_id, id])
   const historyRequests = useRef(new HistoryRequests())
   const [historyLoading, setHistoryLoading] = useState<ReadonlySet<HistorySection>>(new Set())
   const messagesRef = useRef<PendingMessage[]>([])
@@ -212,6 +217,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const loadedMessageConnection = useRef<ReadyConnection | null>(null)
   const localMessageSaves = useRef(0)
   const refreshingRef = useRef(false)
+  const lastWorkspaceReadAt = useRef<number | null>(null)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
   const refreshingGeneration = useRef<number | null>(null)
   const refreshAgain = useRef(false)
@@ -383,7 +389,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     historyRequests.current.reset()
     setHistoryLoading(new Set())
     const cached = cachedConversation(id)
-    dataScope.current = { networkId, clientId }
+    dataScope.current = snapshotScope(id)
     dataRef.current = cached
     onScreen.current = null
     setFresh(new Set<string>())
@@ -402,8 +408,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     return readConversationSnapshot({
       conversationId: id, owner: conversationReads.current,
       current: () => current() && activeId.current === id,
-      read: () => rpc('conversation', { conversation_id: id }),
-      shown: () => dataRef.current,
+      snapshot: latestSnapshot,
+      scope: snapshotScope(id),
+      read: (condition) => rpc('conversation', { conversation_id: id, conditional: true, ...condition }),
+      // A previous Web generation stays visible during reconnect. Its older pages can contain work that finished while offline.
+      shown: () => conversationCache || readGeneration.current === connectionGeneration ? dataRef.current : null,
       loading: setConversationLoading,
       failed: (caught) => setConversationError(messageOf(caught, '读取对话')),
       authorityChanged: () => {
@@ -457,11 +466,37 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }
   }
   const notificationForMain = (notification: NotificationRecord, id: string) => notification.conversation_id === id && isMainNotification(notification, botsRef.current.find((bot) => bot.conversation_id === id)?.bot_id)
-  const acknowledgeNotification = async (notification: NotificationRecord) => {
-    await signedWrite(notification.conversation_id, { method: "ack", params: { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, writeBody({ method: "ack", params: { notification_id: notification.notification_id } }, clientId)) } })
+  const acknowledgeNotification = async (notification: NotificationRecord, visible?: () => boolean) => {
+    const params = { notification_id: notification.notification_id }
+    const attestation = await attest(notification.conversation_id, writeBody({ method: "ack", params }, clientId))
+    if (visible && !visible()) return
+    await signedWrite(notification.conversation_id, { method: "ack", params: { ...params, attestation } })
     requireCurrent()
     notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
     setNotifications(notificationsRef.current)
+  }
+  const markChatVisit = (id: string, next: ConversationPayload) => {
+    if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
+    else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
+      onScreen.current = { id, connection }
+      setFresh(new Set([...notificationsRef.current.filter((item) => notificationForMain(item, id) && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
+    }
+  }
+  const acknowledgeOpenChat = async (id: string) => {
+    if (platform.explicitMessageRead || !joined) return
+    const visible = () => current() && sameRead() && conversationReads.current.confirmed() && activeId.current === id
+      && dataRef.current?.conversation?.conversation_id === id && viewRef.current === 'chat' && platform.foreground()
+    if (!visible()) return
+    const seen = notificationsRef.current.filter((item) => notificationForMain(item, id) && !isSessionNotification(item))
+    for (const notification of seen) {
+      if (!visible()) break
+      const key = `ack:${notification.notification_id}`
+      const pending = inFlight.current
+      if (pending.has(key) || !notificationsRef.current.some(item => item.notification_id === notification.notification_id)) continue
+      pending.add(key)
+      try { await acknowledgeNotification(notification, visible) } catch (caught) { showError(caught, "标记已读"); break }
+      finally { pending.delete(key) }
+    }
   }
   const showConversation = async (id: string, next: ConversationPayload) => {
     // While the entry catches up, what the page already showed stays on screen.
@@ -474,11 +509,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setData(next)
     setDataOrigin('network')
     persistConversation(id, next)
-    if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
-    else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
-      onScreen.current = { id, connection }
-      setFresh(new Set([...notificationsRef.current.filter((item) => notificationForMain(item, id) && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
-    }
+    markChatVisit(id, next)
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.rejection_code !== 'input_conflict' && item.receipt?.stage !== 'refused' && item.receipt?.stage !== 'unknown' && item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id && conversationReads.current.observedMessage(message))
     const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id) && conversationReads.current.observedMessage(message)))
@@ -507,13 +538,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
       return Boolean(job && (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !isReplyEnded(job.state))
     }))
-    if (!platform.explicitMessageRead && joined && current() && sameRead() && viewRef.current === "chat" && platform.foreground()) {
-      const seen = notificationsRef.current.filter((item) => notificationForMain(item, id) && !isSessionNotification(item))
-      for (const notification of seen) {
-        if (!current() || activeId.current !== id || !sameRead() || viewRef.current !== 'chat' || !platform.foreground()) break
-        try { await acknowledgeNotification(notification) } catch (caught) { showError(caught, "标记已读"); break }
-      }
-    }
+    if (!refreshingRef.current) await acknowledgeOpenChat(id)
     return next
   }
   const refreshNotificationButton = async () => {
@@ -624,11 +649,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       }
       readConnection.current = connection
       readGeneration.current = connectionGeneration
+      lastWorkspaceReadAt.current = Date.now()
       loadedMessageConnection.current = connection
       flushMessagesRef.current()
       void readWorkspaceState().catch(showRefreshError)
       void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id))).catch((caught) => showError(caught, '显示系统提醒'))
       void refreshNotificationButton()
+      await acknowledgeOpenChat(activeId.current)
+      finishInitialRead("workspace")
       resolveRefresh()
     } catch (caught) {
       // What the page shows stays; writes wait for the next full read.
@@ -763,12 +791,23 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (result.confirmed.length || result.resubmitted.length || result.rejected.length) scheduleRefresh()
   }
 
+  const finishInitialRead = (part: "local" | "workspace") => {
+    const reads = initialReads.current
+    if (!reads || !current()) return
+    reads[part] = true
+    if (!reads.local || !reads.workspace || !joined || !sameRead() || ledgerFailure.current) return
+    initialReads.current = null
+    void settleOutbox().catch(showRefreshError)
+  }
+
   useEffect(() => {
     alive.current = true
+    initialReads.current = { local: false, workspace: false }
     setBooted(false)
     const stopLedger = platform.outbox.watch?.(() => { try { ledgerGuard() } catch { if (current()) { setLedgerFailed(true); setBooted(false); setError({ text: outboxCorruptNotice }) } } })
     readConnection.current = null
     readGeneration.current = null
+    lastWorkspaceReadAt.current = null
     loadedMessageConnection.current = null
     onScreen.current = null
     setFresh(new Set())
@@ -789,8 +828,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       setIgnoredNotifications(nextIgnored)
       if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
       const storedConversation = conversationCache ? readStorage(scoped(initialBot ? `conversation-for-bot.${initialBot}` : 'selected-conversation'), null) : null
-      selectConversation(typeof storedConversation === 'string' ? storedConversation : '')
-      void loadPending().then(() => { if (current() && !ledgerFailure.current) setBooted(true) }, (caught) => showError(caught, "读取待发消息"))
+      const retained = dataScope.current === snapshotScope(activeId.current) && dataRef.current?.conversation?.conversation_id === activeId.current
+      if (retained && (!storedConversation || storedConversation === activeId.current)) setDataOrigin('cache')
+      else selectConversation(typeof storedConversation === 'string' ? storedConversation : '')
+      void loadPending().then(() => {
+        if (!current() || ledgerFailure.current) return
+        setBooted(true)
+        finishInitialRead("local")
+      }, (caught) => showError(caught, "读取待发消息"))
+      void refreshRef.current().catch(showRefreshError)
     } catch (caught) { showError(caught) }
     const stop = tabs.listen((message) => {
       if (message.networkId !== networkId) return
@@ -805,7 +851,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }, [connection, connectionGeneration])
 
   useEffect(() => {
-    void refreshRef.current().then(() => { if (booted && !ledgerFailed) return settleOutbox() }).catch(showRefreshError)
     const unsubscribe = connection.subscribe((event) => {
       if (!current()) return
       if (event.type === "records") { applyRecords(event.value).catch(() => scheduleRefresh()); return }
@@ -824,13 +869,31 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (progressState.push(event)) scheduleRefresh()
     })
     // A device coming or going is pushed once the Node's sync notices; this rereads sooner while one is away and catches anything missed.
-    let ticks = 0
+    const overdue = () => lastWorkspaceReadAt.current === null || Date.now() - lastWorkspaceReadAt.current >= workspaceRefreshInterval
+    let lastMaintenanceAttempt = Date.now()
     const timer = setInterval(() => {
-      ticks += 1
-      if (ticks % 20 === 0) scheduleRefresh()
-      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) void refreshNodes().catch(() => {})
+      if (!current() || !platform.foreground()) return
+      if (overdue() && Date.now() - lastMaintenanceAttempt >= workspaceRefreshInterval) {
+        lastMaintenanceAttempt = Date.now()
+        if (!refreshingRef.current && refreshTimer.current === null) void refreshRef.current().catch(showRefreshError)
+      } else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) void refreshNodes().catch(() => {})
     }, 15000)
-    const stopForeground = platform.onForeground(scheduleRefresh)
+    // A live channel keeps applying pushes while hidden. Retry a missing read when the user returns.
+    const stopForeground = platform.onForeground(() => {
+      if (!current()) return
+      if (connection.catchingUp?.() || !sameRead() || overdue()) {
+        if (!refreshingRef.current) {
+          lastMaintenanceAttempt = Date.now()
+          scheduleRefresh()
+        }
+      } else {
+        void refreshNotificationButton().catch(showRefreshError)
+        if (dataRef.current) {
+          markChatVisit(activeId.current, dataRef.current)
+          void acknowledgeOpenChat(activeId.current).catch(showRefreshError)
+        }
+      }
+    })
     return () => {
       unsubscribe(); clearInterval(timer)
 
@@ -838,7 +901,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       refreshTimer.current = null
       stopForeground()
     }
-  }, [booted, connection, connectionGeneration])
+  }, [connection, connectionGeneration])
 
   const withMutation = async <T,>(key: string, work: () => Promise<T>) => {
     requireWritable()
@@ -1455,7 +1518,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const traces = (shown?.works ?? []).some((work) => work.trigger === job.trigger) || (shown?.changes ?? []).some((change) => change.cause?.message_id === messageId)
     return sendMessage(retryText(asked.text, job.failure?.kind, traces), [], asked.attachments ?? [])
   }
-  const visibleData = dataScope.current.networkId === networkId && dataScope.current.clientId === clientId ? data : null
+  const visibleData = dataScope.current === snapshotScope(conversationId) ? data : null
   const visibleOrigin: typeof dataOrigin = visibleData ? dataOrigin : 'none'
   const incomplete = !visibleData
   // The lists hold this connection's first full read and the Node is not aligning with other devices; until then an empty list means not yet known.

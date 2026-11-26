@@ -1004,12 +1004,13 @@ test("workspace preserves bot and message requests while routing native decision
         assert.equal(render().canSaveMessages, false, "the new connection must finish its own authorized read")
         await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         assert.equal(messages.length, before + 1)
+        assert.equal(acknowledgements.length, ackBefore, "the new generation has not confirmed the visible chat yet")
         if (outcome === "success") reading.resolve({ ...context, scheduler: null, works: [work] })
         else reading.reject(new Error("new read unavailable"))
         await drainOutbox()
         assert.equal(render().writable, outcome === "success")
         assert.equal(render().canSaveMessages, outcome === "success")
-        assert.equal(acknowledgements.length, ackBefore)
+        assert.equal(acknowledgements.length, ackBefore + (outcome === "success" ? 1 : 0), "only a confirmed open chat acknowledges the notification")
         if (outcome === "failure") await assert.rejects(render().sendMessage("new unread connection"), /先读取|补读/)
         conversationHold = null; scheduler = null
         await render().run(() => render().refresh())
@@ -1040,10 +1041,11 @@ test("workspace preserves bot and message requests while routing native decision
       conversationHold = deferred()
       const restored: ReadyConnection = { ...connection, generation: activeConnection.generation + 1, isCurrent: () => activeConnection === restored }
       activeConnection = restored; render(); await drainOutbox()
+      assert.equal(acknowledgements.length, ackBefore)
       conversationHold.resolve({ ...context, conversation: { ...context.conversation, conversation_id: currentId }, scheduler: null })
       await drainOutbox()
       assert.equal(render().writable, true)
-      assert.equal(acknowledgements.length, ackBefore)
+      assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
       conversationHold = null
       await render().refresh()
       assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
@@ -6100,9 +6102,8 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
   } finally { app.close() }
 })
 
-test('offline chat keeps reconnect and stale waiting summary above the composer, then drops the stale prefix when back online', () => {
+test('offline chat keeps its connection notice and stale waiting summary above the composer, then drops both when back online', () => {
   let connectionOnline = false
-  let retried = 0
   const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
     about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const workspace = () => ({
@@ -6112,17 +6113,14 @@ test('offline chat keeps reconnect and stale waiting summary above the composer,
     data: { ...parseConversation(context, 'chat'), questions: [question], scheduler: null, messages: [] },
     refresh: async () => {},
   })
-  const harness = conversationHarness(workspace, { retryNow: () => { retried++ } })
+  const harness = conversationHarness(workspace)
   try {
     const above = componentText(harness.composer()?.above)
-    assert.match(above, /重试连接/)
+    assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), true)
     assert.match(above, /最近记录 · /)
     assert.ok(harness.composer()?.disabled)
-    const reconnect = harness.findAction('重试连接')?.onClick
-    assert.equal(typeof reconnect, 'function')
-    if (typeof reconnect === 'function') reconnect()
-    assert.equal(retried, 1)
     connectionOnline = true
+    assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), false)
     assert.doesNotMatch(componentText(harness.composer()?.above), /最近记录 · /)
     assert.match(componentText(harness.composer()?.above), /继续吗？/)
     assert.equal(harness.composer()?.disabled, false)

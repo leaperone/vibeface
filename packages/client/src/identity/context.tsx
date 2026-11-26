@@ -124,6 +124,9 @@ const sinceOf = (response: Record<string, unknown>) => typeof response.recovery_
 const INVITE_TTL_MS = 10 * 60 * 1000
 /** A Node on the LAN answers at once; one away must not hold up the way through a Gateway. */
 const LAN_MS = 2000
+const SHORT_BACKGROUND_MS = 30000
+const FOREGROUND_GRACE_MS = 1000
+const FOREGROUND_PROBE_MS = 5000
 /** Not an error: the entry buttons below it are the way in. */
 export const notJoined = (self: string) => `${self}还没加入`
 export const removedText = (self: string) => `${self}已被移除。在管理设备上重新添加`
@@ -1751,30 +1754,61 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     return () => { mounted = false; recoveryPaused.current = true; setupController.abort(); generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
-    let probe: { generation: number; timer?: ReturnType<typeof setTimeout> } | null = null
+    type Probe = { generation: number; timer: ReturnType<typeof setTimeout> | null }
+    let probe: Probe | null = null
+    let backgroundAt: number | null = platform.foreground() ? null : Date.now()
+    const cancelProbe = () => {
+      if (probe && probe.timer !== null) { clearTimeout(probe.timer); probe.timer = null }
+      probe = null
+    }
+    const stopBackground = platform.onBackground?.(() => {
+      backgroundAt ??= Date.now()
+      cancelProbe()
+    })
     const stop = platform.onForeground(() => {
+      if (!platform.foreground()) return
+      const brief = backgroundAt !== null && Date.now() - backgroundAt <= SHORT_BACKGROUND_MS
+      backgroundAt = null
       const active = session.current
       if (!active?.networkId) { retryNow(); return }
       if (probe?.generation === active.generation) return
-      if (probe) clearTimeout(probe.timer)
-      const close = () => {
-        if (session.current === active && generation.current === active.generation) active.channel.close()
-      }
-      const pending = { generation: active.generation, timer: undefined as ReturnType<typeof setTimeout> | undefined }
+      cancelProbe()
+      const pending: Probe = { generation: active.generation, timer: null }
       probe = pending
-      const startTimer = () => {
-        if (probe === pending) pending.timer = setTimeout(close, 5000)
+      const current = () => probe === pending && platform.foreground() && session.current === active && generation.current === active.generation
+      const close = () => {
+        if (current()) active.channel.close()
       }
-      void active.channel.request('info', {}, startTimer).catch(cause => {
-        const code = (cause as { code?: unknown } | null)?.code
-        const queued = code === 'client_overloaded' || /等待读取超时|排队的读取/.test(String((cause as Error)?.message ?? cause))
-        if (!isResponseError(cause) && !queued) close()
-      }).finally(() => {
-        if (pending.timer) clearTimeout(pending.timer)
-        if (probe === pending) probe = null
-      })
+      let resumedTimer = false
+      const startTimer = (): void => {
+        if (!current()) return
+        const dueAt = Date.now() + FOREGROUND_PROBE_MS
+        pending.timer = setTimeout(() => {
+          if (!current()) return
+          // A suspended JS runtime may run this before its queued foreground notification or socket reply.
+          if (!resumedTimer && Date.now() - dueAt > FOREGROUND_GRACE_MS) {
+            resumedTimer = true
+            startTimer()
+          } else close()
+        }, FOREGROUND_PROBE_MS)
+      }
+      const start = () => {
+        pending.timer = null
+        if (!current()) return
+        void active.channel.request('info', {}, startTimer).catch(cause => {
+          const code = isRecord(cause) ? cause.code : undefined
+          const queued = code === 'client_overloaded' || /等待读取超时|排队的读取/.test(messageOf(cause))
+          if (!isResponseError(cause) && !queued) close()
+        }).finally(() => {
+          if (pending.timer !== null) clearTimeout(pending.timer)
+          if (probe === pending) probe = null
+        })
+      }
+      // Keep the live channel through a brief app switch; probe once the foreground has settled.
+      if (brief) pending.timer = setTimeout(start, FOREGROUND_GRACE_MS)
+      else start()
     })
-    return () => { stop(); if (probe?.timer) clearTimeout(probe.timer) }
+    return () => { stop(); stopBackground?.(); cancelProbe() }
   }, [])
   useEffect(() => {
     // One tab per origin settles the outbox; a follower takes the leader's new entrance right away.

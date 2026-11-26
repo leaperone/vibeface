@@ -127,6 +127,10 @@ export const mobilePlatform: Platform = {
     const subscription = AppState.addEventListener('change', (state) => { if (state === 'active') listener() })
     return () => subscription.remove()
   },
+  onBackground(listener) {
+    const subscription = AppState.addEventListener('change', (state) => { if (state !== 'active') listener() })
+    return () => subscription.remove()
+  },
   foreground: () => AppState.currentState === 'active',
   recoveryStorage: privateFiles.recoveryStorage,
   async saveRecovery(bytes, name) {

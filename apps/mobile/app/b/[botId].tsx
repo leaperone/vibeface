@@ -466,7 +466,7 @@ export default function ChatScreen() {
           </Pressable>
         </Link></View> : null}
         <DraftComposer draft={draft} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
-          blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={(inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live?.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
+          blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={live?.writable && (inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
           selectedIntent={selectedIntent} targetBusy={targetBusy} onChooseIntent={chooseIntent}
         >
         <Text numberOfLines={1} className="text-sm text-muted">{targetOption.label}</Text>

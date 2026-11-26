@@ -75,7 +75,8 @@ function useConnection(): { session: Session; connection: Connection } {
   const entry = device.ready?.entry ?? device.entry
   const name = device.ready ? entryLabel({ joined: device.ready.principal.source === 'membership', directory: device.directory, entryId: device.ready.entry.device_id, ownName: device.ready.info.name, address: entryAddress(device.ready.entry) })
     : entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''
-  const state: Connection['state'] = name === null ? 'connecting' : link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
+  const recovering = device.ready && device.phase === 'reconnecting' && (link.kind === 'connecting' || link.kind === 'offline') && link.attempt <= 1
+  const state: Connection['state'] = recovering ? 'reconnecting' : name === null ? 'connecting' : link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
   return { session, connection: { state, entry: name ?? '', direct: entry?.kind === 'lan' } }
 }
 

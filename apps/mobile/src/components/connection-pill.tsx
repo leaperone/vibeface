@@ -17,6 +17,7 @@ import { cn } from '@/lib/utils'
 
 const looks: Record<Connection['state'], { label: string; icon: LucideIcon; tone: Tone }> = {
   connecting: { label: '连接中', icon: ArrowRightLeft, tone: 'info' },
+  reconnecting: { label: '恢复连接中', icon: RefreshCw, tone: 'neutral' },
   syncing: { label: '同步中', icon: RefreshCw, tone: 'info' },
   offline: { label: '离线', icon: WifiOff, tone: 'neutral' },
   online: { label: '在线', icon: ShieldCheck, tone: 'success' },
@@ -76,6 +77,10 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
 export function OfflineBar({ chat, className }: { chat?: boolean; className?: string }) {
   const device = useDevice()
   const { connection } = useWorkspace()
+  if (connection.state === 'reconnecting') return <View role="status" accessibilityLiveRegion="polite" className={cn('min-h-11 flex-row items-center gap-2 px-3', className)}>
+    <Icon as={RefreshCw} className="size-4 text-muted" />
+    <Text className="min-w-0 flex-1 text-sm text-muted">{device.queued ? `恢复连接中，排队第 ${device.queued} 位` : '正在恢复连接，显示最近记录'}</Text>
+  </View>
   if (!unreachable(device.link)) return null
   const title = offlineCopy.title(connection.entry)
   return <View role="status" className={cn('min-h-11 flex-row items-center gap-2 rounded-pill border border-border bg-surface ps-3 pe-1 ', className)}>

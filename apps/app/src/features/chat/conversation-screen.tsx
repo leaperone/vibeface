@@ -7,7 +7,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { InputQueue,WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
-import { ChatSkeleton,useCreateBot } from '@/features/workspace/workspace-shell'
+import { ChatSkeleton,ConnectionNotice,useCreateBot } from '@/features/workspace/workspace-shell'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
@@ -29,7 +29,7 @@ import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Popover,PopoverClose,PopoverContent,PopoverTrigger } from '@vibeface/uiarc/popover/popover.tsx'
-import { ArrowDown,ArrowRightLeft,Bot,ChevronDown,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,RotateCw,Send,Unplug,WifiOff } from 'lucide-react'
+import { ArrowDown,ArrowRightLeft,Bot,ChevronDown,ChevronRight,CircleCheck,CircleQuestionMark,CircleStop,CircleX,Crown,Hourglass,Laptop,ListChecks,LoaderCircle,MessageSquareOff,MessageSquareReply,Plus,RotateCcw,Send,Unplug,WifiOff } from 'lucide-react'
 import { useEffect,useMemo,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
@@ -61,7 +61,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const routeRoutine = useRouterState({ select: (state) => 'routine' in state.location.search && typeof state.location.search.routine === 'string' ? state.location.search.routine : null })
   const routeMessage = useRouterState({ select: (state) => 'message' in state.location.search && typeof state.location.search.message === 'string' ? state.location.search.message : null })
   const routeNotification = useRouterState({ select: (state) => 'notification' in state.location.search && typeof state.location.search.notification === 'string' ? state.location.search.notification : null })
-  const { directory, ready, retryNow } = useDevice()
+  const { directory, ready } = useDevice()
   const draftStorage = storageOf(webPlatform.storage)
   const draftKey = networkKey('bot-drafts', ready?.principal.network_id ?? '')
   const [drafts, setDrafts] = useState<Map<string, string>>(() => { const stored = draftStorage.readStorage(draftKey, {}); return stored && typeof stored === 'object' && !Array.isArray(stored) ? new Map(Object.entries(stored).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) : new Map() })
@@ -317,10 +317,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       {bot && inputTarget ? <PromptInput
         id="message-text"
         above={!workspace.connectionOnline || history && statusLine || showWaiting ? <>
-          {!workspace.connectionOnline ? <p role="status" className="flex min-h-8 max-w-full flex-wrap items-center gap-1.5 rounded-panel border bg-surface ps-2.5 pe-1 text-sm font-medium max-md:min-h-11">
-            <WifiOff aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 break-words">连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}</span>
-            <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
-          </p> : null}
+          {!workspace.connectionOnline ? <ConnectionNotice /> : null}
           {history && statusLine ? <Button type="button" variant="ghost" size="sm" className="max-w-full" onClick={(event) => openActivity(event.currentTarget)}>
             <ListChecks aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 truncate">{statusLine}</span>
           </Button> : null}
