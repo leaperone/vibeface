@@ -14,7 +14,7 @@ BASE = 'e2093b537da3ba0b6f3fed057d81ab60bc54dd51'
 RUNTIME = json.loads((SOURCE / 'fixtures/release-contract.json').read_text(encoding='utf-8'))['runtime']
 WEB_FILES = [name[4:] for name in RUNTIME['targets'][0]['roles']['node-full'] if name.startswith('web/')]
 MODULES = ('release_component_identity', 'release_format', 'release_context', 'release_source', 'release_archive',
-           'release_inventory', 'release_github', 'release_publisher', 'release_assembly', 'ios_device')
+           'release_inventory', 'release_github', 'release_publisher', 'release_assembly')
 TARGETS = ('aarch64-apple-darwin', 'aarch64-unknown-linux-gnu',
            'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc')
 CLI = '0.0.1-hourly.2026111409'
@@ -61,7 +61,7 @@ class Fixture:
                                                   cwd=SOURCE.parent, env=environment(self.root))
                 (self.scripts / name).write_bytes(content)
         else:
-            for name in ('release', *MODULES):
+            for name in ('release', *MODULES, 'ios_device'):
                 shutil.copy2(SOURCE / (name + '.py'), self.scripts / (name + '.py'))
             shutil.copytree(SOURCE / 'tests', self.scripts / 'tests',
                             ignore=shutil.ignore_patterns('__pycache__'))
