@@ -8,6 +8,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { folderLabels,folderSetup,projectChoices,projectKey } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { cooperationExamples } from '@vibeface/client/chat/first-cooperation.ts'
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
@@ -109,6 +110,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
           </FormField>
           <FormField>
             <Textarea label="它负责什么" description="可选" id="bot-instructions" name="bot-instructions" maxLength={8192} value={instructions} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setInstructions(event.target.value)} placeholder="例如：帮我维护项目，回答问题并检查修改。" />
+            <div className="mt-2 flex flex-wrap gap-2">{cooperationExamples.map(example => <Button key={example.label} type="button" variant="secondary" size="sm" disabled={Boolean(pending) || busy} onClick={() => setInstructions(current => `${current.trim()}${current.trim() ? '\n\n' : ''}${example.text}`)}>{example.label}</Button>)}</div>
+            <FieldNote>这些是可编辑的职责与合作约定，不改变设备或目录权限。</FieldNote>
           </FormField>
           <FormField>
             {pending ? <Input label={folderLabels.project} description="可选" id="bot-project" readOnly value={savedProjectLabel} aria-describedby={pending.project ? undefined : "bot-project-help"} /> : (

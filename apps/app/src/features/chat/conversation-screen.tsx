@@ -4,6 +4,7 @@ import { Chat,type ChatEntry } from '@/components/arc/conversation-thread'
 import { ActionCard,Dot,EmptyState,InlineError,PageActions,PrimaryMark } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
 import { ActionButton } from '@/features/workspace/present'
+import { useInbox } from '@/features/workspace/inbox'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { InputQueue,WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
@@ -14,7 +15,9 @@ import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntents,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
-import { chatTimeline,chatUpdates,firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { botRecap,recapGroups,routineState,type BotRecapItem } from '@vibeface/client/chat/companion-recap.ts'
+import { cooperationExamples,useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
 import { failureText,taskError } from '@vibeface/client/lib/errors.ts'
@@ -55,6 +58,7 @@ function NoBot() {
 /** `missing`: the route names a bot this network does not have. */
 export function ConversationScreen({ missing = false, active }: { missing?: boolean; active: boolean }) {
   const workspace = useWorkspace()
+  const inbox = useInbox()
   const generation = workspace.generation
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
@@ -186,7 +190,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   entries.push(...waiting)
   // The replies and questions this chat's badge counted when it came on screen start under 新消息.
   const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
-  const updates = chatUpdates(data?.messages ?? [], jobs, workspace.fresh)
+  const recap = bot ? botRecap({ bot, data, inbox, notifications: workspace.notifications, ignoredNotifications: workspace.ignoredNotifications, workspaceState: workspace.workspaceState, openWorks: workspace.openWorks, fresh: workspace.fresh, connected: workspace.connectionOnline && workspace.dataOrigin === 'network' }) : []
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
   if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-sm text-foreground before:h-px before:flex-1 before:bg-foreground/40 after:h-px after:flex-1 after:bg-foreground/40">新消息</p> })
 
@@ -222,7 +226,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const waitingTarget = asked ? `question-${asked.question_id}` : null
   const waitingCount = toAnswer.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const showWaiting = Boolean(waitingTarget && (targetHidden || !workspace.connectionOnline))
+  const showWaiting = Boolean(waitingTarget && (targetHidden || !workspace.connectionOnline) && !recap.some(item => item.focus === `question:${asked?.question_id}`))
   const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = reachDevice(workspace.nodes, reach) ?? ready?.entry.device_id
@@ -266,6 +270,15 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     if (routeRoutine && target !== selectedTarget && bot) void navigate({ to: '/b/$botId', params: { botId: bot.bot_id }, search: {}, replace: true }).catch(setSendError)
   }
   const setText = (value: string) => setDrafts((current) => { const next = new Map(current).set(conversationId, value); draftStorage.writeStorage(draftKey, Object.fromEntries(next)); return next })
+  const welcome = useFirstCooperation(webPlatform.storage, { networkId: ready?.principal.network_id ?? '', deviceId: ready?.principal.device_id ?? '', botId: bot?.bot_id ?? '' }, Boolean(active && !routeRoutine && data?.history.messages.complete && !entries.length))
+  const chooseFirst = (example: string) => { if (text.trim() || files.length) return; setText(example); welcome.dismiss(); document.getElementById('message-text')?.focus() }
+  const openRecap = (item: BotRecapItem) => {
+    const target = item.target
+    if (target.kind === 'task' || target.kind === 'channel_task') void navigate({ to: '/tasks/$taskId', params: { taskId: target.task_id }, search: item.focus ? { message: item.focus } : {} })
+    else if (target.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id }, search: item.focus ? { message: item.focus } : {} })
+    else if (target.kind === 'work' && bot) void navigate({ to: '/b/$botId/work/$workId', params: { botId: bot.bot_id, workId: target.work_id }, search: item.focus ? { message: item.focus } : {} })
+    else if (bot) void navigate({ to: '/b/$botId', params: { botId: bot.bot_id }, search: { ...(target.kind === 'routine' ? { routine: target.trigger } : {}), ...(item.focus ? { message: item.focus } : {}), ...(item.notificationId ? { notification: item.notificationId } : {}) } })
+  }
 
   if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   const history = active && bot ? <TaskHistory key={`task-history:${conversationId}`} tasks={tasks} botId={bot.bot_id} attention={attention} open={activityOpen} onOpenChange={setActivityOpen} onOpen={openActivity} from={activityFrom}
@@ -286,10 +299,12 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     <section className="conversation-screen" aria-label="对话">
       {history}
       {location.kind !== 'found' ? <div role="status" className="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2 px-4 py-2 text-sm text-secondary"><p>{location.text}</p>{location.kind === 'failed' ? <Button type="button" variant="secondary" size="sm" onClick={location.retry}>重新定位原记录</Button> : null}</div> : null}
-      {!routeRoutine && updates.length ? <div aria-label="自上次查看以来" className="mx-auto grid w-full max-w-3xl gap-1 px-4 py-2 text-sm">
-        <p className="text-secondary">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录' : '自上次查看以来'} · {updates.length} 条新结果</p>
-        {updates.slice(-2).map((update) => <p key={update.id} className="line-clamp-2"><span className="font-medium">{update.state}</span> · {update.text}</p>)}
-        <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={(event) => openActivity(event.currentTarget)}>查看结果与依据</Button>
+      {!routeRoutine && recap.length ? <div aria-label="回来接着办" className="mx-auto grid max-h-64 w-full max-w-3xl gap-3 overflow-y-auto px-4 py-2 text-sm">
+        <p className="text-secondary">{!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? '最近记录 · 连上后核对状态' : '回来接着办'}</p>
+        {recapGroups.map(({ group, label }) => {
+          const items = recap.filter(item => item.group === group)
+          return items.length ? <section key={group} aria-label={label} className="grid gap-1"><h2 className="font-medium">{label} · {items.length}</h2>{items.map(item => <Button key={item.key} type="button" variant="ghost" size="sm" className="h-auto! justify-start py-2! text-left" onClick={() => openRecap(item)}><span className="line-clamp-2 whitespace-normal!">{item.state} · {item.text}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Button>)}</section> : null
+        })}
       </div> : null}
       {routeRoutine && bot ? <RoutineRecord workspace={workspace} botId={bot.bot_id} trigger={routeRoutine} notificationId={routeNotification} /> : <Chat
         key={conversationId}
@@ -308,11 +323,20 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             {away || canSetUp ? <RoutedAction to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</RoutedAction>
               : <p className="flex items-center gap-1.5 text-sm text-secondary"><Crown aria-hidden="true" className="size-4 shrink-0" />{setUpOnManager((directory?.members ?? []).filter((member) => member.manage).map((member) => member.name))}</p>}
           </>
-            : !text.trim() ? <div className="grid min-w-0 max-w-full gap-2">
+            : !text.trim() && !welcome.show ? <div className="grid min-w-0 max-w-full gap-2">
               <div className="flex flex-wrap justify-center gap-2">
                 {starterExamples({ project: Boolean(bot.project), attachments: files.length > 0, canRun: agentReady }).map((example) => <button key={example} type="button" className={`${buttonStyles.button} ${buttonStyles.secondary} h-auto max-w-full whitespace-normal! py-2! [overflow-wrap:anywhere]`} onMouseDown={(event) => event.preventDefault()} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</button>)}
               </div>
             </div> : null}
+          {welcome.show ? <div className="grid w-full gap-3 text-left">
+            <p className="text-sm text-secondary">Bot 已创建 · {workspace.connectionOnline && agentReady ? '执行设备已就绪' : '执行设备待就绪'} · 首条回复尚未收到</p>
+            <h3 className="font-medium">先帮我做一件事</h3>
+            <div className="flex flex-wrap gap-2">{starterExamples({ project: Boolean(bot.project), attachments: files.length > 0, canRun: agentReady }).map(example => <Button key={example} type="button" variant="secondary" className="h-auto! max-w-full whitespace-normal! py-2!" disabled={Boolean(text.trim() || files.length)} onClick={() => chooseFirst(example)}>{example}</Button>)}</div>
+            <h3 className="font-medium">合作约定 <span className="text-sm text-secondary">可选</span></h3>
+            <div className="flex flex-wrap gap-2">{cooperationExamples.map(example => <Button key={example.label} type="button" variant="secondary" disabled={Boolean(text.trim() || files.length)} onClick={() => chooseFirst(`请把下面内容保存为这个 Bot 的职责与合作约定：\n\n${example.text}`)}>{example.label}</Button>)}</div>
+            <p className="text-sm text-secondary">选择只填入可编辑草稿，由你发送；不会启动任务或增加权限。</p>
+            <Button type="button" variant="ghost" size="sm" className="justify-self-start" onClick={welcome.dismiss}>跳过，直接聊天</Button>
+          </div> : null}
         </div> : workspace.synced ? <NoBot /> : null}
       />}
       {bot && inputTarget ? <PromptInput
@@ -459,9 +483,11 @@ function JobLine({ job, retry, refresh }: { job: ManagerJob; retry?: () => Promi
 
 function RoutineRecord({ workspace, botId, trigger, notificationId }: { workspace: ReturnType<typeof useWorkspace>; botId: string; trigger: string; notificationId: string | null }) {
   const record = useNotificationRecord({ workspace, conversationId: workspace.conversationId, target: { kind: 'routine', bot_id: botId, trigger }, notificationId })
+  const state = routineState(workspace.data, trigger, workspace.connectionOnline && workspace.dataOrigin === 'network')
   return <div className="mx-auto grid w-full max-w-3xl gap-3 overflow-y-auto px-4 py-6" aria-label="原例行记录">
     <h2 className="text-sm font-medium">{scheduleName(trigger, workspace.data?.bot_settings, workspace.data?.changes)}</h2>
-    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : <Chat entries={[{ key: record.content.message.message_id, message: record.content.message }]} empty={null} /> : <p role="status" className="text-sm text-secondary">{record.text}</p>}
+    {state ? <p role="status" className="text-sm text-secondary">{state} · 原例行执行记录</p> : null}
+    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : <Chat entries={[{ key: record.content.message.message_id, message: record.content.message }]} empty={null} /> : <p role="status" className="text-sm text-secondary">{!notificationId && state ? '尚未读取到本轮的结果正文或问题；执行记录不代表结果已验收。' : record.text}</p>}
     {record.kind === 'failed' ? <Button type="button" variant="secondary" onClick={record.retry}>重新读取原记录</Button> : null}
   </div>
 }

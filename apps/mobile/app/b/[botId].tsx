@@ -12,7 +12,9 @@ import { useCSSVariable, withUniwind } from 'uniwind'
 import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
-import { chatUpdates, messageTimes } from '@vibeface/client/chat/timeline.ts'
+import { messageTimes } from '@vibeface/client/chat/timeline.ts'
+import { botRecap, recapGroups, routineState } from '@vibeface/client/chat/companion-recap.ts'
+import { cooperationExamples, useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { canRememberMessage } from '@vibeface/client/workspace/memory.ts'
 import { setUpOnManager } from '@vibeface/client/identity/copy.ts'
@@ -31,7 +33,7 @@ import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
-import { useLive } from '@/data/live'
+import { useInbox, useLive, useOpenNotificationConversation } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
 import type { InputIntent, InputTarget, Question } from '@vibeface/client/workspace/types.ts'
 import type { ReadAttachment } from '@/features/chat/attachments'
@@ -119,8 +121,23 @@ function Starters({ draft, project, canRun }: { draft: ChatDraftOwner; project: 
   </View>
 }
 
+function FirstCooperation({ draft, project, canRun, onSkip }: { draft: ChatDraftOwner; project: boolean; canRun: boolean; onSkip: () => void }) {
+  const { text, files } = useDraftView(draft)
+  const choose = (example: string) => { if (text.trim() || files.length) return; draft.changeText(example); onSkip() }
+  return <View className="w-full gap-3">
+    <Text className="text-sm text-muted">选择只填入可编辑草稿，由你发送；不会启动任务或增加权限。</Text>
+    <Text role="heading" className="font-medium">先帮我做一件事</Text>
+    <View className="flex-row flex-wrap gap-2">{starterExamples({ project, attachments: files.length > 0, canRun }).map(example => <Button key={example} variant="secondary" disabled={Boolean(text.trim() || files.length)} onPress={() => choose(example)}><Text className="min-w-0 shrink">{example}</Text></Button>)}</View>
+    <Text role="heading" className="font-medium">合作约定 · 可选</Text>
+    <View className="flex-row flex-wrap gap-2">{cooperationExamples.map(example => <Button key={example.label} variant="secondary" disabled={Boolean(text.trim() || files.length)} onPress={() => choose(`请把下面内容保存为这个 Bot 的职责与合作约定：\n\n${example.text}`)}><Text>{example.label}</Text></Button>)}</View>
+    <Button variant="ghost" className="self-start" onPress={onSkip}><Text>跳过，直接聊天</Text></Button>
+  </View>
+}
+
 export default function ChatScreen() {
   const router = useRouter()
+  const inbox = useInbox()
+  const openRecap = useOpenNotificationConversation()
   const { botId, routine, message: targetMessage, notification } = useLocalSearchParams<{ botId: string; routine?: string; message?: string; notification?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()
@@ -283,6 +300,7 @@ export default function ChatScreen() {
   const renderItem = useCallback(({ item }: { item: Entry }) => !('message' in item) ? <>{item.node}</> : bot
     ? <Message message={item.message} bot={bot} time={item.time} offline={offline} retry={item.message === newest ? retry : undefined} attachmentScope={attachmentScope} readAttachment={read} onQuote={quote} remember={!routine && canRememberMessage(item.message, device.ready?.principal.device_id, bot.bot_id)} conversationId={id} />
     : null, [bot, offline, newest, retry, attachmentScope, read, quote, routine, id, device.ready?.principal.device_id])
+  const welcome = useFirstCooperation(mobilePlatform.storage, { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', botId: bot?.bot_id ?? '' }, Boolean(routeFocused && !routine && chat?.origin.kind === 'network' && live?.data?.history.messages.complete && !rows.length))
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
@@ -354,7 +372,7 @@ export default function ChatScreen() {
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   const statusLine = routine ? '' : chatStatusLine(extras)
   const nextQuestion = routine ? undefined : [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
-  const updates = chatUpdates(chat?.messages ?? [], live?.data?.scheduler?.jobs ?? [], live?.fresh ?? new Set())
+  const recap = botRecap({ bot, data: live?.data ?? null, inbox, notifications: live?.notifications ?? [], ignoredNotifications: live?.ignoredNotifications ?? new Set(), workspaceState: live?.workspaceState ?? null, openWorks: live?.openWorks ?? (chat?.works ?? []).map(work => ({ ...work, conversation_id: id })), fresh: live?.fresh ?? new Set(), connected: !offline && live?.dataOrigin === 'network' })
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
@@ -431,7 +449,7 @@ export default function ChatScreen() {
       renderItem={renderItem}
     />}
     {routine || rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
-      <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
+      <ScrollView keyboardShouldPersistTaps="handled" contentContainerClassName="grow items-center justify-center gap-4 px-4 py-4">
         <BotFace bot={bot} mood={mood} size={96} />
         <View className="items-center gap-1">
           <Text role="heading" className="text-center text-lg font-medium">{bot.name}</Text>
@@ -439,13 +457,14 @@ export default function ChatScreen() {
             <Icon as={Star} className="size-3.5 fill-muted text-muted" /><Text className="text-sm text-muted">主 Bot</Text>
           </View> : null}
         </View>
-        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? <Starters draft={draft} project={Boolean(bot.project)} canRun={botCanSend(reach)} /> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
+        {!chat ? <View accessibilityLiveRegion="polite" className="items-center gap-2"><Text className="text-center text-muted">{live?.conversationLoading ? '正在读取聊天记录…' : live?.conversationError ? '没读到聊天记录' : offline ? '连上后可读取' : '正在连接聊天记录…'}</Text>{live && !live.conversationLoading ? <Button variant="secondary" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取</Text></Button> : null}</View> : botCanSend(reach) ? welcome.show ? null : <Starters draft={draft} project={Boolean(bot.project)} canRun={botCanSend(reach)} /> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted" /><Text className="text-muted">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted" /><Text className="text-muted">Bot 还不能回复</Text></View>
           {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild>
             <Button><Icon as={Bot} /><Text>{reach === 'offline' ? '查看设备' : '设置运行 Bot 的设备'}</Text></Button>
           </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted" /><Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text></View>}
         </>}
-      </View>
+        {welcome.show ? <View className="w-full gap-3"><Text className="text-sm text-muted">Bot 已创建 · {!offline && botCanSend(reach) ? '执行设备已就绪' : '执行设备待就绪'} · 首条回复尚未收到</Text><FirstCooperation draft={draft} project={Boolean(bot.project)} canRun={botCanSend(reach)} onSkip={welcome.dismiss} /></View> : null}
+      </ScrollView>
     </Animated.View>}
     <RecoveryAlert top={header} />
     </View></ScreenFaces>
@@ -455,10 +474,14 @@ export default function ChatScreen() {
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
         {location.kind !== 'found' ? <View role="status" className="w-full max-w-3xl gap-2 self-center px-4 py-2"><Text className="text-sm text-muted">{location.text}</Text>{location.kind === 'failed' ? <Button variant="secondary" onPress={location.retry}><Text>重新定位原记录</Text></Button> : null}</View> : null}
-        {nextQuestion ? <View className="px-4"><Button variant="secondary" accessibilityLabel={`现在处理：${questionParts(nextQuestion.text).ask}`} onPress={() => {
+        {nextQuestion && !recap.some(item => item.focus === `question:${nextQuestion.question_id}`) ? <View className="px-4"><Button variant="secondary" accessibilityLabel={`现在处理：${questionParts(nextQuestion.text).ask}`} onPress={() => {
           const index = rows.findIndex((row) => row.key === `q:${nextQuestion.question_id}`)
           if (index >= 0) toUnread(index)
-        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : !routine && updates.length ? <View accessibilityLabel="自上次查看以来" className="w-full max-w-3xl gap-1 self-center px-4"><Text numberOfLines={2} className="text-sm text-muted">{offline ? '最近记录' : '自上次查看以来'} · {updates.at(-1)?.state} · {updates.at(-1)?.text}</Text></View> : null}
+        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : null}
+        {!routine && recap.length ? <ScrollView accessibilityLabel="回来接着办" className="max-h-48 w-full max-w-3xl self-center" contentContainerClassName="gap-3 px-4 py-2" keyboardShouldPersistTaps="handled"><Text className="text-sm text-muted">{offline || live?.dataOrigin !== 'network' ? '最近记录 · 连上后核对状态' : '回来接着办'}</Text>{recapGroups.map(({ group, label }) => {
+          const items = recap.filter(item => item.group === group)
+          return items.length ? <View key={group} className="gap-1"><Text role="heading" className="text-sm font-medium">{label} · {items.length}</Text>{items.map(item => <Button key={item.key} variant="ghost" className="justify-start" onPress={() => openRecap(id, item.target, item.focus, item.notificationId)}><Text numberOfLines={2} className="min-w-0 flex-1 text-left text-sm">{item.state} · {item.text}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Button>)}</View> : null
+        })}</ScrollView> : null}
         {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
           <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
             <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />
@@ -494,9 +517,11 @@ export default function ChatScreen() {
 function RoutineRecord({ workspace, botId, conversationId, trigger, notificationId, attachmentScope, readAttachment }: { workspace: ReturnType<typeof useLive>; botId: string; conversationId: string; trigger: string; notificationId: string | null; attachmentScope: string; readAttachment: ReadAttachment | undefined }) {
   const record = useNotificationRecord({ workspace, conversationId, target: { kind: 'routine', bot_id: botId, trigger }, notificationId })
   const bot = workspace?.bots.find((bot) => bot.bot_id === botId)
+  const state = routineState(workspace?.data ?? null, trigger, Boolean(workspace?.connectionOnline && workspace.dataOrigin === 'network'))
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-32" accessibilityLabel="原例行记录">
     <Text role="heading" className="text-sm font-medium">{scheduleName(trigger, workspace?.data?.bot_settings, workspace?.data?.changes)}</Text>
-    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : bot ? <Message message={record.content.message} bot={bot} offline={!workspace?.connectionOnline} attachmentScope={attachmentScope} readAttachment={readAttachment} /> : null : <Text role="status" className="text-sm text-muted">{record.text}</Text>}
+    {state ? <Text role="status" className="text-sm text-muted">{state} · 原例行执行记录</Text> : null}
+    {record.kind === 'record' ? record.content.kind === 'question' ? <QuestionCard question={record.content.question} /> : bot ? <Message message={record.content.message} bot={bot} offline={!workspace?.connectionOnline} attachmentScope={attachmentScope} readAttachment={readAttachment} /> : null : <Text role="status" className="text-sm text-muted">{!notificationId && state ? '尚未读取到本轮的结果正文或问题；执行记录不代表结果已验收。' : record.text}</Text>}
     {record.kind === 'failed' ? <Button variant="secondary" onPress={record.retry}><Text>重新读取原记录</Text></Button> : null}
   </ScrollView>
 }

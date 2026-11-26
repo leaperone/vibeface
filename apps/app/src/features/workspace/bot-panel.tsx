@@ -7,21 +7,26 @@ import { EmptyState,SettingsGroup,SettingsRow,toast } from "@/components/arc/pro
 import { providerIcons } from "@/features/devices/ai-settings"
 import { terms } from "@/lib/glossary"
 import { cn } from "@/lib/utils"
-import { useNavigate } from "@tanstack/react-router"
+import { webPlatform } from '@/lib/platform'
+import { Link,useNavigate } from "@tanstack/react-router"
 import { useAvatarPick } from "@vibeface/client/avatar/use-avatar-pick.ts"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { asProvider,messageOf,providerNames } from "@vibeface/client/lib/node.ts"
 import { botCopy,botModelRows,folderLabels,formatIn,formatWhen,projectChoices,projectKey,projectPlace,scheduleDetail,scheduleFrequency,sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { contactCopy,quietScheduleRequest } from '@vibeface/client/chat/contact.ts'
+import { notificationPreferences,watchNotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
-import { AlarmClock,BookOpen,Check,ChevronDown,CirclePause,Cpu,FolderOpen,Laptop,MessageCircle,MessagesSquare,NotebookPen,Pause,Play,Repeat,Trash2,WifiOff } from "lucide-react"
-import { useEffect,useRef,useState } from "react"
+import { Switch } from '@vibeface/uiarc/switch/switch.tsx'
+import { AlarmClock,Bell,BookOpen,Check,ChevronDown,CirclePause,Cpu,FolderOpen,Laptop,MessageCircle,MessagesSquare,NotebookPen,Pause,Play,Repeat,Trash2,WifiOff } from "lucide-react"
+import { useEffect,useMemo,useRef,useState } from "react"
 import { AvatarPicker } from "./avatar-picker"
 import { ContextPanel,MemorySummary } from "./context-panel"
 import { ActionButton } from "./present"
+import { BotRequestDraft } from './bot-request'
 
 /** A deleted schedule keeps its place for a moment, so a second click does not land on the next row. */
 type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
@@ -34,7 +39,13 @@ export const openSchedule = (id: string) => showSchedule?.(id)
 /** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (packages/docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
-  const { directory } = useDevice()
+  const { directory,ready } = useDevice()
+  const networkId = ready?.principal.network_id ?? ''
+  const preferences = useMemo(() => notificationPreferences(webPlatform.storage, networkId), [networkId])
+  const [,refreshPreferences] = useState(0)
+  useEffect(() => watchNotificationPreferences(networkId, () => refreshPreferences(value => value + 1)), [networkId])
+  const settings = preferences.read()
+  const [request,setRequest] = useState<{ key: string; text: string } | null>(null)
   const [open, setOpen] = useState(false)
   // While the panel is open, rows keep their places: a paused schedule moves to the end only on the next open, not from under the pointer.
   const order = useRef<string[]>([])
@@ -52,6 +63,8 @@ export function BotPanelButton() {
   const toComposer = useRef(false)
   const navigate = useNavigate()
   const bot = workspace.selectedBot
+  useEffect(() => setRequest(null), [bot?.conversation_id,workspace.generation])
+  useEffect(() => { if (request) requestAnimationFrame(() => document.getElementById('bot-request-text')?.focus()) }, [request?.key])
   const view = workspace.data?.bot_settings
   const owner = workspace.data?.conversation?.owner
   const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
@@ -137,33 +150,45 @@ export function BotPanelButton() {
           </SettingsGroup>
           {empty ? <EmptyState icon={NotebookPen} className="py-4" title={botCopy.empty}
             action={<Button type="button" size="sm" variant="secondary" onClick={() => { toComposer.current = true; setOpen(false) }}><MessageCircle aria-hidden="true" />去聊天里说</Button>} /> : null}
-          {bot.instructions.trim() ? <SettingsGroup title="说明">
-            <p className="px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
-          </SettingsGroup> : null}
+          <SettingsGroup title="职责与合作约定">
+            <p className="px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions.trim() || '还没有约定，可在聊天中告诉它。'}</p>
+            <div className="px-4 pb-3"><Button type="button" variant="secondary" size="sm" onClick={() => setRequest({ key: 'profile', text: `请把这个 Bot 的职责与合作约定改为：\n\n${bot.instructions}` })}>调整合作约定</Button></div>
+          </SettingsGroup>
+          <SettingsGroup title="主动联系">
+            <SettingsRow icon={Bell} label="接收这个 Bot 的提醒" description={contactCopy.scope}><Switch aria-label={`接收 ${bot.name} 的提醒`} checked={!settings.mutedConversations.includes(bot.conversation_id)} disabled={!networkId} onCheckedChange={enabled => { try { const current = preferences.read(); preferences.write({ ...current, mutedConversations: enabled ? current.mutedConversations.filter(id => id !== bot.conversation_id) : [...current.mutedConversations, bot.conversation_id] }) } catch (cause) { toast(messageOf(cause), { tone: 'danger' }) } }} /></SettingsRow>
+            {workspace.notificationButton.state !== 'on' ? <p className="px-4 pb-3 text-sm text-secondary">浏览器提醒尚未开启；解除静音不会申请系统权限。</p> : null}
+          </SettingsGroup>
+          {request ? <SettingsGroup title="修改请求草稿"><div className="p-4"><BotRequestDraft key={`${workspace.generation}:${bot.conversation_id}:${request.key}`} bot={bot} initialText={request.text} onClose={() => setRequest(null)} /></div></SettingsGroup> : null}
           {rows.length ? <SettingsGroup title={`定时任务 · ${view.schedules.length}`}>
+            <p className="px-4 pt-3 text-sm text-secondary">{contactCopy.pause}</p>
+            {!workspace.connectionOnline || workspace.dataOrigin === 'cache' ? <p role="status" className="px-4 text-sm text-secondary">以下为最近保存的约定与时间，连上后核对。</p> : null}
             {rows.map(({ schedule, deleted }, index) => {
               const once = schedule.every_minutes === undefined
               const detail = scheduleDetail(schedule)
               const name = detail ? schedule.name : schedule.prompt
+              const cause = [...workspace.data?.changes ?? []].reverse().find(record => record.change.kind === 'schedule' && record.change.schedule_id === schedule.schedule_id && record.cause)?.cause
               if (deleted) return <SettingsRow key={schedule.schedule_id} icon={Trash2} className="text-secondary" label={<span role="status"><span className="line-through">{schedule.name}</span> 已删除</span>} />
               return <SettingsRow key={schedule.schedule_id} id={`schedule-${schedule.schedule_id}`} icon={once ? AlarmClock : Repeat} className={cn(!schedule.enabled && "text-secondary", shownSchedule === schedule.schedule_id && "bg-accent/10")}
                 label={<span title={name}>{name}</span>}
                 description={<span className="flex flex-wrap items-center gap-x-1.5 tabular-nums">
                   {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-3.5" />已暂停</span>
-                    : schedule.next_run_at_ms !== null ? <time dateTime={new Date(schedule.next_run_at_ms).toISOString()} title={formatWhen(schedule.next_run_at_ms)}>{formatIn(schedule.next_run_at_ms)}</time> : null}
+                    : schedule.next_run_at_ms !== null ? <time dateTime={new Date(schedule.next_run_at_ms).toISOString()} title={formatWhen(schedule.next_run_at_ms)}>下次 {formatWhen(schedule.next_run_at_ms)} · {formatIn(schedule.next_run_at_ms)}</time> : <span>下次时刻待确认</span>}
                   {!schedule.enabled || schedule.next_run_at_ms !== null ? <span aria-hidden="true">·</span> : null}<span>{scheduleFrequency(schedule)}</span>
                   {detail ? <span className="basis-full truncate" title={detail}>{detail}</span> : null}
+                  <span className="basis-full">按已保存的约定触发。{once ? contactCopy.once : contactCopy.recurring}</span>
+                  {cause && workspace.bots.some(item => item.conversation_id === cause.conversation_id) ? <Link to="/" search={{ conversation: cause.conversation_id, message: cause.message_id }} className="min-h-11 underline underline-offset-4" onClick={() => setOpen(false)}>查看原约定</Link> : null}
                 </span>}>
                 {confirming === schedule.schedule_id ? <>
                   <Button type="button" variant="ghost" autoFocus onClick={() => { refocus.current = schedule.schedule_id; setConfirming(null) }}>取消</Button>
                   <ActionButton variant="danger" disabled={!workspace.writable} action={() => remove(schedule, index)}>删除</ActionButton>
                 </> : <span className="-me-2 flex">
-                  <ActionButton variant="ghost" label={schedule.enabled ? "暂停" : "恢复"} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
+                  <ActionButton variant="ghost" label={`${schedule.enabled ? '暂停后续执行' : '恢复后续执行'}：${schedule.name}`} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
                     {schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                   </ActionButton>
                   <Button ref={returnFocus(schedule.schedule_id)} type="button" variant="ghost" size="md" aria-label="删除" title="删除" disabled={!workspace.writable} onClick={() => setConfirming(schedule.schedule_id)}>
                     <Trash2 aria-hidden="true" />
                   </Button>
+                  {!once ? <Button type="button" variant="ghost" size="sm" onClick={() => setRequest({ key: `schedule:${schedule.schedule_id}`, text: quietScheduleRequest(schedule) })}>仅变化时联系</Button> : null}
                 </span>}
               </SettingsRow>
             })}
