@@ -100,15 +100,23 @@ test('records wait for a device and go out in bounded batches', async () => {
   assert.equal(sent.length, 2, 'nothing is sent without a device')
 })
 
-test('a failing device drops the batch instead of throwing', async () => {
+test('a failed send keeps the batch, and only a batch the device refused as invalid is dropped', async () => {
   const reporter = createReporter()
   let attempts = 0
   reporter.connect(async () => { attempts++; throw new Error('offline') })
-  reporter.report({ level: 'error', event: 'web.uncaught', message: 'boom' })
+  reporter.report({ level: 'error', event: 'web.uncaught', message: 'boom', fields: { ref: 'abcd1234' } })
+  await reporter.flush()
+  assert.equal(reporter.pending(), 1, 'the record with its error number waits for a later try')
+  assert.deepEqual(await reporter.send(), { sent: 0, left: 1, connected: true }, 'send stops when nothing goes out')
+  const sent: WebRecord[] = []
+  reporter.connect(async records => { sent.push(...records) })
+  await reporter.flush()
+  assert.equal(sent[0]?.fields?.ref, 'abcd1234')
+  reporter.connect(async () => { attempts++; throw Object.assign(new Error('bad'), { responded: true, code: 'log_rejected' }) })
+  reporter.report({ level: 'info', event: 'web.action', message: 'refused' })
   await reporter.flush()
   assert.equal(reporter.pending(), 0)
-  await reporter.flush()
-  assert.equal(attempts, 1)
+  assert.equal(attempts, 3)
 })
 
 test('only the newest 100 queued records reach the device', async () => {

@@ -1,4 +1,4 @@
-import { ActionCard,claimFocus } from '@/components/arc/product-kit'
+import { ActionCard,CountBadge,claimFocus } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
 import { JoinCard } from '@/features/devices/join'
 import { RecoveryPendingCard,RotateHintCard } from '@/features/identity/recovery-controls'
@@ -8,7 +8,6 @@ import { QuestionCard } from '@/features/workspace/question-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { InputTargetLink,WorkspaceInputStatus } from '@/features/workspace/workspace-chat'
 import { WriteCard } from '@/features/workspace/write-card'
-import { terms } from '@/lib/glossary'
 import { Link,useNavigate } from '@tanstack/react-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
@@ -67,8 +66,8 @@ export function PendingSection() {
     }, "清除待处理问题")
     setBusy(null)
   }
-  return <section className="grid gap-3" aria-labelledby="pending-heading">
-    <div className="flex flex-wrap items-center justify-between gap-2"><h2 id="pending-heading" className="text-lg font-medium">{terms.inbox.label}</h2>{questions.length ? <Button type="button" variant="secondary" disabled={!workspace.writable || busy !== null} aria-busy={busy === "questions" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void clearQuestions()}><ListChecks aria-hidden="true" />移出待处理（{questions.length}）</Button> : null}</div>
+  return <section className="grid gap-4" aria-labelledby="pending-heading">
+    <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><h2 id="pending-heading" className="text-xl font-medium">需要你处理</h2><CountBadge count={items.length} label={`${items.length} 项待处理`} /></div>{questions.length ? <Button type="button" variant="ghost" disabled={!workspace.writable || busy !== null} aria-busy={busy === "questions" || undefined} onFocus={() => { held.current = { key: bulkFocusKey, index: 0 } }} onClick={() => void clearQuestions()}><ListChecks aria-hidden="true" />移出待处理（{questions.length}）</Button> : null}</div>
     {inputs.length ? <section className="grid gap-3"><h3 className="text-sm font-medium text-secondary">待确认</h3>{inputs.map((input) => <div key={input.message_id} data-pending-input="" tabIndex={-1} onFocus={() => { held.current = { key: `undelivered:${input.message_id}`, index: 0 } }} className="grid gap-2 outline-none"><p className="line-clamp-2 text-sm">{input.text}</p><InputTargetLink target={input.target} conversationId={input.conversation_id} /><WorkspaceInputStatus pending={input} /></div>)}</section> : null}
     {attention.length ? <h3 className="mt-3 text-sm font-medium text-secondary">更新</h3> : null}
     {attention.length ? <div className="flex flex-wrap justify-end gap-2">

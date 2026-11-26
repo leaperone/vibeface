@@ -3,7 +3,7 @@ import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-rou
 import { Bot, Circle, CircleCheck, CircleDot, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, Square, type LucideIcon } from 'lucide-react-native'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
-import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
+import { KeyboardAwareScrollView, type KeyboardAwareScrollViewRef } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
 import { agentLaneLabels, fixOnDevice, fixOnDeviceLabel, followUp, followUpCopy, interruptedCopy, nodeName, parseSummarySteps, progressLabel, promptSummary, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp, type SummaryStep } from '@vibeface/client/workspace/labels.ts'
@@ -31,11 +31,13 @@ type ComposerDraft = { text: string; files: PickedAttachment[]; workId: string; 
 
 /** One task of a bot's chat, as the web's task panel: progress, result, stop and the details behind it. */
 export default function TaskDetailRoute() {
-  const { botId, workId } = useLocalSearchParams<{ botId: string; workId: string }>()
-  return <TaskDetail key={`${botId}:${workId}`} botId={botId} workId={workId} />
+  const { botId, workId, message } = useLocalSearchParams<{ botId: string; workId: string; message?: string }>()
+  return <TaskDetail key={`${botId}:${workId}`} botId={botId} workId={workId} focus={message} />
 }
 
-function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
+function TaskDetail({ botId, workId, focus }: { botId: string; workId: string; focus?: string }) {
+  const scroll = useRef<KeyboardAwareScrollViewRef>(null)
+  const located = useRef('')
   const shared = useLive()
   const { directory, ready } = useDevice()
   const router = useRouter()
@@ -93,6 +95,9 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
 
   const lookup = { nodes: shared.nodes, directory }
   const asking = workApproval({ work, conversationId: bot.conversation_id, questions: shared.questions, answered: shared.answered })
+  const focusQuestion = focus?.startsWith('question:') ? focus.slice(9) : null
+  const originalQuestion = focusQuestion ? shared.questions.find((question) => question.question_id === focusQuestion && question.conversation_id === work.conversation_id && question.target?.kind === 'work' && question.target.work_id === work.work_id) : null
+  const question = focusQuestion ? originalQuestion : asking
   const shown = shownState(work, shared.nodes)
   const state = shown === 'running' && asking ? 'waiting' : shown
   const device = work.target_node
@@ -119,7 +124,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   // A work whose result is unknown may still write; new input waits until the result is checked.
   const inputPaused = !canContinue && (!work.outcome || unknown || work.outcome === "unverified")
   const inputIntent = canContinue || inputPaused ? promptIntent(text) : "new_task"
-  return <KeyboardAwareScrollView keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
+  return <KeyboardAwareScrollView ref={scroll} keyboardShouldPersistTaps="handled" bottomOffset={16} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <Button variant="ghost" className="self-start" accessibilityLabel={`打开所属 Bot ${bot.name}`} onPress={() => router.push(`/b/${bot.bot_id}`)}><Icon as={Bot} /><Text>{bot.name}</Text></Button>
     <Text className="text-sm text-muted">来源：共享历史中的工作记录。完整执行历史未提供。</Text>
@@ -155,7 +160,7 @@ function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
     {asked.summary ? <Section title="交代的事"><Text selectable>{asked.summary}</Text></Section> : null}
     {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
     {check ? <ConfirmCard check={check} /> : null}
-    {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
+    {question || focusQuestion ? <View onLayout={focusQuestion ? ({ nativeEvent }) => { if (located.current !== focusQuestion) { located.current = focusQuestion; const y = Math.max(0, nativeEvent.layout.y - 16); requestAnimationFrame(() => scroll.current?.scrollTo({ y, animated: false })) } } : undefined}>{question ? <QuestionCard key={question.question_id} question={question} inTask /> : <Text role="status" className="text-sm text-muted">{!shared.synced ? '最近记录尚未同步完，原问题状态待确认。' : '原问题已不在这个工作的待处理记录中。请查看这里的最新结果，旧提醒不会再次执行。'}</Text>}</View> : null}
     {canStop && sharing.length ? <Section title="会一起停止">
       {sharing.map((item) => <View key={item.work_id} className="flex-row items-center gap-2">
         <Icon as={Link2} className="size-4 text-muted" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>

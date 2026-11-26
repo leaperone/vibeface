@@ -57,7 +57,7 @@ mod work;
 mod work_input;
 mod workspace;
 pub(crate) use cursor::record_reply as record_cursor_reply;
-pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool};
+pub(crate) use health::{MAX_LOG_READ, health_turn, health_turn_tool, runs_health_turns};
 pub use manager_control::RegisteredInvocation;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
@@ -1527,12 +1527,21 @@ impl Runtime {
             Ok(BusinessCommand::Notifications(_)) => {
                 let network = network.to_owned();
                 let client = field(input, "client_id")?.to_owned();
-                let notifications = self
-                    .read_display(&access, input, "notifications", move |store| {
-                        store.display_notifications(&network, &client)
-                    })
-                    .await?;
-                Ok(json!({"notifications":notifications}))
+                let allowed_conversation = access.conversation_id().map(str::to_owned);
+                let notification_id = input
+                    .get("notification_id")
+                    .map(|_| id(input, "notification_id"))
+                    .transpose()?;
+                self.read_display(&access, input, "notifications", move |store| {
+                    if let Some(id) = notification_id {
+                        let notification = store.notification_by_id(&network, &id)?;
+                        if let (Some(allowed), Some(notification)) = (&allowed_conversation, &notification) {
+                            ensure!(allowed == &notification.conversation_id, "notification is outside this conversation");
+                        }
+                        let record = notification.as_ref().map(|notification| store.routine_notification_record(&network, notification)).transpose()?.unwrap_or(Value::Null);
+                        Ok(json!({"notifications":notification.into_iter().collect::<Vec<_>>(), "record":record}))
+                    } else { Ok(json!({"notifications":store.display_notifications(&network, &client)?})) }
+                }).await
             }
             Ok(BusinessCommand::DismissWork(_)) => {
                 ensure!(access.is_user(), "only clients close failed works");

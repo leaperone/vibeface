@@ -977,8 +977,12 @@ async fn health(options: Access) -> Result<()> {
         println!("Problems: none");
     }
     for problem in &problems {
+        let on = problem["device"]
+            .as_str()
+            .map(|device| format!(" on {device}"))
+            .unwrap_or_default();
         println!(
-            "Problem: {} {} since {}: {}",
+            "Problem: {} {}{on} since {}: {}",
             problem["check"].as_str().unwrap_or_default(),
             problem["subject"].as_str().unwrap_or_default(),
             ago(&problem["since_ms"]),

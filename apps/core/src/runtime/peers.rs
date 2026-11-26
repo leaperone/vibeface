@@ -23,6 +23,24 @@ const RETRY_LIMIT: Duration = Duration::from_secs(30);
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOB_CHUNK: usize = 64 * 1024;
 const BLOB_SYNC_BYTES: u64 = 1024 * 1024;
+/// A source that sends nothing for this long while its connection stays open loses the
+/// download; the committed offset stays for the next try.
+const BLOB_IDLE: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct BlobIdle;
+
+impl std::fmt::Display for BlobIdle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "attachment source sent nothing for {} s",
+            BLOB_IDLE.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for BlobIdle {}
 const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
@@ -723,11 +741,26 @@ impl Runtime {
                 | "join_changed"
                 | "input_receipt"
                 | "scope_context"
+                | "health_problems"
+                | "read_logs"
+                | "read_health"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
+            "health_problems" | "read_logs" | "read_health"
+                if !self.schedules_primary_bot(network, origin).await? =>
+            {
+                bail!("only the Node that schedules the primary bot reads another Node's health")
+            }
+            "health_problems" => Ok(self.shared_problems()),
+            // A member Node's primary bot diagnosing this one; the logs are already redacted.
+            "read_logs" => {
+                let (dir, args) = (self.data_dir.clone(), input["args"].clone());
+                tokio::task::spawn_blocking(move || super::health::read_logs(&dir, &args)).await?
+            }
+            "read_health" => self.read_health().await,
             "work_evidence" => {
                 let conversation = field(input, "conversation_id")?;
                 let work_id = field(input, "work_id")?;
@@ -2376,10 +2409,23 @@ impl Runtime {
             if let Err(error) = self.fetch_blob(network, peer, blob).await {
                 tracing::debug!(%peer, %error, blob = blob.hash, "attachment download pending");
                 failed += 1;
+                // A source that stopped sending would make each of the rest wait out the limit too.
+                if error.is::<BlobIdle>() {
+                    break;
+                }
             }
         }
         ensure!(failed == 0, "{failed} attachments still pending");
         Ok(())
+    }
+
+    /// An attachment source that went idle: logged at warn once per attachment until it moves on.
+    fn blob_stalled(&self, peer: &str, blob: &BlobRef, offset: u64) -> anyhow::Error {
+        if self.health.lock().expect("health").blob_stalled(&blob.hash) {
+            tracing::warn!(event = "attachment.stalled", %peer, blob = blob.hash, offset,
+                size = blob.size, idle_s = BLOB_IDLE.as_secs(), "an attachment source stopped sending");
+        }
+        anyhow::Error::new(BlobIdle)
     }
 
     /// Resumes from the last offset synced to disk, so a restart re-downloads at most one chunk.
@@ -2418,8 +2464,9 @@ impl Runtime {
         )
         .await?;
         send.finish().ok();
-        let header = net::read_frame(&mut recv)
-            .await?
+        let header = tokio::time::timeout(BLOB_IDLE, net::read_frame(&mut recv))
+            .await
+            .map_err(|_| self.blob_stalled(peer, blob, committed))??
             .context("source closed the attachment stream")?;
         if let Some(error) = header["error"].as_str() {
             bail!("{error}");
@@ -2454,9 +2501,9 @@ impl Runtime {
         file.seek(std::io::SeekFrom::Start(committed)).await?;
         let mut offset = committed;
         let mut unsynced = 0;
-        while let Some(chunk) = recv
-            .read_chunk(BLOB_CHUNK)
+        while let Some(chunk) = tokio::time::timeout(BLOB_IDLE, recv.read_chunk(BLOB_CHUNK))
             .await
+            .map_err(|_| self.blob_stalled(peer, blob, offset))?
             .map_err(|error| anyhow::anyhow!("attachment stream failed: {error}"))?
         {
             offset += chunk.len() as u64;
@@ -2465,6 +2512,10 @@ impl Runtime {
             unsynced += chunk.len() as u64;
             if unsynced >= BLOB_SYNC_BYTES {
                 file.sync_data().await?;
+                self.health
+                    .lock()
+                    .expect("health")
+                    .blob_progressed(peer, &blob.hash, now_ms());
                 {
                     let arg0 = (blob.hash).to_owned();
                     let arg1 = Some(offset);
@@ -2509,6 +2560,10 @@ impl Runtime {
         }
         tokio::fs::create_dir_all(target.parent().context("blob directory")?).await?;
         tokio::fs::rename(&part, &target).await?;
+        self.health
+            .lock()
+            .expect("health")
+            .blob_progressed(peer, &blob.hash, now_ms());
         {
             let arg0 = (blob.hash).to_owned();
             let arg1 = None;
@@ -2537,6 +2592,7 @@ pub(super) fn staging_room_for(dir: &Path, size: u64, new_object: bool) -> Resul
     );
     Ok(())
 }
+
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

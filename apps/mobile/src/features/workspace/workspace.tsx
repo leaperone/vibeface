@@ -250,6 +250,7 @@ function OfflineWorkspaceHistory({ taskId, channelId }: { taskId?: string; chann
   const [query, setQuery] = useState('')
   const files = (attachments: NonNullable<ChatMessage['attachments']>, conversationId: string) => <MessageAttachments files={attachments} scope={JSON.stringify([scope.networkId, scope.deviceId, conversationId])} />
   return <KeyboardAwareScrollView ref={scroll} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-6 pb-12"><Stack.Screen options={{ title: cached?.title ?? (channelId ? '频道记录' : '任务记录') }} />
+    {locatedMessage.startsWith('question:') ? <Text role="status" className="text-sm text-muted">原问题状态需连接确认，当前仅展示保存的{channelId ? '频道' : '任务'}记录。</Text> : null}
     <Text role="status" className="text-sm text-muted">本地回看 · 当前只读。连上并同步后可读取完整历史、继续发送和处理任务。</Text>
     {cached ? <><Text className="text-sm text-muted">{cached.botIds.map(id => workspace.bots.find(bot => bot.bot_id === id)?.name ?? 'Bot').join('、')} · 保存于 {new Date(cached.savedAt).toLocaleString()}</Text><Input accessibilityLabel="搜索本地保存的记录" placeholder="搜索本地记录" value={query} onChangeText={setQuery} />
       {cached.events.filter(event => !query.trim() || JSON.stringify(event.body).toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())).map(event => {
@@ -406,10 +407,12 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
     return () => { routeActive.current = false; request.current = null; viewportRead.invalidate(); clearInterval(timer); listener.remove() }
   }, []))
   const matchesLocation = (event: NonNullable<typeof history>['events'][number]) => workspaceHistoryMatchesMessage(event, locatedMessage)
-  const foundLocation = Boolean(locatedMessage && history?.events.some(matchesLocation))
+  const focusQuestion = locatedMessage.startsWith('question:') ? locatedMessage.slice(9) : null
+  const scopedQuestions = shared?.questions.filter(question => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target))) ?? []
+  const foundLocation = focusQuestion ? scopedQuestions.some((question) => question.question_id === focusQuestion) : Boolean(locatedMessage && history?.events.some(matchesLocation))
   useEffect(() => {
-    if (locatedMessage && history && !foundLocation && !history.complete && !reading && !pageError && !historyError) void readRef.current('older')
-  }, [locatedMessage, history, foundLocation, reading, pageError, historyError])
+    if (locatedMessage && !focusQuestion && history && !foundLocation && !history.complete && !reading && !pageError && !historyError) void readRef.current('older')
+  }, [locatedMessage, focusQuestion, history, foundLocation, reading, pageError, historyError])
   if (!shared || !bot || taskId && !task && !pendingTask || channelId && !channel) return <View className="flex-1"><EmptyState icon={ListChecks} title={historyError || (shared?.workspaceState ? '尚未读到这个任务、频道或 Bot' : '正在读取')} className="flex-1 justify-center" action={<Button variant="secondary" disabled={Boolean(reading)} onPress={() => void read()}><Text>重新读取</Text></Button>} /></View>
   const expectedRevision = task?.revision ?? pendingTask?.expected_revision
   const label = `${bot.name} · ${task?.title ?? (selectedTaskId ? '已保存的任务' : '新频道任务')}`
@@ -475,7 +478,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
       <View className="gap-2"><Text nativeID="scope-history-search" className="text-sm text-muted">{channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'}</Text><Input accessibilityLabel={channelId ? '搜索当前频道已加载的记录' : '搜索当前任务已加载的记录'} accessibilityLabelledBy="scope-history-search" value={historyQuery} onChangeText={setHistoryQuery} placeholder="输入关键词" /></View>
       {history?.next_cursor ? <Button variant="secondary" disabled={Boolean(reading)} onPress={() => void read('older')}><Text>{reading === 'older' ? '正在读取更早记录' : '读取更早记录'}</Text></Button> : null}
       {pageError || historyError ? <View accessibilityLiveRegion="polite" className="gap-2"><ErrorText error={pageError || historyError} /><Text className="text-sm text-muted">连接或历史依据可能已改变。重新加载可重新读取历史，草稿会保留。</Text><Button variant="secondary" disabled={Boolean(reading)} onPress={() => void read('reload')}><Text>重新加载历史</Text></Button></View> : null}
-      {locatedMessage ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">{foundLocation ? '已定位搜索结果。' : history?.complete ? '这条搜索结果已不在当前历史中，请重新搜索。' : '正在读取更早记录以定位搜索结果。'}</Text> : null}
+      {locatedMessage ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">{focusQuestion ? !shared.synced || !shared.connectionOnline ? '最近记录尚未同步完，原问题状态待确认。' : foundLocation ? '已定位原问题。' : `原问题已不在当前${channelId ? '频道' : '任务'}的待处理记录中。请查看这里的最新结果，旧提醒不会再次执行。` : foundLocation ? '已定位搜索结果。' : history?.complete ? '这条搜索结果已不在当前历史中，请重新搜索。' : '正在读取更早记录以定位搜索结果。'}</Text> : null}
       {renderedHistoryEvents.map(event => {
         const body = event.body
         const actor = event.speaker
@@ -498,7 +501,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
         }
         return content ? <View key={event.event_hash} className={highlighted ? 'gap-2 rounded-control border border-accent p-3' : undefined} onLayout={layout => { const row = layout.nativeEvent.layout; viewportRows.current.set(event.event_hash, { y: row.y, height: row.height }); reportViewport.current(); if (highlighted && located.current !== locatedMessage) { located.current = locatedMessage; const y = Math.max(0, row.y - 16); requestAnimationFrame(() => scroll.current?.scrollTo({ y, animated: false })) } }}>{highlighted ? <Text className="text-sm font-medium">搜索结果</Text> : null}{content}</View> : null
       })}
-      {shared.questions.filter(question => question.target && (channelId ? (question.target.kind === 'channel_task' || question.target.kind === 'channel_member') && question.target.channel_id === channelId : sameTarget(question.target, target))).map(question => <QuestionCard key={question.question_id} question={question} inTask />)}
+      {scopedQuestions.map(question => <View key={question.question_id} onLayout={question.question_id === focusQuestion ? ({ nativeEvent }) => { if (located.current !== locatedMessage) { located.current = locatedMessage; const y = Math.max(0, nativeEvent.layout.y - 16); requestAnimationFrame(() => scroll.current?.scrollTo({ y, animated: false })) } } : undefined}><QuestionCard question={question} inTask /></View>)}
       {pending.map(item => <View key={item.message_id} className="gap-2">{!posted.has(item.message_id) ? <View className="max-w-[90%] self-end rounded-panel bg-surface-muted px-4 py-3">{item.text ? <Text selectable>{item.text}</Text> : null}{item.attachments?.length ? attachments(item.attachments, item.conversation_id) : null}<MessageActions message={{ message_id: item.message_id, event_hash: '', created_at_ms: item.created_at_ms, role: 'user', text: item.text, attachments: item.attachments }} onQuote={quote} /></View> : null}<InputStatus pending={item} /></View>)}
       {history?.complete && !history.events.length ? <Text className="text-center text-sm text-muted">发送一条交代开始对话。</Text> : null}<Text accessibilityLiveRegion="polite" className="text-sm text-muted">{history ? `已加载 ${history.events.length} 条记录${history.complete ? '，这个节点上的历史已全部加载' : '，更早的记录尚未加载'}。` : reading ? '正在读取历史。' : '尚未读取历史。'}执行服务是否接收、输入归入哪个回合，请查看每条输入的状态。</Text>
       {cacheError ? <Text accessibilityLiveRegion="polite" className="text-sm text-warning">{cacheError}</Text> : null}

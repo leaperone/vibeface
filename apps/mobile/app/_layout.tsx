@@ -8,7 +8,7 @@ import { Stack, usePathname, useRouter } from 'expo-router'
 import { ListChecks, MessageSquare, Settings, X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
-import { useEffect } from 'react'
+import { Activity, useEffect } from 'react'
 import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
@@ -23,6 +23,7 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace, useLive, useWaiting } from '@/data/live'
+import { NotificationBanner } from '@/features/home/notification-banner'
 import { HomeList } from '@/features/home/list'
 import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
@@ -79,8 +80,8 @@ function Screens() {
   return <>
     <StatusBar style="auto" />
     <View className="flex-1 flex-row bg-background">
-      {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
-      {ready ? <View className="w-80 border-e border-border bg-surface-muted" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
+      {/* Kept mounted when narrow, hidden with its effects stopped and its updates deferred, so a rotation only flips its display. */}
+      {ready ? <View className="w-80 border-e border-border bg-surface-muted" style={{ display: wide ? 'flex' : 'none' }}><Activity mode={wide ? 'visible' : 'hidden'}><HomeList sidebar /></Activity></View> : null}
       <View className="flex-1">
         <Stack screenListeners={({ route }) => ({ focus: () => { if (route.name !== 'b/[botId]') shared?.setView(route.name === 'tasks' ? 'tasks' : 'other') } })} screenOptions={{
           headerShadowVisible: false,
@@ -127,12 +128,13 @@ function Screens() {
             <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
-        {tabbed ? <NavigationTabs bottom={insets.bottom} items={tabs.map(([href, label, icon]) => ({
+        {tabbed ? <NavigationTabs bottom={insets.bottom} left={insets.left} right={insets.right} items={tabs.map(([href, label, icon]) => ({
           href: { pathname: href, params: { tab: '1' } }, label, icon, selected: pathname === href,
           accessibilityLabel: href === '/tasks' && waiting ? `${label}，${waiting} 件事等你决定` : label,
           notice: href === '/tasks' ? <Badge count={waiting} /> : undefined,
         }))} /> : null}
         {/* Keep background notifications clear of navigation and the composer. */}
+        {ready && shared && workspace.networkId ? <NotificationBanner key={JSON.stringify([workspace.networkId, workspace.deviceId, shared.generation])} networkId={workspace.networkId} /> : null}
         <Toaster bottom={(tabbed ? 68 : 88) + insets.bottom} />
       </View>
     </View>

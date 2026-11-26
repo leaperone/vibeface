@@ -93,11 +93,11 @@ export async function notificationForOpening(args: {
   destination: NotificationDestination
   connection: ReadyConnection
   current(): boolean
-  read(): Promise<NotificationRecord[]>
+  read(notificationId: string): Promise<NotificationRecord[]>
 }): Promise<{ kind: 'deferred' } | { kind: 'invalid' } | { kind: 'target'; notification: NotificationRecord }> {
   const { destination, connection, current, read } = args
   if (!current() || destination.network_id !== connection.principal.network_id || connection.info.network_id !== destination.network_id) return { kind: 'deferred' }
-  const items = await read()
+  const items = await read(destination.notification_id)
   if (!current()) return { kind: 'deferred' }
   const notification = items.find(item => item.notification_id === destination.notification_id && item.conversation_id === destination.conversation_id)
   return notification ? { kind: 'target', notification } : connection.catchingUp?.() ? { kind: 'deferred' } : { kind: 'invalid' }

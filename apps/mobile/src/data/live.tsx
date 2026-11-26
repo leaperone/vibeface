@@ -80,16 +80,21 @@ function useConnection(): { session: Session; connection: Connection } {
   return { session, connection: { state, entry: name ?? '', direct: entry?.kind === 'lan' } }
 }
 
-function Device({ children }: { children: ReactNode }) {
+export function useOpenNotificationConversation() {
   const router = useRouter()
+  return (id: string, target?: InputTarget, focus?: string, notificationId?: string) => {
+    if (target?.kind === 'task' || target?.kind === 'channel_task') router.push({ pathname: '/task/[taskId]', params: { taskId: target.task_id, ...(focus ? { message: focus } : {}) } })
+    else if (target?.kind === 'channel_member') router.push({ pathname: '/channel/[channelId]', params: { channelId: target.channel_id, ...(focus ? { message: focus } : {}) } })
+    else router.push({ pathname: '/', params: { conversation: id, ...(focus ? { message: focus } : {}), ...(notificationId ? { notification: notificationId } : {}), ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
+  }
+}
+
+function Device({ children }: { children: ReactNode }) {
+  const openConversation = useOpenNotificationConversation()
   const device = useDevice()
   const { ready } = device
   if (!ready) return <Offline>{children}</Offline>
-  return <SharedWorkspace key={`${ready.principal.network_id}:${ready.principal.device_id}`} platform={mobilePlatform} connection={ready} tabs={noTabs} openConversation={(id, target?: InputTarget) => {
-    if (target?.kind === 'task' || target?.kind === 'channel_task') router.push(`/task/${target.task_id}`)
-    else if (target?.kind === 'channel_member') router.push(`/channel/${target.channel_id}`)
-    else router.push({ pathname: '/', params: { conversation: id, ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
-  }}>
+  return <SharedWorkspace key={`${ready.principal.network_id}:${ready.principal.device_id}`} platform={mobilePlatform} connection={ready} tabs={noTabs} openConversation={openConversation}>
     <Live>{children}</Live>
   </SharedWorkspace>
 }
@@ -148,9 +153,20 @@ function Live({ children }: { children: ReactNode }) {
   const seen = useMemo(() => lastSeen(scope), [scope?.network_id, scope?.device_id, scope?.entry_device_id, device.phase])
 
   const cached = useMemo(() => localConversations.all({ networkId, deviceId: me ?? '' }), [networkId, me, data, shared.generation])
-  const conversations: Record<string, Conversation> = Object.fromEntries(cached.map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)]))
+  // The open conversation shows what the workspace holds, so its stored copy is not projected only to be replaced.
+  const replaced = data && conversationId && (shared.dataOrigin === 'cache' || shared.dataOrigin === 'network') ? conversationId : null
+  const cachedConversations = useMemo(() => Object.fromEntries(cached.filter((record) => record.conversationId !== replaced).map((record) => [record.conversationId, cachedConversation(record, shared.pendingMessages)])), [cached, replaced, shared.pendingMessages])
+  const conversations: Record<string, Conversation> = { ...cachedConversations }
   if (data && conversationId && shared.dataOrigin === 'cache') conversations[conversationId] = cachedConversation({ networkId, deviceId: me ?? '', conversationId, savedAt: cached.find((record) => record.conversationId === conversationId)?.savedAt ?? Date.now(), payload: data }, shared.pendingMessages)
-  if (data && conversationId && shared.dataOrigin === 'network') {
+  // Live progress re-renders this far more often than the conversation itself changes.
+  const shown = useMemo(() => {
+    if (!data || shared.dataOrigin !== 'network') return null
+    const steered = new Set((data.scheduler?.jobs ?? []).filter((job) => job.state === 'steered').map((job) => job.message_id))
+    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
+    return { timeline: chatTimeline(data.messages, data.questions, steered), folded: foldAnswers(data.messages, data.questions) }
+  }, [data, shared.dataOrigin])
+  if (data && conversationId && shown) {
+    const { timeline, folded } = shown
     const jobs = data.scheduler?.jobs ?? []
     // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
     // streaming, which can land a frame or two before the job names it.
@@ -166,9 +182,6 @@ function Live({ children }: { children: ReactNode }) {
     const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
     const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? (sending ? pending.at(-1)?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id))
-    const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
-    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
-    const folded = foldAnswers(data.messages, data.questions)
     const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers) && shared.fresh.has(`question:${question.question_id}`))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
@@ -254,8 +267,6 @@ function Live({ children }: { children: ReactNode }) {
       leave: device.leave,
     }
   }, [device.join, device.cancelJoin, device.leave])
-
-  useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
 
   const fresh = shared.synced || shared.bots.length > 0
   const bots = fresh || !seen ? shared.bots : seen.bots, primary = fresh || !seen ? shared.primary : seen.primary

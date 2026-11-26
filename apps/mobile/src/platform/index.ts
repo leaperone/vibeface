@@ -56,13 +56,8 @@ const phoneKeys: DeviceKeys = {
 }
 
 Notifications.setNotificationHandler({
-  handleNotification: async (notification) => {
-    const destination: unknown = notification.request.content.data?.destination
-    const networkId = destination && typeof destination === 'object' && 'network_id' in destination && typeof destination.network_id === 'string' ? destination.network_id : ''
-    const settings = notificationPreferences(notificationStorage, networkId).read()
-    const muted = destination && typeof destination === 'object' && 'conversation_id' in destination && typeof destination.conversation_id === 'string' && settings.mutedConversations.includes(destination.conversation_id)
-    return { shouldShowBanner: settings.enabled && !muted, shouldShowList: settings.enabled && !muted, shouldPlaySound: settings.enabled && settings.sound && !muted, shouldSetBadge: settings.enabled && settings.badge }
-  },
+  // Expo asks how to present a foreground delivery. The live workspace owns that UI.
+  handleNotification: async () => ({ shouldShowBanner: false, shouldShowList: false, shouldPlaySound: false, shouldSetBadge: false }),
 })
 // Its own Android channel, so system settings show Vibeface's name for these alerts; iOS ignores channels.
 const channelId = 'vibeface'
@@ -95,6 +90,7 @@ const notifier: Notifier = {
     const settings = notificationPreferences(notificationStorage, destination.network_id).read()
     await privateFiles.run(async (current) => {
       if (!current()) throw new Error('应用内数据正在清除。')
+      if (AppState.currentState !== 'background') return
       await Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { destination }, ...(settings.sound ? { sound: 'default' } : {}) }, trigger: { channelId: settings.sound ? channelId : silentChannelId } })
     })
   },

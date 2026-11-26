@@ -829,12 +829,36 @@ pub enum JobOutcome {
 
 impl JobOutcome {
     pub(crate) fn completed_for(job: &SchedulerJob, text: &str) -> Self {
-        if matches!(job.scope, SessionScope::Routine { .. }) && text.trim().is_empty() {
+        if job.kind == TriggerKind::Schedule
+            && matches!(job.scope, SessionScope::Routine { .. })
+            && routine_no_change(text)
+        {
             Self::NoChange
         } else {
             Self::Completed
         }
     }
+}
+
+pub(crate) const ROUTINE_NO_CHANGE: &str = r#"{"routine_result":"no_change"}"#;
+
+/// A whole, explicit result; blanks, mixed prose and unknown fields never mean no change.
+pub(crate) fn routine_no_change(text: &str) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ResultSignal {
+        routine_result: NoChange,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum NoChange {
+        NoChange,
+    }
+    if text == ROUTINE_NO_CHANGE {
+        return true;
+    }
+    serde_json::from_str::<ResultSignal>(text)
+        .is_ok_and(|signal| matches!(signal.routine_result, NoChange::NoChange))
 }
 
 #[derive(Debug, Clone)]
