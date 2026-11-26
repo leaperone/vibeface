@@ -7,7 +7,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     ...config,
     name: config.name ?? 'Vibeface',
     slug: config.slug ?? 'vibeface',
-    plugins: [...config.plugins ?? [], 'expo-notifications'],
+    plugins: [...config.plugins ?? [], 'expo-notifications', './plugins/with-ios-share.cjs'],
     extra: { ...config.extra, ...(projectId ? { eas: { projectId } } : {}) },
     android: { ...config.android, ...(googleServicesFile ? { googleServicesFile } : {}) },
   }

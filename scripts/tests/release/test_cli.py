@@ -352,23 +352,45 @@ class CliContracts(unittest.TestCase):
                     info_name = 'Payload/Vibeface.app/Info.plist' if index else 'Vibeface.xcarchive/Products/Applications/Vibeface.app/Info.plist'
                     with zipfile.ZipFile(path, 'w') as archive:
                         archive.writestr(info_name, plistlib.dumps(dict(CFBundleIdentifier='cn.leaperone.vibeface',
-                            CFBundleShortVersionString='1.0.0', CFBundleVersion='2611.14.9', CFBundleSupportedPlatforms=['iPhoneOS'])))
+                            CFBundleShortVersionString='1.0.0', CFBundleVersion='2611.14.9', CFBundleSupportedPlatforms=['iPhoneOS'],
+                            ExpoShareIntoAppGroupId='group.one.leaper.vibeface')))
+                        share_info = dict(CFBundleIdentifier='one.leaper.vibeface.share', CFBundleShortVersionString='1.0.0',
+                            CFBundleVersion='2611.14.9', CFBundleSupportedPlatforms=['iPhoneOS'], CFBundleDisplayName='Vibeface',
+                            AppGroupId='group.one.leaper.vibeface', CFBundlePackageType='XPC!',
+                            NSExtension={'NSExtensionPointIdentifier': 'com.apple.share-services'})
+                        share_prefix = info_name.rsplit('/', 1)[0] + '/PlugIns/expo-sharing-extension.appex/'
+                        archive.writestr(share_prefix + 'Info.plist', plistlib.dumps(share_info))
                         if signed:
                             archive.writestr(info_name.rsplit('/', 1)[0] + '/embedded.mobileprovision', b'fixture provisioning profile')
+                            archive.writestr(share_prefix + 'embedded.mobileprovision', b'fixture sharing provisioning profile')
                     sha = hashlib.sha256(path.read_bytes()).hexdigest()
                     path.with_name(name + '.sha256').write_text(sha + '  ' + name + '\n')
                     receipt = dict(schema=1, platform='ios-device', source_sha='a' * 40, release_version=CLI,
                         bundle_identifier='cn.leaperone.vibeface', bundle_short_version='1.0.0', build_number='2611.14.9',
                         artifact=name, sha256=sha, signed=signed, installable=bool(index),
-                        kind='signed-ios-ipa' if index else state + '-xcarchive-inspection-only')
+                        kind='signed-ios-ipa' if index else state + '-xcarchive-inspection-only',
+                        share_extension=dict(bundle_identifier='one.leaper.vibeface.share', bundle_short_version='1.0.0',
+                            build_number='2611.14.9', display_name='Vibeface', app_group_identifier='group.one.leaper.vibeface',
+                            extension_point_identifier='com.apple.share-services'))
                     if index:
                         receipt.update(distribution_method='ad-hoc', team_id='ABCDE12345', provisioning_profile_uuid='fixture-uuid',
-                                       provisioning_profile_expiration='2027-01-01T00:00:00Z', testflight_eligible=False)
+                                       provisioning_profile_expiration='2027-01-01T00:00:00Z', testflight_eligible=False,
+                                       share_provisioning_profile_uuid='fixture-share-uuid', share_provisioning_profile_expiration='2027-01-01T00:00:00Z')
                     write_json(path.with_name(name + '.provenance.json'), receipt)
                 f.cli('manifest', 'mobile', mobile)
                 self.assertEqual(len(list(mobile.iterdir())), count)
                 with patch.object(release_context, 'ROOT', f.root), patch.dict(os.environ, f.env, clear=True):
                     release_inventory.verify_release('mobile', mobile)
+                    for name in names:
+                        receipt_path = mobile / (name + '.provenance.json')
+                        original = json.loads(receipt_path.read_text())
+                        malformed = original | {'share_extension': original['share_extension'] | {'display_name': 'expo-sharing-extension'}}
+                        write_json(receipt_path, malformed)
+                        f.cli('manifest', 'mobile', mobile)
+                        with self.assertRaises(ValueError):
+                            release_inventory.verify_release('mobile', mobile)
+                        write_json(receipt_path, original)
+                    f.cli('manifest', 'mobile', mobile)
                     receipt = mobile / (names[0] + '.provenance.json')
                     bad = json.loads(receipt.read_text())
                     bad['signed'] = not signed

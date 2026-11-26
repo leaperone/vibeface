@@ -35,7 +35,7 @@ jobs:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
           GH_TOKEN: ${{ github.token }}
           WINDOWS_SIGNING_CONFIGURED: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' }}
-          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' }}
+          IOS_SIGNING_CONFIGURED: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 != '' && secrets.IOS_CERTIFICATE_PASSWORD != '' && secrets.IOS_PROVISIONING_PROFILE_BASE64 != '' && secrets.IOS_SHARE_PROVISIONING_PROFILE_BASE64 != '' }}
         run: python3 -B scripts/release-entry.py --app mobile
   android:
     name: Build Mobile / android

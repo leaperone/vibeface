@@ -12,6 +12,7 @@ import tarfile
 import zipfile
 import release_context
 import release_format
+from ios_device import SHARE_BUNDLE_ID, SHARE_TARGET, share_receipt, verify_bundle_info
 
 
 MAX_ARCHIVE = 384 * 1024 * 1024
@@ -192,9 +193,10 @@ def verify_ios_assets(directory, pins):
         release_format.require(payload.is_file() and not payload.is_symlink(), 'missing regular iOS payload')
         verify_checksum_file(directory, name)
         receipt = json.loads((directory / (name + '.provenance.json')).read_text(encoding='utf-8'))
-        fields = set(identity_fields) | {'artifact', 'sha256', 'signed', 'installable', 'kind'}
+        fields = set(identity_fields) | {'artifact', 'sha256', 'signed', 'installable', 'kind', 'share_extension'}
         if index:
             fields |= {'distribution_method', 'team_id', 'provisioning_profile_uuid', 'provisioning_profile_expiration', 'testflight_eligible'}
+            fields |= {'share_provisioning_profile_uuid', 'share_provisioning_profile_expiration'}
         release_format.require(set(receipt) == fields, 'unsupported iOS receipt fields')
         release_format.require(all(receipt.get(key) == value for key, value in identity_fields.items()), 'iOS source, version or app identity mismatch')
         release_format.require(receipt.get('artifact') == name and receipt.get('sha256') == digest(payload), 'iOS receipt payload digest mismatch')
@@ -210,6 +212,10 @@ def verify_ios_assets(directory, pins):
             release_format.require(receipt.get('distribution_method') in ('app-store-connect', 'ad-hoc'), 'unsupported iOS distribution method')
             release_format.require(isinstance(receipt.get('team_id'), str) and re.fullmatch(r'[A-Z0-9]{10}', receipt['team_id']), 'invalid iOS signing team')
             release_format.require(isinstance(receipt.get('provisioning_profile_uuid'), str) and receipt['provisioning_profile_uuid'], 'missing iOS provisioning profile')
+            release_format.require(isinstance(receipt.get('share_provisioning_profile_uuid'), str)
+                    and receipt['share_provisioning_profile_uuid']
+                    and receipt['share_provisioning_profile_uuid'].upper() != receipt['provisioning_profile_uuid'].upper(),
+                    'sharing extension requires a distinct iOS provisioning profile')
         with zipfile.ZipFile(payload) as archive:
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
@@ -219,10 +225,18 @@ def verify_ios_assets(directory, pins):
             profile_name = info_name.rsplit('/', 1)[0] + '/embedded.mobileprovision'
             release_format.require((profile_name in names) is signed, 'iOS archive provisioning state differs from its signing claim')
             info = plistlib.loads(archive.read(info_name))
-            release_format.require((info.get('CFBundleIdentifier'), info.get('CFBundleShortVersionString'), str(info.get('CFBundleVersion')))
-                    == (mobile['ios']['bundleIdentifier'], mobile['version'], str(mobile['ios']['buildNumber'])),
-                    'iOS archive app metadata mismatch')
-            release_format.require(info.get('CFBundleSupportedPlatforms') == ['iPhoneOS'], 'iOS device archive must not contain a simulator app')
+            verify_bundle_info(info, mobile['ios']['bundleIdentifier'], mobile['version'], mobile['ios']['buildNumber'])
+            extension_prefix = info_name.rsplit('/', 1)[0] + '/PlugIns/'
+            extensions = {name[len(extension_prefix):].split('/', 1)[0] for name in names
+                          if name.startswith(extension_prefix) and '.appex/' in name[len(extension_prefix):]}
+            release_format.require(extensions == {SHARE_TARGET + '.appex'}, 'iOS app must contain exactly its sharing extension')
+            extension_info_name = extension_prefix + SHARE_TARGET + '.appex/Info.plist'
+            release_format.require(extension_info_name in names, 'iOS app is missing sharing extension metadata')
+            extension_info = plistlib.loads(archive.read(extension_info_name))
+            verify_bundle_info(extension_info, SHARE_BUNDLE_ID, mobile['version'], mobile['ios']['buildNumber'], share=True)
+            release_format.require(receipt['share_extension'] == share_receipt(extension_info), 'iOS sharing extension receipt differs from its bundle')
+            extension_profile_name = extension_info_name.rsplit('/', 1)[0] + '/embedded.mobileprovision'
+            release_format.require((extension_profile_name in names) is signed, 'iOS sharing extension signing claim mismatch')
     return signed
 
 

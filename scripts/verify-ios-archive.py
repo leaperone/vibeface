@@ -7,7 +7,8 @@ import plistlib
 import subprocess
 import zipfile
 from pathlib import Path
-from ios_device import verify_device_executable
+from ios_device import SHARE_TARGET, share_receipt, verify_bundle_info, verify_device_executable, verify_share_extension
+from ios_signing import verify_signed_pair
 
 
 def sha256_file(path):
@@ -26,6 +27,7 @@ def main():
     parser.add_argument('--release-version', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--signed', action='store_true')
+    parser.add_argument('--distribution-method', choices=('app-store-connect', 'ad-hoc'), default='app-store-connect')
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -42,18 +44,14 @@ def main():
         'CFBundleShortVersionString': mobile['version'],
         'CFBundleVersion': mobile['ios']['buildNumber'],
     }
-    for key, value in expected.items():
-        if info.get(key) != value:
-            raise SystemExit(f'archive {key} differs from committed app metadata')
-    if info.get('CFBundleSupportedPlatforms') != ['iPhoneOS']:
-        raise SystemExit('archive app is not marked for iPhoneOS')
+    verify_bundle_info(info, mobile['ios']['bundleIdentifier'], mobile['version'], mobile['ios']['buildNumber'])
     app = info_path.parent
     executable = verify_device_executable(app, info)
-    has_profile = (app / 'embedded.mobileprovision').exists()
-    if has_profile != args.signed:
+    extension, extension_info, extension_executable = verify_share_extension(app, mobile['version'], mobile['ios']['buildNumber'])
+    if any((bundle / 'embedded.mobileprovision').exists() != args.signed for bundle in (app, extension)):
         raise SystemExit('archive signing state does not match the requested verification mode')
     if args.signed:
-        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+        verify_signed_pair(app, extension, args.distribution_method)
     if not args.zip.is_file() or not zipfile.is_zipfile(args.zip):
         raise SystemExit('missing or invalid archive ZIP')
     with zipfile.ZipFile(args.zip) as zipped:
@@ -61,7 +59,22 @@ def main():
         executable_name = [name for name in zipped.namelist() if name.endswith('/Products/Applications/Vibeface.app/' + info['CFBundleExecutable'])]
         if len(info_name) != 1 or len(executable_name) != 1:
             raise SystemExit('ZIP does not contain exactly one expected device app bundle')
-        for name, path in ((info_name[0], info_path), (executable_name[0], executable)):
+        extension_prefix = info_name[0].rsplit('/', 1)[0] + '/PlugIns/'
+        extensions = {name[len(extension_prefix):].split('/', 1)[0] for name in zipped.namelist()
+                      if name.startswith(extension_prefix) and '.appex/' in name[len(extension_prefix):]}
+        if extensions != {SHARE_TARGET + '.appex'}:
+            raise SystemExit('ZIP does not contain exactly the expected sharing extension')
+        inspected = [(info_name[0], info_path), (executable_name[0], executable),
+                     (extension_prefix + extension.name + '/Info.plist', extension / 'Info.plist'),
+                     (extension_prefix + extension.name + '/' + extension_info['CFBundleExecutable'], extension_executable)]
+        if args.signed:
+            inspected.extend((info_name[0].rsplit('/', 1)[0] + '/' + str(path.relative_to(app)), path)
+                             for path in (app / 'embedded.mobileprovision', extension / 'embedded.mobileprovision'))
+        elif any(name.endswith('/embedded.mobileprovision') for name in zipped.namelist()):
+            raise SystemExit('unsigned ZIP contains a provisioning profile')
+        for name, path in inspected:
+            if zipped.namelist().count(name) != 1:
+                raise SystemExit('ZIP is missing a unique inspected bundle file')
             zipped_digest = hashlib.sha256()
             with zipped.open(name) as source:
                 for block in iter(lambda: source.read(1024 * 1024), b''):
@@ -77,6 +90,7 @@ def main():
         'bundle_identifier': expected['CFBundleIdentifier'],
         'bundle_short_version': expected['CFBundleShortVersionString'],
         'build_number': expected['CFBundleVersion'],
+        'share_extension': share_receipt(extension_info),
         'artifact': args.zip.name,
         'sha256': digest,
         'signed': args.signed,
