@@ -20,3 +20,4 @@
 - 主分支 CI 保留核心检查；同步、恢复、调度和工具执行改动须按 `packages/docs/ci.md` 补跑相关本地专项并记录结果。CI 只用受控协议夹具，不调用真实 AI Provider 或读取模型密钥。
 
 - e2e 测试、截图和界面验收只在用户明确要求时编写或运行，不作为默认验收、preflight 或 CI 步骤。被要求时先读 `.agents/skills/e2e/SKILL.md`，启动方式见 `packages/docs/e2e.md`。
+- 明确要求对代码库进行架构降熵治理时，先读 `.agents/skills/architecture-deentropy/SKILL.md`。
