@@ -72,6 +72,9 @@ export default function MessageSearch() {
   for (const item of visible.items) items.set(item.event_hash, item)
   const hits = [...items.values()].sort((a, b) => b.rank.localeCompare(a.rank) || b.created_at_ms - a.created_at_ms)
 
+  const empty = Boolean(term) && !hits.length && (visible.kind === 'ready' || !device.ready)
+  const more = Boolean(device.ready && term && visible.cursor) && visible.kind !== 'failed'
+
   return <FlatList data={hits} keyExtractor={(hit) => hit.event_hash} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-12"
     ListHeaderComponentClassName="gap-4" ListHeaderComponent={<>
     <Stack.Screen options={{ title }} />
@@ -85,9 +88,9 @@ export default function MessageSearch() {
         <Text numberOfLines={5}>{hit.text}</Text>
       </Pressable></Link>
     }}
-    ListFooterComponentClassName="gap-4" ListFooterComponent={<>
-    {term && !hits.length && (visible.kind === 'ready' || !device.ready) ? <EmptyState icon={Search} title={device.ready ? '当前已检索的记录没有匹配消息' : '本地没有匹配消息，联网后可继续检索'} /> : null}
+    ListFooterComponentClassName="gap-4" ListFooterComponent={empty || visible.kind === 'failed' || more ? <>
+    {empty ? <EmptyState icon={Search} title={device.ready ? '当前已检索的记录没有匹配消息' : '本地没有匹配消息，联网后可继续检索'} /> : null}
     {visible.kind === 'failed' ? <View className="gap-2"><ErrorText error={visible.error} /><Button variant="secondary" onPress={() => void read()}><Text>重新检索</Text></Button></View> : null}
-    {device.ready && term && visible.cursor && visible.kind !== 'failed' ? <Button variant="secondary" disabled={visible.kind === 'loading'} onPress={() => void read(visible.cursor ?? undefined)}><Text>{visible.kind === 'loading' ? '正在检索…' : '查找更早的匹配'}</Text></Button> : null}
-    </>} />
+    {more ? <Button variant="secondary" disabled={visible.kind === 'loading'} onPress={() => void read(visible.cursor ?? undefined)}><Text>{visible.kind === 'loading' ? '正在检索…' : '查找更早的匹配'}</Text></Button> : null}
+    </> : undefined} />
 }
