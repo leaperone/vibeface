@@ -5622,6 +5622,15 @@ impl Store {
             else {
                 continue;
             };
+            // Only work and task inputs can steer a raw work turn.
+            if !matches!(
+                route.target,
+                crate::workspace::InputTarget::Work { .. }
+                    | crate::workspace::InputTarget::Task { .. }
+                    | crate::workspace::InputTarget::ChannelTask { .. }
+            ) {
+                continue;
+            }
             let Ok(resolved) = super::workspace::resolve_input_target_from(
                 &self.connection,
                 network,
