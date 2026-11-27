@@ -279,7 +279,7 @@ async fn triage_claims_gate_late_mutators_and_keep_handled_results_read_only() -
         }? else { bail!("admission"); };
         let id = attempt.id().to_owned();
         *lock(&node.triage.active) = Some(id.clone());
-        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"继续吗？"});
+        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"继续吗？","choices":["继续","停下"]});
         let respond = json!({"action":"respond","request_id":held["request_id"],"result":{"behavior":"allow"}});
         for action in [&raise, &respond, &json!({"action":"dismiss","event_id":queued["event_id"]})] {
             assert!(node.triage_command(action.clone()).await.is_err(), "an unscoped caller cannot change a claimed row");

@@ -2,7 +2,7 @@ import { completeHistory } from './history-fixture.ts'
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, answerLabel, attentionLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionInboxDismissible, questionInboxKey, questionMeta, questionParts, settledAnswer, sharedProject, workApproval } from "./questions.ts"
+import { answerBody, answerLabel, approvalNote, attentionLabel, awaitsAnswer, declined, foldAnswers, heldApproval, openQuestions, placeByTime, projectName, questionInboxDismissible, questionInboxKey, questionMeta, questionParts, settledAnswer, settledLabel, sharedProject, workApproval } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -180,6 +180,23 @@ test("a refused request reads as refused, never as agreed", () => {
   assert.equal(answerLabel("拒绝"), "已拒绝")
   assert.equal(answerLabel("拒绝，先别改"), "已拒绝 · 拒绝，先别改")
   assert.equal(answerLabel("允许"), "已回答 · 允许")
+})
+
+test("a held approval reads 忽略 and the person's own words as a refusal and keeps the words only as the reason", () => {
+  const [approval, question, denyOnly] = parseQuestions({ questions: [
+    row("s1", 1, { about: { ...about, request_id: "r" }, target: { kind: "work", work_id: "w1" }, choices: [{ label: "允许本次", action: "allow_once" }, { label: "拒绝", action: "deny" }] }),
+    row("q1", 2),
+    row("s2", 3, { about: { ...about, request_id: "r2" }, choices: [{ label: "拒绝", action: "deny" }] }),
+  ] })
+  assert.ok(heldApproval(approval) && !heldApproval(question) && heldApproval(denyOnly))
+  assert.deepEqual(settledLabel(approval, "允许本次"), { label: "已回答 · 允许本次", mark: "answered" })
+  assert.deepEqual(settledLabel(approval, "拒绝"), { label: "已拒绝", mark: "declined" })
+  assert.deepEqual(settledLabel(approval, "忽略"), { label: "已忽略", mark: "ignored" })
+  assert.deepEqual(settledLabel(approval, "先跑测试"), { label: "已拒绝 · 先跑测试", mark: "declined" })
+  assert.deepEqual(settledLabel(question, "先跑测试"), { label: "已回答 · 先跑测试", mark: "answered" }, "an ordinary question's words are an answer")
+  assert.equal(approvalNote(approval), "只允许这一次；忽略或自己写回答都算拒绝。")
+  assert.equal(approvalNote(denyOnly), null, "an approval that cannot be allowed has no note")
+  assert.equal(approvalNote(question), null)
 })
 
 test('typed attention preserves the required device and distinguishes browser takeover from approval', () => {

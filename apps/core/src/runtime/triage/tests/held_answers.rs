@@ -749,6 +749,68 @@ async fn a_question_holds_the_request_until_it_is_answered() -> Result<()> {
 }
 
 #[tokio::test]
+async fn own_words_on_a_held_approval_decline_it() -> Result<()> {
+    with_node(async |node, admin, _| {
+        with_agent(&node);
+        bot(&node, &admin, "c", "前端", &["t-1"]).await?;
+        let (mut server, handed) = app_server(&node).await?;
+        node.on_codex_request(&handed).await;
+        let (question, _) = raise_for(&node).await?;
+        assert_eq!(
+            answer(&node, &question, "先跑测试，别清理").await?,
+            "answered"
+        );
+        node.pending_provider_launches.store(true, Ordering::SeqCst);
+        node.wake_agent().await?;
+        node.wake_agent().await?;
+        assert_eq!(
+            answered_once(&mut server).await["result"],
+            json!({"decision":"decline"})
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_held_question_keeps_the_choices_its_request_needs() -> Result<()> {
+    with_node(async |node, admin, _| {
+        with_agent(&node);
+        bot(&node, &admin, "c", "Bot", &[]).await?;
+        let event = HookEvent {
+            hold: Some(RequestKind::Question),
+            ..asks_permission("held-question")
+        };
+        let schema = HookRequest {
+            provider: event.agent,
+            session_id: event.session_id.clone(),
+            turn_id: event.turn_id.clone(),
+            kind: RequestKind::Question,
+            questions: Some(json!([{"question":"Which database?","options":[{"label":"SQLite"}]}])),
+        };
+        let held = node.ingest_hook_event(event, Some(schema)).await?;
+        let event = node.triage_command(json!({"action":"events"})).await?["events"][0].clone();
+        let raised = node
+            .triage_command(json!({"action":"raise","event_id":event["event_id"],
+            "request_id":held["request_id"],"severity":"attention","question":"Which database?",
+            "choices":["SQLite"]}))
+            .await?;
+        assert_eq!(
+            raised["asked"],
+            json!(true),
+            "a held question is not held to the two-or-three rule of a plain one"
+        );
+        let asked = unanswered(&node).await?;
+        assert_eq!(
+            (asked.len(), asked[0]["choices"][0]["label"].clone()),
+            (1, json!("SQLite"))
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn explicit_approval_answers_bypass_exhausted_triage_budget_once() -> Result<()> {
     with_node(async |node, admin, _| {
         with_agent(&node);
@@ -974,11 +1036,6 @@ async fn a_live_workspace_task_gets_its_one_approval_without_a_slot_or_another_t
         assert_eq!(
             card["choices"][0],
             json!({"label":"允许本次","action":"allow_once"})
-        );
-        assert!(
-            signed_answer_fact(&node, &admin, &question, "继续")
-                .await
-                .is_err()
         );
         assert!(
             node.post_answer(
@@ -1746,6 +1803,31 @@ fn answer_results_use_the_original_question_schema_and_text() -> Result<()> {
     );
     hook.session_id = "other-session".into();
     assert!(hook_answer_response(&event, Some(&hook)).is_err());
+    Ok(())
+}
+
+#[test]
+fn only_an_approvals_own_action_approves_and_anything_else_declines() -> Result<()> {
+    let response = AnswerResponse::Approval {
+        allow_once: Some(json!({"decision":"accept"})),
+        deny: json!({"decision":"decline"}),
+    };
+    let question = json!({"choices":[{"label":"允许本次","action":"allow_once"},{"label":"拒绝","action":"deny"}]});
+    let result =
+        |text: &str| crate::store::triage::approval_answer_result(&question, text, &response);
+    assert_eq!(result("允许本次")?, Some(json!({"decision":"accept"})));
+    for text in ["拒绝", "忽略", "先跑测试再清理", "允许"] {
+        assert_eq!(
+            result(text)?,
+            Some(json!({"decision":"decline"})),
+            "{text} declines the request"
+        );
+    }
+    let untrusted = json!({"choices":[{"label":"允许"}]});
+    assert!(
+        crate::store::triage::approval_answer_result(&untrusted, "允许", &response).is_err(),
+        "a choice without the Node's action never approves"
+    );
     Ok(())
 }
 

@@ -681,7 +681,7 @@ enum TriageAction {
         /// Kind of decision requested from the user.
         #[arg(long, value_enum)]
         attention_kind: Option<AttentionKind>,
-        /// Available answer. Repeat for multiple answers.
+        /// Answer choice. A plain question without --request-id takes two or three distinct choices; held approvals use the Node's own actions.
         #[arg(long = "choice")]
         choices: Vec<String>,
     },

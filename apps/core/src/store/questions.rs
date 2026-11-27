@@ -551,17 +551,16 @@ impl Store {
         if let Some(reason) = closed {
             bail!("this question was closed ({reason}); nothing can act on an answer now");
         }
+        // Only an approval's own action approves; 忽略 and the user's own words decline it.
         if held && question_body["attention"]["kind"] == "approval" {
-            let choices: Vec<_> = question_body["choices"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|choice| choice["label"].as_str() == Some(text))
-                .collect();
             ensure!(
-                choices.len() == 1
-                    && matches!(choices[0]["action"].as_str(), Some("allow_once" | "deny")),
-                "choose one of this approval's actions; free text cannot approve a request"
+                question_body["choices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|choice| choice["label"].as_str() == Some(text))
+                    .all(|choice| matches!(choice["action"].as_str(), Some("allow_once" | "deny"))),
+                "this choice has no trusted approval action"
             );
         }
         if let Some((request, _)) = control {

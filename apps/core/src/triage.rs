@@ -364,9 +364,10 @@ It asks in the chat of the event's bot. Write TEXT in the user's language and pl
 for the concrete decision. Then explain the known situation, the consequences of the alternatives and why the user must \
 decide. Keep TEXT within 1024 UTF-8 bytes. Say when something is unknown; never invent facts or use a shell command, \
 code or raw output as the question. Offer only real alternatives, each --choice a complete action and its relevant \
-consequence within 120 characters. Never put a destructive action first. Use zero to eight choices; \
-eight is only the protocol limit, not a target. Do not pad the list with later, other or keep researching, and do not imply \
-a recommendation by putting the likely answer first. Ordinary questions accept text. Held approvals use only the Node's trusted actions. While a question about the \
+consequence within 120 characters. Never put a destructive action first. A plain question (no --request-id) takes two or three distinct \
+choices; the Node refuses any other count. Every card already adds 忽略 and a line for the user's own answer, so do not pad the list with ignore, later, other or keep \
+researching, and do not imply a recommendation by putting the likely answer first. Other held requests keep the choices their own question needs. Held approvals ignore --choice and use only the Node's \
+trusted actions; there 忽略 or the user's own words decline the request. While a question about the \
 same session and same request is unanswered, a raise returns it. \
 Ordinary answers return in the question's original scope. A held request's answer controls only that original live request through a private coordination claim. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\

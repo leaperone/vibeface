@@ -219,6 +219,12 @@ fn answer_input_from(
     Ok((question, message))
 }
 
+/// The answer that sets a question aside. On a held approval it declines the request.
+pub(crate) const IGNORED_ANSWER: &str = "忽略";
+
+/// What a held approval's answer sends to its request. Only the choice carrying the Node's
+/// one-time action approves; 忽略 or the user's own words decline it, and those words stay
+/// only in the recorded answer as the reason.
 pub(crate) fn approval_answer_result(
     question: &Value,
     text: &str,
@@ -233,13 +239,13 @@ pub(crate) fn approval_answer_result(
         .flatten()
         .filter(|choice| choice["label"].as_str() == Some(text))
         .collect();
-    ensure!(choices.len() == 1, "choose one of this approval's actions");
-    let result = match choices[0]["action"].as_str() {
-        Some("allow_once") => allow_once
+    ensure!(choices.len() <= 1, "this approval repeats a choice");
+    let result = match choices.first().map(|choice| choice["action"].as_str()) {
+        Some(Some("allow_once")) => allow_once
             .as_ref()
             .context("this request does not allow a one-time approval")?,
-        Some("deny") => deny,
-        _ => anyhow::bail!("this choice has no trusted approval action"),
+        Some(Some("deny")) | None => deny,
+        Some(_) => anyhow::bail!("this choice has no trusted approval action"),
     };
     Ok(Some(result.clone()))
 }

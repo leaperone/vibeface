@@ -4,7 +4,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { answerText, approvalNote, attentionLabel, approvalTask, ignoredAnswer, questionMeta, questionParts, settledAnswer, settledLabel, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import type { AnswerResult } from '@vibeface/client/workspace/types.ts'
 import { ArrowUp, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, RotateCw, TriangleAlert, X, type LucideIcon } from 'lucide-react-native'
 import { useRef, useState } from 'react'
@@ -47,10 +47,9 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const taskScope = inputTarget?.kind === 'task' || inputTarget?.kind === 'channel_task' ? inputTarget.task_id : null
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
-  const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
-  const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
-  // The Node takes only an approval's own actions for a live request; 拒绝 clears it there.
-  const ignorable = !approvalChoices.length && !(question.attention?.kind === 'approval' && question.about.request_id)
+  const displayAnswer = (value: string) => answerText(question, value)
+  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it and stay as the reason.
+  const note = approvalNote(question)
   const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
   const elsewhere = settled?.elsewhere || raced
   const warned = settled?.beaten || raced
@@ -59,7 +58,10 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
-  if (settled) return <Settled icon={warned ? CircleAlert : settled.text.trim() === ignoredAnswer ? CircleSlash : declined(displayAnswer(settled.text)) ? CircleX : CircleCheck} className={warned ? 'text-warning' : settled.text.trim() === ignoredAnswer ? undefined : declined(displayAnswer(settled.text)) ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : answerLabel(displayAnswer(settled.text))}</Settled>
+  if (settled) {
+    const { label, mark } = settledLabel(question, settled.text)
+    return <Settled icon={warned ? CircleAlert : mark === 'ignored' ? CircleSlash : mark === 'declined' ? CircleX : CircleCheck} className={warned ? 'text-warning' : mark === 'ignored' ? undefined : mark === 'declined' ? 'text-danger' : 'text-success'} ask={ask} detail={detail} about={about}>{elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : label}</Settled>
+  }
   if (question.closed) return <Settled icon={CircleSlash} ask={ask} detail={detail} about={about}>已失效</Settled>
 
   const pending = shared?.pendingAnswers.find((item) => item.question_id === id)
@@ -85,7 +87,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const { icon, tone } = looks[question.severity]
   return <ActionCard kind="approval" icon={approval ? Hand : icon} tone={tone} title={ask}>
     <Text className="text-sm text-muted">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
-    {approvalChoices.length ? <Text className="text-sm text-muted">允许仅对这次请求有效；拒绝会结束该请求。</Text> : null}
+    {note ? <Text className="text-sm text-muted">{note}</Text> : null}
     {question.attention?.kind === 'browser_takeover' ? <Text className="text-sm text-muted">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-base">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
@@ -107,24 +109,23 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
         <Icon as={busy === 'retry' ? LoaderCircle : RotateCw} /><Text>再试</Text>
       </Button>
     </View> : <View className="gap-2">
-      {approvalChoices.length ? <View className="flex-row flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} variant={choice.action === 'allow_once' ? 'primary' : 'secondary'} accessibilityLabel={choice.action === 'allow_once' ? '允许本次' : '拒绝'} disabled={disabled} accessibilityState={{ disabled, busy: busy === `permission:${choice.action}` }} onPress={() => void send(`permission:${choice.action}`, choice.label)}><Icon as={busy === `permission:${choice.action}` ? LoaderCircle : choice.action === 'allow_once' ? CircleCheck : CircleX} /><Text>{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Text></Button>)}</View> : <>
-        {question.choices.map((choice, index) => <Button variant="ghost" key={index} accessibilityRole="button" accessibilityLabel={choice.label} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
-          className={cn(row, 'active:bg-surface-muted', disabled && 'opacity-50')}>
-          {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className="w-4 text-center text-muted">{index + 1}</Text>}
-          <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
-        </Button>)}
-        <View className="flex-row items-end gap-2">
-          <Textarea maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'}
-            className="max-h-40 min-h-11 flex-1 text-base" value={text} maxLength={4000} editable={!disabled}
-            multiline textAlignVertical="top" submitBehavior="newline" onChangeText={(value) => { setText(value); setError('') }} />
-          <Button iconOnly accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
-            <Icon as={busy === 'answer' ? LoaderCircle : ArrowUp} />
-          </Button>
-        </View>
-      </>}
-      {ignorable ? <Button variant="ghost" className="self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
+      {question.choices.map((choice, index) => <Button variant="ghost" key={index} accessibilityRole="button" accessibilityLabel={displayAnswer(choice.label)} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
+        className={cn(row, 'active:bg-surface-muted', disabled && 'opacity-50')}>
+        {/* The one choice that approves a held request reads as the primary action. */}
+        {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className={cn('w-4 text-center', choice.action === 'allow_once' ? 'text-accent' : 'text-muted')}>{index + 1}</Text>}
+        <Text className={cn('min-w-0 flex-1 font-medium', choice.action === 'allow_once' && 'text-accent')}>{displayAnswer(choice.label)}</Text>
+      </Button>)}
+      <View className="flex-row items-end gap-2">
+        <Textarea maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'}
+          className="max-h-40 min-h-11 flex-1 text-base" value={text} maxLength={4000} editable={!disabled}
+          multiline textAlignVertical="top" submitBehavior="newline" onChangeText={(value) => { setText(value); setError('') }} />
+        <Button iconOnly accessibilityLabel="发送回答" disabled={disabled || !text.trim()} accessibilityState={{ disabled: disabled || !text.trim(), busy: busy === 'answer' }} onPress={() => void send('answer', text)}>
+          <Icon as={busy === 'answer' ? LoaderCircle : ArrowUp} />
+        </Button>
+      </View>
+      <Button variant="ghost" className="self-start" accessibilityLabel="忽略" disabled={disabled} accessibilityState={{ disabled, busy: busy === 'ignore' }} onPress={() => void send('ignore', ignoredAnswer)}>
         <Icon as={busy === 'ignore' ? LoaderCircle : X} className="text-muted" /><Text className="text-muted">忽略</Text>
-      </Button> : null}
+      </Button>
     </View>}
     <ErrorText error={error} />
   </ActionCard>
