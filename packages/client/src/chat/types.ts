@@ -10,6 +10,8 @@ export type TranscriptMessage = {
   role: string
   text: string
   event_hash: string
+  /** The verified event author; absent on an input that is only held locally. */
+  author?: string
   created_at_ms: number
   in_reply_to?: string
   status?: ReplyStatus

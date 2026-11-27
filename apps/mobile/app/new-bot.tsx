@@ -17,6 +17,7 @@ import { Text } from '@/components/arc/text'
 import { Textarea } from '@/components/arc/textarea'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
+import { cooperationExamples } from '@vibeface/client/chat/first-cooperation.ts'
 
 /** A new bot, as the web form: a name, what it does and a folder it works in; an unconfirmed one is retried unchanged. */
 export default function NewBot() {
@@ -56,6 +57,8 @@ export default function NewBot() {
     <View className="gap-2">
       <Text className="text-sm font-medium text-muted">它负责什么 <Text className="text-sm text-muted/70">可选</Text></Text>
       <Textarea accessibilityLabel="它负责什么" placeholder="例如：帮我维护项目，回答问题并检查修改。" className="min-h-28" maxLength={8192} value={instructions} editable={!locked} onChangeText={setInstructions} />
+      <View className="flex-row flex-wrap gap-2">{cooperationExamples.map(example => <Button key={example.label} variant="secondary" size="sm" disabled={locked} onPress={() => setInstructions(current => `${current.trim()}${current.trim() ? '\n\n' : ''}${example.text}`)}><Text>{example.label}</Text></Button>)}</View>
+      <Text className="text-sm text-muted">这些是可编辑的职责与合作约定，不改变设备或目录权限。</Text>
     </View>
     <View className="gap-2">
       <Text className="text-sm font-medium text-muted">{folderLabels.project} <Text className="text-sm text-muted/70">可选</Text></Text>

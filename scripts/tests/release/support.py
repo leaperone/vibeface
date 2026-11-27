@@ -61,7 +61,7 @@ class Fixture:
                                                   cwd=SOURCE.parent, env=environment(self.root))
                 (self.scripts / name).write_bytes(content)
         else:
-            for name in ('release', *MODULES):
+            for name in ('release', *MODULES, 'ios_device'):
                 shutil.copy2(SOURCE / (name + '.py'), self.scripts / (name + '.py'))
             shutil.copytree(SOURCE / 'tests', self.scripts / 'tests',
                             ignore=shutil.ignore_patterns('__pycache__'))

@@ -1,5 +1,5 @@
 import { Bot, CirclePause, CircleX, Clock, RotateCcw } from 'lucide-react-native'
-import { memo, type ReactNode } from 'react'
+import { memo, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
@@ -14,6 +14,7 @@ import { easeOut, settle } from '@/lib/motion'
 import { Markdown } from './markdown'
 import { MessageAttachments, type ReadAttachment } from './attachments'
 import { useMessageActions, type MessageActionsProps } from './message-actions'
+import { MemoryPreference } from './memory-preference'
 
 const Rise = withUniwind(Animated.View)
 // As on the web: a new message rises 5px into place once.
@@ -40,15 +41,16 @@ function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
  * `retry`: 重试 after this reply failed or was stopped. Memoised, and the chat passes callbacks that keep their identity:
  * while a reply streams, a row re-renders only when its own message object, time or retry changes.
  */
-export const Message = memo(function Message({ message, bot, time: shown, offline, retry, attachmentScope, readAttachment, onCopy, onShare, onQuote }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown>; attachmentScope?: string; readAttachment?: ReadAttachment } & MessageActionsProps) {
+export const Message = memo(function Message({ message, bot, time: shown, offline, retry, attachmentScope, readAttachment, onCopy, onShare, onQuote, remember = false, conversationId }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown>; attachmentScope?: string; readAttachment?: ReadAttachment; remember?: boolean; conversationId?: string } & MessageActionsProps) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
   const cause = failed ? replyFailure(message.failure, message.detail) : failureText(message.failure)
   const entering = message.created_at_ms > Date.now() - 2000 ? rise : undefined
-  const { choose, feedback } = useMessageActions({ message, onCopy, onShare, onQuote })
+  const [preferenceOpen, setPreferenceOpen] = useState(false)
+  const { choose, feedback } = useMessageActions({ message, onCopy, onShare, onQuote, onRemember: remember && user ? () => setPreferenceOpen(true) : undefined })
   const time = shown ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
-  const attachments = message.attachments?.length ? <MessageAttachments files={message.attachments} scope={attachmentScope} read={readAttachment} /> : null
+  const attachments = message.attachments?.length ? <MessageAttachments files={message.attachments} scope={attachmentScope} read={readAttachment} conversationId={conversationId} /> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
     <MessageActionsButton choose={message.text ? choose : null} />
     <MessageBubble>
@@ -57,6 +59,7 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
     </MessageBubble>
     {feedback}
     {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted" /> : time}
+    {preferenceOpen ? <MemoryPreference key={message.event_hash} message={message} botId={bot.bot_id} onClose={() => setPreferenceOpen(false)} /> : null}
   </Rise>
   if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">
     <MessageActionsButton choose={choose} />

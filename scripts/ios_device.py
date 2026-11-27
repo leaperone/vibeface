@@ -1,7 +1,51 @@
 """Verify the program inside an iPhoneOS App, including each Mach-O slice."""
 import re
 import subprocess
+import plistlib
 from pathlib import Path
+
+
+SHARE_BUNDLE_ID = 'one.leaper.vibeface.share'
+SHARE_TARGET = 'expo-sharing-extension'
+APP_GROUP = 'group.one.leaper.vibeface'
+
+
+def verify_bundle_info(info, bundle_id, version, build_number, share=False):
+    expected = (bundle_id, version, str(build_number))
+    if (info.get('CFBundleIdentifier'), info.get('CFBundleShortVersionString'), str(info.get('CFBundleVersion'))) != expected:
+        raise ValueError('iOS bundle identity or version differs from committed app metadata')
+    if info.get('CFBundleSupportedPlatforms') != ['iPhoneOS']:
+        raise ValueError('iOS bundle is not marked for iPhoneOS')
+    group_key = 'AppGroupId' if share else 'ExpoShareIntoAppGroupId'
+    if info.get(group_key) != APP_GROUP:
+        raise ValueError('iOS bundle does not use the expected sharing App Group')
+    if share and (info.get('CFBundleDisplayName') != 'Vibeface'
+                  or info.get('CFBundlePackageType') != 'XPC!'
+                  or info.get('NSExtension', {}).get('NSExtensionPointIdentifier') != 'com.apple.share-services'):
+        raise ValueError('iOS sharing extension has an invalid display name or extension point')
+
+
+def share_receipt(info):
+    return {
+        'bundle_identifier': info['CFBundleIdentifier'],
+        'bundle_short_version': info['CFBundleShortVersionString'],
+        'build_number': str(info['CFBundleVersion']),
+        'display_name': info['CFBundleDisplayName'],
+        'app_group_identifier': info['AppGroupId'],
+        'extension_point_identifier': info['NSExtension']['NSExtensionPointIdentifier'],
+    }
+
+
+def verify_share_extension(app, version, build_number):
+    extensions = list((app / 'PlugIns').glob('*.appex'))
+    if len(extensions) != 1 or extensions[0].name != SHARE_TARGET + '.appex' or extensions[0].is_symlink():
+        raise ValueError('iOS app must embed exactly its expected sharing extension')
+    extension = extensions[0]
+    with (extension / 'Info.plist').open('rb') as source:
+        info = plistlib.load(source)
+    verify_bundle_info(info, SHARE_BUNDLE_ID, version, build_number, share=True)
+    executable = verify_device_executable(extension, info)
+    return extension, info, executable
 
 
 def require_device_commands(architectures, load_commands):
@@ -37,6 +81,18 @@ def self_test():
         except ValueError:
             continue
         raise AssertionError('accepted an executable that does not target iPhoneOS')
+    info = dict(CFBundleIdentifier=SHARE_BUNDLE_ID, CFBundleShortVersionString='0.0.1', CFBundleVersion='17',
+                CFBundleSupportedPlatforms=['iPhoneOS'], AppGroupId=APP_GROUP, CFBundleDisplayName='Vibeface',
+                CFBundlePackageType='XPC!', NSExtension={'NSExtensionPointIdentifier': 'com.apple.share-services'})
+    verify_bundle_info(info, SHARE_BUNDLE_ID, '0.0.1', '17', share=True)
+    for change in ({'CFBundleIdentifier': 'wrong.share'}, {'CFBundleVersion': '18'},
+                   {'CFBundleSupportedPlatforms': ['iPhoneSimulator']}, {'AppGroupId': 'group.wrong'},
+                   {'CFBundleDisplayName': SHARE_TARGET}, {'NSExtension': {}}, {'CFBundlePackageType': 'APPL'}):
+        try:
+            verify_bundle_info(info | change, SHARE_BUNDLE_ID, '0.0.1', '17', share=True)
+        except ValueError:
+            continue
+        raise AssertionError('accepted invalid iOS sharing extension metadata')
     print('iOS executable platform checks passed')
 
 

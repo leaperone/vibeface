@@ -11,6 +11,7 @@ import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Bot,CalendarClock,ChevronDown,ChevronUp,CirclePause,CircleQuestionMark,CircleX,Clock,LoaderCircle,Merge,RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { Artifact } from './artifact'
+import { MemoryPreference } from './memory-preference'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
@@ -50,7 +51,7 @@ export function FoldedText({ text }: { text: string }) {
  * the schedule whose run produced this reply. `retry` is 重试 after this reply failed or was stopped.
  */
 /** `detail`: the device's own words for a failed reply, read for its cause. */
-export function Message({ message, conversationId, schedule, time: shown, retry, detail }: { message: ChatMessage; conversationId?: string; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
+export function Message({ message, conversationId, schedule, time: shown, retry, detail, remember = false }: { message: ChatMessage; conversationId?: string; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string; remember?: boolean }) {
   const { connectionOnline, selectedBot } = useWorkspace()
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
@@ -66,6 +67,7 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
     {message.attachments?.map((file) => <div key={`${conversationId ?? ''}:${file.hash}`} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} conversationId={conversationId} /></div>)}
     {/* Always mounted so a delivery state that appears later is announced. */}
     <span aria-live="polite" className="flex items-center gap-1 px-1">{mark}{time}</span>
+    {remember && conversationId ? <MemoryPreference key={messageKey(message)} message={message} conversationId={conversationId} /> : null}
   </div>
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-sm text-secondary">

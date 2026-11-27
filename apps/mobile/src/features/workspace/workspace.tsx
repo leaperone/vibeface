@@ -26,6 +26,7 @@ import type { ChatMessage } from '@/data/types'
 import { Composer } from '@/features/chat/composer'
 import { MessageAttachments } from '@/features/chat/attachments'
 import { MessageActions } from '@/features/chat/message-actions'
+import { ResultFeedback } from '@/features/chat/result-feedback'
 import { SendPreparation, type SendPreparationState } from '@/features/chat/send-preparation'
 import { useChatDraft } from '@/features/chat/use-chat-draft'
 import { chatDrafts } from '@/platform/native-chat-drafts'
@@ -424,7 +425,7 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
     const content = [message.text, ...(message.attachments ?? []).map(file => `附件：${file.name}`)].filter(Boolean).join('\n')
     draft.changeText(`${draft.text}${draft.text ? '\n\n' : ''}${content.split('\n').map(line => `> ${line}`).join('\n')}\n\n`)
   }
-  const attachments = (files: NonNullable<ChatMessage['attachments']>, id: string) => <MessageAttachments files={files} scope={JSON.stringify([draftScope.networkId, draftScope.deviceId, id])} read={(file, offset) => shared.readArtifactBytes(file.hash, offset, id)} />
+  const attachments = (files: NonNullable<ChatMessage['attachments']>, id: string) => <MessageAttachments files={files} scope={JSON.stringify([draftScope.networkId, draftScope.deviceId, id])} read={(file, offset) => shared.readArtifactBytes(file.hash, offset, id)} conversationId={id} />
   const send = async () => {
     const activity = workspaceSendActivity.acquire(draftKey)
     if (!activity) return
@@ -488,10 +489,16 @@ function ScopedWorkspaceContent({ taskId, channelId }: { taskId?: string; channe
         if (body.type === 'input_posted' || body.type === 'message_posted') {
           const message: ChatMessage = { message_id: body.message_id, event_hash: event.event_hash, created_at_ms: event.created_at_ms, role: body.type === 'input_posted' ? 'user' : body.role, text: body.text, attachments: body.attachments }
           content = <View className={cn('gap-2', body.type === 'input_posted' ? 'max-w-[90%] self-end rounded-panel bg-surface-muted px-4 py-3' : 'w-full')}><Text className="text-sm text-muted">{speaker}</Text>{body.text ? body.type === 'input_posted' ? <Text selectable>{body.text}</Text> : <Markdown text={body.text} /> : null}{body.attachments?.length ? attachments(body.attachments, event.scope_id) : null}<MessageActions message={message} onQuote={quote} />{body.type === 'input_posted' && body.target.kind === 'channel_task' ? <Button variant="ghost" className="self-start" onPress={() => { if (body.target.kind === 'channel_task') { selectionRevision.current++; setSelected(`task:${body.target.task_id}`); setRecipient(body.target.bot_id); setSavedInput(null); storage.writeStorage(selectionKey, { bot_id: body.target.bot_id, task_id: body.target.task_id }); const revision = selectionRevision.current; void shared.readWorkspaceState({ task_id: body.target.task_id }).catch(cause => { if (shared.isCurrent() && routeActive.current && revision === selectionRevision.current) setError(messageOf(cause)) }) } }}><Icon as={Reply} /><Text>回复这个任务</Text></Button> : null}</View>
-        } else if (body.type === 'work_finished') content = <Card className="gap-2"><Text className="text-sm font-medium">工作结果 · {body.outcome === 'completed' ? '已完成' : body.outcome === 'interrupted' ? '已停止' : '需要留意'}</Text><Markdown text={body.result_text || body.failure_reason || '没有结果文本'} /></Card>
+        } else if (body.type === 'work_finished') content = <Card className="gap-2"><Text className="text-sm font-medium">工作结果 · {body.outcome === 'completed' ? '已完成' : body.outcome === 'interrupted' ? '已停止' : '需要留意'}</Text><Markdown text={body.result_text || body.failure_reason || '没有结果文本'} />{body.result_text ? <ResultFeedback source={{ kind: 'work_result', scope_id: event.scope_id, work_id: body.work_id, event_hash: event.event_hash }} conversationId={event.scope_id} /> : null}</Card>
         else if (body.type === 'workspace_commanded') {
           const command = body.command
-          if (command.kind === 'assignment_progress' && command.result) content = <Card className="gap-2"><Text className="text-sm text-muted">第 {command.revision} 版提交的结果，执行状态以任务记录为准</Text><Markdown text={command.result} /></Card>
+          if (command.kind === 'assignment_progress' && command.result) {
+            const assignment = shared.workspaceState?.assignments.find(item => item.assignment_id === command.assignment_id)
+            const submitted = assignment?.submitted_result?.event_hash === event.event_hash ? assignment.submitted_result : null
+            const resultTaskId = assignment?.task_id ?? taskId
+            const resultBot = shared.bots.find(item => item.bot_id === (assignment?.bot_id ?? task?.owner_bot))
+            content = <Card className="gap-2"><Text className="text-sm text-muted">第 {submitted?.revision ?? command.revision} 版提交的结果，执行状态以任务记录为准</Text><Markdown text={submitted?.text ?? command.result} />{resultTaskId && resultBot ? <ResultFeedback source={{ kind: 'task_result', scope_id: event.scope_id, task_id: resultTaskId, revision: submitted?.revision ?? command.revision, event_hash: submitted?.event_hash ?? event.event_hash }} conversationId={resultBot.conversation_id} /> : null}</Card>
+          }
           if (command.kind === 'post_channel_message') {
             const message: ChatMessage = { message_id: command.message_id, event_hash: event.event_hash, created_at_ms: event.created_at_ms, role: actor.kind === 'human' ? 'user' : 'bot', text: command.text, attachments: command.attachments }
             content = <Card className="gap-2"><Text className="text-sm text-muted">{speaker} · 频道记录</Text>{command.text ? <Markdown text={command.text} /> : null}{command.attachments.length ? attachments(command.attachments, event.scope_id) : null}<MessageActions message={message} onQuote={quote} /></Card>

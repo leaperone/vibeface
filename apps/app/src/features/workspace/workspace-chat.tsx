@@ -2,6 +2,7 @@ import { PromptInput } from '@/components/arc/conversation-composer'
 import { Chat,type ChatEntry } from '@/components/arc/conversation-thread'
 import { Details,EmptyState,InlineError,StatusPill,useAction } from '@/components/arc/product-kit'
 import { RoutedAction } from "@/components/arc/routed-action"
+import { ResultFeedback } from '@/features/chat/elements/result-feedback'
 import '@/features/chat/chat.css'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
@@ -209,10 +210,16 @@ function ScopedConversation({ target, conversationId, label, task, channelId, ex
     if (body.type === 'input_posted' || body.type === 'message_posted') {
       entries.push({ key: event.event_hash, conversationId: event.scope_id, anchor: body.type === 'input_posted', message: { message_id: body.message_id, event_hash: event.event_hash, role: body.type === 'input_posted' ? 'user' : channelId && actor.kind === 'bot' ? 'bot' : body.role, text: body.text, created_at_ms: event.created_at_ms, attachments: body.attachments, ...(body.type === 'message_posted' ? { in_reply_to: body.in_reply_to, status: body.status, ...(channelId && actor.kind === 'bot' ? { sender: { conversation_id: workspace.bots.find((bot) => bot.bot_id === actor.bot_id)?.conversation_id ?? '', name: speaker } } : {}) } : {}) } })
       if (body.type === 'input_posted' && body.target.kind === 'channel_task' && onReply) { const reply = body.target; entries.push({ key: `reply:${event.event_hash}`, node: <Button type="button" variant="ghost" size="sm" onClick={() => onReply(reply.task_id, reply.bot_id)}><Reply aria-hidden="true" />回复这个任务</Button> }) }
-    } else if (body.type === 'work_finished') entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="text-sm font-medium">工作结果 · {body.outcome === 'completed' ? '已完成' : body.outcome === 'interrupted' ? '已停止' : '需要留意'}</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{body.result_text || body.failure_reason || '没有结果文本'}</p></div> })
+    } else if (body.type === 'work_finished') entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="text-sm font-medium">工作结果 · {body.outcome === 'completed' ? '已完成' : body.outcome === 'interrupted' ? '已停止' : '需要留意'}</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{body.result_text || body.failure_reason || '没有结果文本'}</p>{body.result_text ? <ResultFeedback source={{ kind: 'work_result', scope_id: event.scope_id, work_id: body.work_id, event_hash: event.event_hash }} conversationId={event.scope_id} /> : null}</div> })
     else if (body.type === 'workspace_commanded') {
       const command = body.command
-      if (command.kind === 'assignment_progress' && command.result) entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="text-sm text-secondary">第 {command.revision} 版提交的结果，执行状态以任务记录为准</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{command.result}</p></div> })
+      if (command.kind === 'assignment_progress' && command.result) {
+        const assignment = workspace.workspaceState?.assignments.find(item => item.assignment_id === command.assignment_id)
+        const submitted = assignment?.submitted_result?.event_hash === event.event_hash ? assignment.submitted_result : null
+        const resultTaskId = assignment?.task_id ?? scopeTaskId
+        const resultBot = workspace.bots.find(item => item.bot_id === (assignment?.bot_id ?? task?.owner_bot))
+        entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="text-sm text-secondary">第 {submitted?.revision ?? command.revision} 版提交的结果，执行状态以任务记录为准</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{submitted?.text ?? command.result}</p>{resultTaskId && resultBot ? <ResultFeedback source={{ kind: 'task_result', scope_id: event.scope_id, task_id: resultTaskId, revision: submitted?.revision ?? command.revision, event_hash: submitted?.event_hash ?? event.event_hash }} conversationId={resultBot.conversation_id} /> : null}</div> })
+      }
       else if (command.kind === 'post_channel_message') entries.push({ key: event.event_hash, node: <div className="grid gap-2 rounded-panel border bg-surface p-4"><p className="text-sm text-secondary">{speaker} · 频道记录</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{command.text}</p>{command.attachments.length ? <p className="text-sm text-secondary">{command.attachments.length} 个附件</p> : null}</div> })
       else if (command.kind === 'create_task') { const item = workspace.workspaceState?.tasks.find((task) => task.task_id === command.task_id); if (item) entries.push({ key: event.event_hash, node: <WorkspaceTaskLink task={item} /> }) }
       else if (command.kind === 'revise_task') entries.push({ key: event.event_hash, node: <p className="text-sm text-secondary">任务交代已更新为第 {command.expected_revision + 1} 版。</p> })

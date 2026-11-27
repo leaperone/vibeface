@@ -1343,6 +1343,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const body = { ...prepared.body, ...(attachments.length ? { attachments } : {}) }
       const attestation = await attest(id, writeBody({ method: "message", params: body }, clientId))
       if (renderedConnection.current !== connection || !alive.current) throw new Error('工作区已切换，输入仍留在编辑器。')
+      options?.onPrepared?.({ message_id: body.message_id, conversation_id: id, target: body.target })
       const queued = await enqueue(outbox, { key: prefix + writeKeySuffix({ method: 'message', params: body }), method: 'message', scope_id: id, params: { ...body, attestation }, created_at_ms: prepared.pending.created_at_ms, uploads, delivery: 'saved', ...(prerequisite ? { prerequisite } : {}) })
       if (localTask) localTask.saved = true
       await outboxChanged().catch((caught) => showError(caught, '读取已保存的输入'))

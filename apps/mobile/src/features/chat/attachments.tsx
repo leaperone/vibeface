@@ -9,12 +9,13 @@ import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { attachmentSize, validAttachment, type ReadAttachment } from '@/platform/chat-attachments'
 import { localAttachment, shareAttachment, type LocalAttachment } from '@/platform/native-chat-attachments'
+import { ResultFeedback } from './result-feedback'
 
 export type { ReadAttachment } from '@/platform/chat-attachments'
-export function MessageAttachments({ files, scope, read }: { files: Attachment[]; scope?: string; read?: ReadAttachment }) {
-  return <View className="gap-2">{files.map((file, index) => <MessageAttachment key={JSON.stringify([scope, file.hash, file.size, file.name, index])} file={file} scope={scope} read={read} />)}</View>
+export function MessageAttachments({ files, scope, read, conversationId }: { files: Attachment[]; scope?: string; read?: ReadAttachment; conversationId?: string }) {
+  return <View className="gap-2">{files.map((file, index) => <MessageAttachment key={JSON.stringify([scope, file.hash, file.size, file.name, index])} file={file} scope={scope} read={read} conversationId={conversationId} />)}</View>
 }
-function MessageAttachment({ file, scope, read }: { file: Attachment; scope?: string; read?: ReadAttachment }) {
+function MessageAttachment({ file, scope, read, conversationId }: { file: Attachment; scope?: string; read?: ReadAttachment; conversationId?: string }) {
   const [local, setLocal] = useState<LocalAttachment | null>(null)
   const [state, setState] = useState<{ kind: 'idle' } | { kind: 'loading'; received: number } | { kind: 'failed'; message: string }>({ kind: 'idle' })
   const [preview, setPreview] = useState(false)
@@ -62,6 +63,7 @@ function MessageAttachment({ file, scope, read }: { file: Attachment; scope?: st
       <Button iconOnly variant="ghost" disabled={loading || !validAttachment(file)} accessibilityLabel={`保存或分享 ${file.name}`} onPress={choose}><Icon as={MoreHorizontal} /></Button>
     </View>
     {state.kind === 'failed' ? <View accessibilityLiveRegion="polite" className="gap-1"><Text className="text-sm text-danger">{state.message}</Text><Button variant="ghost" size="sm" onPress={() => void perform('open')}><Icon as={Paperclip} /><Text>重新打开</Text></Button></View> : null}
+    {local && conversationId ? <ResultFeedback source={{ kind: 'attachment', scope_id: conversationId, ...file }} conversationId={conversationId} /> : null}
     <Modal visible={preview} animationType="none" onRequestClose={() => setPreview(false)} presentationStyle="fullScreen">
       <SafeAreaView className="flex-1 bg-background"><View className="flex-row items-center justify-between gap-2 px-4"><Text numberOfLines={1} className="shrink">{file.name}</Text><Button variant="ghost" iconOnly accessibilityLabel="关闭图片" onPress={() => setPreview(false)}><Icon as={X} /></Button></View>
         {local ? <Image source={{ uri: local.uri }} resizeMode="contain" accessibilityLabel={file.name} accessibilityIgnoresInvertColors className="flex-1" onError={() => { setPreview(false); setState({ kind: 'failed', message: '图片无法预览，仍可保存或分享附件。' }) }} /> : null}

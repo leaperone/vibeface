@@ -2,11 +2,19 @@ import { writeBody } from './write-request.ts'
 import { array, boolean, record, text } from '../lib/node.ts'
 import { enqueue, type OutboxItem, type OutboxStore } from '../lib/outbox.ts'
 import type { MemoryBase, MemoryControlResult, MemoryEntry, MemoryMetadata, MemoryState, MemoryStateResult, MemorySyncConflicts } from './types.ts'
+import type { TranscriptMessage } from '../chat/types.ts'
 
 export const DATA_EPOCH = 1
 export type MemoryControls = {
   conversationId: string; writable: boolean
   controlMemory(conversationId: string, memoryId: string, base: MemoryBase, after: string | null): Promise<MemoryControlResult>
+}
+
+export function canRememberMessage(message: TranscriptMessage & { state?: string }, deviceId: string | undefined, botId: string) {
+  return Boolean(deviceId && message.author === deviceId && message.role === 'user' && !message.state
+    && /^[a-f0-9]{64}$/.test(message.event_hash) && message.text.trim() && !message.text.trimStart().startsWith('>')
+    && !message.attachments?.length && !message.answers
+    && (message.target === undefined || message.target.kind === 'bot_main' && message.target.bot_id === botId))
 }
 
 function counter(value: unknown): number {

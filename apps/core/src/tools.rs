@@ -351,7 +351,7 @@ impl Tool {
                 &["skill_id"],
             ),
             Tool::Remember => (
-                "Keep a short note this bot reads in every later turn (a fact or preference the user wants kept), because the user's own message asked. Omit memory_id to add a note; pass it to rewrite that note. Never store keys, tokens or passwords; they are refused.",
+                "Keep a short note this bot can recall in later turns (a fact or preference the user wants kept), because the user's own message asked. Omit memory_id to add a note; pass it to rewrite that note. Never store keys, tokens or passwords; they are refused.",
                 json!({"call_ref":string(),"memory_id":string(),
                 "text":{"type":"string","minLength":1,"maxLength":MAX_MEMORY_CHARS}}),
                 &["call_ref", "text"],

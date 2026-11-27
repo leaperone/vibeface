@@ -12,7 +12,12 @@ export type InputTarget =
   | { kind: 'channel_member'; channel_id: string; bot_id: string }
   | { kind: 'channel_task'; channel_id: string; task_id: string; bot_id: string }
 export type InputIntent = 'continue' | 'new_task' | 'defer'
-export type InputOptions = { target: InputTarget; intent?: InputIntent; expected_revision?: number; conversation_id?: string; onSaved?: (input: PendingMessage) => void }
+export type InputOptions = {
+  target: InputTarget; intent?: InputIntent; expected_revision?: number; conversation_id?: string
+  /** Runs synchronously after signing, before enqueue; throwing prevents the enqueue attempt. */
+  onPrepared?: (input: Pick<PendingMessage, 'message_id' | 'conversation_id' | 'target'>) => void
+  onSaved?: (input: PendingMessage) => void
+}
 export type SessionScope = { kind: 'main' } | { kind: 'workspace_task'; task_id: string } | { kind: 'task'; work_id: string } | { kind: 'routine'; trigger: string }
 export type InputReceipt = {
   message_id: string; target: InputTarget

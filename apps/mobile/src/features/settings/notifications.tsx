@@ -2,7 +2,8 @@ import * as Notifications from 'expo-notifications'
 import { BellRing, Bot, CircleDot, Settings, Volume2 } from 'lucide-react-native'
 import { useEffect, useMemo, useState } from 'react'
 import { Linking, View } from 'react-native'
-import { notificationPreferences, type NotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
+import { notificationPreferences, watchNotificationPreferences, type NotificationPreferences } from '@vibeface/client/workspace/system-notifications.ts'
+import { contactCopy } from '@vibeface/client/chat/contact.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useLive } from '@/data/live'
 import { useWorkspace } from '@/data/context'
@@ -16,7 +17,7 @@ import { mobilePlatform } from '@/platform'
 import { remoteNotifications, type RemoteNotificationState } from '@/platform/remote-notifications'
 import { useRun } from '@/lib/use-run'
 
-export function NotificationSettings() {
+export function NotificationSettings({ botId }: { botId?: string } = {}) {
   const device = useDevice(), workspace = useWorkspace(), shared = useLive()
   const networkId = workspace.networkId ?? ''
   const preferences = useMemo(() => notificationPreferences(mobilePlatform.storage, networkId), [networkId])
@@ -26,6 +27,7 @@ export function NotificationSettings() {
   const ready = device.ready
   const remote: RemoteNotificationState = ready ? remoteNotifications.state(ready) : { kind: 'off' }
   useEffect(() => remoteNotifications.watch(() => refresh((value) => value + 1)), [ready])
+  useEffect(() => watchNotificationPreferences(networkId, () => refresh(value => value + 1)), [networkId])
   const save = async (next: NotificationPreferences) => {
     if (!ready?.isCurrent() || !shared) throw new Error('连上网络后再同步提醒设置。')
     if (next.enabled && !settings.enabled) {
@@ -36,10 +38,11 @@ export function NotificationSettings() {
     refresh((value) => value + 1)
     if (!next.badge || !next.enabled) await Notifications.setBadgeCountAsync(0)
     const state = await remoteNotifications.sync(ready, next)
-    if (state.kind === 'error') throw new Error(state.message)
+    if (state.kind === 'error') throw new Error(`本机提醒设置已保存，后台推送尚未同步：${state.message}`)
   }
-  const disabled = busy !== null || !ready || !networkId
+  const disabled = busy !== null || !ready?.isCurrent() || !networkId
   return <>
+    {botId ? null : <>
     <SettingsRow icon={BellRing} label="后台系统通知" description={shared?.notificationButton.state === 'denied' ? '系统权限未开启，请前往系统设置。' : '使用应用时只显示应用内横幅。'}>
       <Switch accessibilityLabel="后台系统通知" value={settings.enabled} disabled={disabled} onValueChange={(enabled) => void run('notifications', () => save({ ...settings, enabled }))} />
     </SettingsRow>
@@ -48,10 +51,11 @@ export function NotificationSettings() {
     {settings.enabled ? <View className="gap-2 px-4 py-3"><Text className="text-sm text-muted">{remote.kind === 'registered' ? '后台提醒已连接，系统通知设置仍会影响展示。' : remote.kind === 'unconfigured' ? '此安装包尚未启用后台提醒。打开应用后仍可接收消息。' : remote.kind === 'error' ? remote.message : '正在连接后台提醒。'}</Text>
       {remote.kind !== 'registered' && remote.kind !== 'unconfigured' ? <Button variant="secondary" size="sm" disabled={disabled} onPress={() => void run('push-retry', () => save(settings))}><Text>重新连接提醒</Text></Button> : null}
     </View> : null}
-    {workspace.bots.map((bot) => <SettingsRow icon={Bot} key={bot.bot_id} label={bot.name} description="接收这个 Bot 的提醒">
-      <Switch accessibilityLabel={`接收 ${bot.name} 的提醒`} value={!settings.mutedConversations.includes(bot.conversation_id)} disabled={disabled} onValueChange={(enabled) => void run(`mute:${bot.bot_id}`, () => save({ ...settings, mutedConversations: enabled ? settings.mutedConversations.filter((id) => id !== bot.conversation_id) : [...settings.mutedConversations, bot.conversation_id] }))} />
+    </>}
+    {workspace.bots.filter(bot => !botId || bot.bot_id === botId).map((bot) => <SettingsRow icon={Bot} key={bot.bot_id} label={botId ? '接收这个 Bot 的提醒' : bot.name} description={contactCopy.scope}>
+      <Switch accessibilityLabel={`接收 ${bot.name} 的提醒`} value={!settings.mutedConversations.includes(bot.conversation_id)} disabled={disabled} onValueChange={(enabled) => void run(`mute:${bot.bot_id}`, () => { const current = preferences.read(); return save({ ...current, mutedConversations: enabled ? current.mutedConversations.filter((id) => id !== bot.conversation_id) : [...current.mutedConversations, bot.conversation_id] }) })} />
     </SettingsRow>)}
-    <SettingsRow icon={Settings} label="系统通知设置" onPress={() => void run('system-settings', () => Linking.openSettings())}><Icon as={Settings} className="text-muted" /></SettingsRow>
+    {botId ? !settings.enabled ? <Text className="px-4 pb-3 text-sm text-muted">后台系统通知尚未开启；解除静音不会申请系统权限。</Text> : remote.kind === 'unconfigured' ? <Text className="px-4 pb-3 text-sm text-muted">此安装包尚未启用后台提醒，应用内横幅仍按此设置。</Text> : remote.kind === 'error' ? <View className="gap-2 px-4 pb-3"><ErrorText error={remote.message} /><Button variant="secondary" size="sm" disabled={disabled} onPress={() => void run('push-retry', () => save(settings))}><Text>重新同步提醒</Text></Button></View> : null : <SettingsRow icon={Settings} label="系统通知设置" onPress={() => void run('system-settings', () => Linking.openSettings())}><Icon as={Settings} className="text-muted" /></SettingsRow>}
     {error ? <View className="px-4 pb-3"><ErrorText error={error} /></View> : null}
   </>
 }

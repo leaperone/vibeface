@@ -11,10 +11,11 @@ export type MessageActionsProps = {
   onCopy?: (message: ChatMessage) => void | Promise<unknown>
   onShare?: (message: ChatMessage) => void | Promise<unknown>
   onQuote?: (message: ChatMessage) => void | Promise<unknown>
+  onRemember?: (message: ChatMessage) => void | Promise<unknown>
 }
 
 /** The copy, share and quote sheet for one message; `choose` opens it, null while there is nothing to act on. */
-export function useMessageActions({ message, onCopy, onShare, onQuote }: MessageActionsProps & { message: ChatMessage }) {
+export function useMessageActions({ message, onCopy, onShare, onQuote, onRemember }: MessageActionsProps & { message: ChatMessage }) {
   const version = useRef(0), mounted = useRef(true)
   useEffect(() => { mounted.current = true; version.current++; return () => { mounted.current = false; version.current++ } }, [message])
   const copy = useClipboardAction(message)
@@ -29,9 +30,13 @@ export function useMessageActions({ message, onCopy, onShare, onQuote }: Message
       { text: '复制整条消息', action: () => run(async () => { if (onCopy) await onCopy(message); else await copy.copy(text) }) },
       { text: '分享消息', action: () => run(async () => { if (onShare) await onShare(message); else await Share.share({ message: text }) }) },
       ...(onQuote ? [{ text: '引用消息', action: () => run(() => onQuote(message)) }] : []),
+      ...(onRemember ? [{ text: '记为这个 Bot 的偏好', action: () => run(() => onRemember(message)) }] : []),
     ]
     if (Platform.OS === 'ios') ActionSheetIOS.showActionSheetWithOptions({ options: [...options.map(item => item.text), '取消'], cancelButtonIndex: options.length }, index => { if (current()) void options[index]?.action() })
-    else Alert.alert('消息操作', undefined, options.map(item => ({ text: item.text, onPress: () => { if (current()) void item.action() } })), { cancelable: true })
+    else {
+      const show = (items: typeof options) => Alert.alert('消息操作', undefined, items.map(item => ({ text: item.text, onPress: () => { if (current()) void item.action() } })), { cancelable: true })
+      show(options.length > 3 ? [...options.slice(0, 2), { text: '更多操作', action: async () => show(options.slice(2)) }] : options)
+    }
   }
   const feedback = copy.copied ? <Text accessibilityLiveRegion="polite" className="text-sm text-muted">已复制</Text>
     : copy.error ? <Text accessibilityLiveRegion="polite" className="shrink text-sm text-danger">{copy.error}</Text> : null

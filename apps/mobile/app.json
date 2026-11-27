@@ -54,6 +54,25 @@
       "expo-status-bar",
       "expo-system-ui",
       [
+        "expo-sharing",
+        {
+          "ios": {
+            "enabled": true,
+            "extensionBundleIdentifier": "one.leaper.vibeface.share",
+            "appGroupId": "group.one.leaper.vibeface",
+            "activationRule": {
+              "supportsText": true,
+              "supportsWebUrlWithMaxCount": 1
+            }
+          },
+          "android": {
+            "enabled": true,
+            "singleShareMimeTypes": ["text/plain"],
+            "multipleShareMimeTypes": []
+          }
+        }
+      ],
+      [
         "expo-camera",
         {
           "cameraPermission": "扫描加入二维码",

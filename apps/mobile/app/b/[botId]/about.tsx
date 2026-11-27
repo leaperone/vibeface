@@ -1,11 +1,12 @@
 import { SelectionItem } from '@/components/arc/selection'
 import { HistoryControls } from '@/features/chat/history-controls'
-import { Stack, useLocalSearchParams } from 'expo-router'
+import { Link, Stack, useLocalSearchParams } from 'expo-router'
 import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessageSquareWarning, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Alert, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
-import { botCopy, botModelRows, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { botCopy, botModelRows, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { contactCopy, quietScheduleRequest } from '@vibeface/client/chat/contact.ts'
 import { asProvider, messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
 import { useAvatarPick } from '@vibeface/client/avatar/use-avatar-pick.ts'
@@ -22,6 +23,8 @@ import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 import { MemorySummary } from '@/features/chat/memory-summary'
+import { BotRequestDraft } from '@/features/chat/bot-request'
+import { NotificationSettings } from '@/features/settings/notifications'
 
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
@@ -34,6 +37,8 @@ export default function BotAbout() {
 function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType<typeof useLive>> }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
+  const [request, setRequest] = useState<{ key: string; text: string } | null>(null)
+  useEffect(() => setRequest(null), [bot.conversation_id, shared.generation])
   const look = useAvatarPick(bot, (version, avatar) => shared.setBotAvatar(bot.conversation_id, version, avatar), (error) => Alert.alert('没换成', messageOf(error)))
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
@@ -87,29 +92,39 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
     <Details label="换长相">
       <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!shared.writable} busy={look.pending} pick={look.pick} />
     </Details>
-    {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
+    <Section icon={ScrollText} title="职责与合作约定"><Text selectable>{bot.instructions.trim() || '还没有约定，可在聊天中告诉它。'}</Text><Button variant="secondary" className="self-start" onPress={() => setRequest({ key: 'profile', text: `请把这个 Bot 的职责与合作约定改为：\n\n${bot.instructions}` })}><Text>调整合作约定</Text></Button></Section>
+    <SettingsGroup title="主动联系"><NotificationSettings botId={bot.bot_id} /></SettingsGroup>
+    {request ? <Section icon={ScrollText} title="修改请求草稿"><BotRequestDraft key={`${shared.generation}:${bot.conversation_id}:${request.key}`} bot={bot} initialText={request.text} onClose={() => setRequest(null)} /></Section> : null}
     {schedules.length ? <Section icon={CalendarClock} title="定时任务" count={schedules.length}>
-      {schedules.map((schedule) => <View key={schedule.schedule_id} className="flex-row items-start gap-3">
+      <Text className="text-sm text-muted">{contactCopy.pause}</Text>
+      {!shared.connectionOnline || shared.dataOrigin === 'cache' ? <Text role="status" className="text-sm text-muted">当前显示上次保存的约定和时间。连接后可查看最新内容。</Text> : null}
+      {schedules.map((schedule) => {
+        const cause = [...shared.data?.changes ?? []].reverse().find(record => record.change.kind === 'schedule' && record.change.schedule_id === schedule.schedule_id && record.cause)?.cause
+        const sourceBot = cause ? shared.bots.find(item => item.conversation_id === cause.conversation_id) : undefined
+        return <View key={schedule.schedule_id} className="flex-row items-start gap-3">
         <Icon as={schedule.every_minutes === undefined ? AlarmClock : Repeat} className="mt-0.5 size-4 text-muted" />
         <View className="min-w-0 flex-1 gap-0.5">
           <Text className="font-medium">{schedule.name}</Text>
           <View className="flex-row flex-wrap items-center gap-x-2">
             {!schedule.enabled ? <View className="flex-row items-center gap-1"><Icon as={CirclePause} className="size-4 text-muted" /><Text className="text-sm text-muted">已暂停</Text></View>
-              : schedule.next_run_at_ms !== null ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{formatIn(schedule.next_run_at_ms)}</Text> : null}
+              : schedule.next_run_at_ms !== null ? <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>下次 {formatWhen(schedule.next_run_at_ms)} · {formatIn(schedule.next_run_at_ms)}</Text> : <Text className="text-sm text-muted">下次时刻待确认</Text>}
             <Text className="text-sm text-muted" style={{ fontVariant: ['tabular-nums'] }}>{scheduleFrequency(schedule)}</Text>
           </View>
           <Text numberOfLines={2} className="text-sm text-muted">{scheduleDetail(schedule) || schedule.prompt}</Text>
-          <View className="flex-row gap-2 pt-1">
-            <ActionButton variant="secondary" size="sm" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
+          <Text className="text-sm text-muted">按已保存的约定触发。{schedule.every_minutes === undefined ? contactCopy.once : contactCopy.recurring}</Text>
+          {cause && sourceBot ? <Link href={{ pathname: '/b/[botId]', params: { botId: sourceBot.bot_id, message: cause.message_id } }} asChild><Button variant="ghost" className="self-start"><Text>查看原约定</Text></Button></Link> : null}
+          <View className="flex-row flex-wrap gap-2 pt-1">
+            <ActionButton variant="secondary" size="sm" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停后续执行' : '恢复后续执行'}</ActionButton>
             <Button variant="secondary" size="sm" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
               { text: '取消', style: 'cancel' },
               { text: '删除', style: 'destructive', onPress: () => void shared.controlSchedule(schedule.schedule_id, 'delete').catch((error: unknown) => Alert.alert('删除失败', messageOf(error))) },
             ])}>
               <Icon as={Trash2} /><Text>删除</Text>
             </Button>
+            {schedule.every_minutes !== undefined ? <Button variant="secondary" size="sm" onPress={() => setRequest({ key: `schedule:${schedule.schedule_id}`, text: quietScheduleRequest(schedule) })}><Text>仅变化时联系</Text></Button> : null}
           </View>
         </View>
-      </View>)}
+      </View>})}
     </Section> : null}
     {view ? <Section icon={NotebookPen} title="持久记忆" count={view.memory.length}>
       <MemorySummary key={bot.conversation_id} settings={view} context={shared.data?.scheduler?.context} memory={shared} />

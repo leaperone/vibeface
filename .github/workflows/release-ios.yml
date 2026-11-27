@@ -14,6 +14,7 @@ on:
       IOS_CERTIFICATE_P12_BASE64: {required: false}
       IOS_CERTIFICATE_PASSWORD: {required: false}
       IOS_PROVISIONING_PROFILE_BASE64: {required: false}
+      IOS_SHARE_PROVISIONING_PROFILE_BASE64: {required: false}
     outputs:
       artifact_id:
         value: ${{ jobs.build.outputs.artifact_id }}
@@ -55,6 +56,7 @@ jobs:
           IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          IOS_SHARE_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_SHARE_PROVISIONING_PROFILE_BASE64 }}
         run: scripts/build-ios.sh "$RELEASE_VERSION" "$SOURCE_SHA"
       - name: Package and verify archive provenance
         env:
@@ -64,27 +66,33 @@ jobs:
           IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
           IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          IOS_SHARE_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_SHARE_PROVISIONING_PROFILE_BASE64 }}
         run: |
           mkdir -p .artifacts/ios
           configured=0
-          for value in "$IOS_CERTIFICATE_P12_BASE64" "$IOS_CERTIFICATE_PASSWORD" "$IOS_PROVISIONING_PROFILE_BASE64"; do
+          for value in "$IOS_CERTIFICATE_P12_BASE64" "$IOS_CERTIFICATE_PASSWORD" "$IOS_PROVISIONING_PROFILE_BASE64" "$IOS_SHARE_PROVISIONING_PROFILE_BASE64"; do
             [[ -z "$value" ]] || ((configured+=1))
           done
-          if (( configured == 3 )); then
+          if (( configured != 0 && configured != 4 )); then
+            echo 'iOS provenance requires either no signing secrets or all four signing secrets' >&2
+            exit 1
+          fi
+          if (( configured == 4 )); then
             archive_name="vibeface-${RELEASE_VERSION}-ios-device-signed.xcarchive.zip"
           else
             archive_name="vibeface-${RELEASE_VERSION}-ios-device-unsigned.xcarchive.zip"
           fi
           ditto -c -k --sequesterRsrc --keepParent .artifacts/ios-build/Vibeface.xcarchive ".artifacts/ios/$archive_name"
           verify_args=()
-          if (( configured == 3 )); then verify_args+=(--signed); fi
+          if (( configured == 4 )); then verify_args+=(--signed); fi
           python3 -B scripts/verify-ios-archive.py \
             --archive .artifacts/ios-build/Vibeface.xcarchive \
             --zip ".artifacts/ios/$archive_name" \
             --source-sha "$SOURCE_SHA" \
             --release-version "$RELEASE_VERSION" \
+            --distribution-method "$IOS_DISTRIBUTION_METHOD" \
             --output ".artifacts/ios/$archive_name.provenance.json" "${verify_args[@]}"
-          if (( configured == 3 )); then
+          if (( configured == 4 )); then
             ipa_name="vibeface-${RELEASE_VERSION}-ios.ipa"
             cp .artifacts/ios-build/export/Vibeface.ipa ".artifacts/ios/$ipa_name"
             python3 -B scripts/verify-ios-ipa.py \
