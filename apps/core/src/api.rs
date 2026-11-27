@@ -1,4 +1,5 @@
 use crate::{identity::local::BootstrapCapability, runtime::Runtime};
+mod gateway;
 mod static_assets;
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -555,7 +556,7 @@ fn browser_router_with_assets(
     if !local {
         app.addresses = Some(Default::default());
     }
-    let mut routes = Router::new();
+    let mut routes = gateway::routes();
     if app.node.config.web_enabled {
         routes = routes
             .route("/api/info", get(info))
@@ -585,6 +586,7 @@ fn browser_router_with_assets(
 }
 
 async fn boundary(State(app): State<App>, request: Request, next: Next) -> Response {
+    let gateway_request = gateway::is_path(request.uri().path());
     let ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -616,19 +618,31 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         }
     }) {
         Ok(_decision) => {
+            let path = request.uri().path();
             let work = if matches!(
                 *request.method(),
                 Method::GET | Method::HEAD | Method::OPTIONS
             ) {
                 Ok(None)
-            } else if request.uri().path() == HOOKS_WAIT {
-                // A hook waits up to its request's deadline; that must not hold off an update.
+            } else if path == HOOKS_WAIT
+                || path == "/api/gateway/v1/wait"
+                || path == "/api/gateway/v1/queue"
+                || path == "/api/gateway/mcp"
+            {
+                // These requests may block until a deadline. Admit through the
+                // maintenance Gate, then drop the lease so an update can start.
+                // Mutating gateway ops re-enter for the short critical section.
                 app.node.maintenance.enter().map(|_| None)
             } else {
                 app.node.maintenance.enter().map(Some)
             };
             match work {
                 Ok(_work) => next.run(request).await,
+                Err(_) if gateway_request => gateway::failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "node is preparing an update; try again after it restarts",
+                ),
                 Err(_) => ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "node is preparing an update; try again after it restarts".into(),
@@ -636,6 +650,7 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
                 .into_response(),
             }
         }
+        Err(error) if gateway_request => gateway::failure(error.0, "invalid_request", &error.1),
         Err(error) => error.into_response(),
     };
     let headers = response.headers_mut();
@@ -719,6 +734,7 @@ async fn check_boundary(
             || path == "/api/local/launch"
             || path == "/api/decision";
         let bearer_call = (is_tool && bearer(headers).is_some())
+            || gateway::is_path(path)
             || path == HOOKS
             || path == HOOKS_WAIT
             || path == TRIAGE

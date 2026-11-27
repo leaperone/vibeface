@@ -771,6 +771,13 @@ impl Runtime {
         event: HookEvent,
         schema: Option<HookRequest>,
     ) -> Result<Value> {
+        if self
+            .gateway
+            .native_thread(&event.session_id)?
+            .is_some_and(|entry| entry.spec.resolved.provider == Provider::from(event.agent))
+        {
+            return Ok(json!({"status":"dropped"}));
+        }
         match event.hold {
             Some(kind) => self.hold_request(event, kind, schema).await,
             None => self.queue_event(event, None).await,
@@ -1017,6 +1024,9 @@ impl Runtime {
     /// again, as after a reconnect, keeps its ID: it takes the new connection's JSON-RPC ID and
     /// stays with the question or the Agent event it already has, so nothing is asked twice.
     pub(crate) async fn on_codex_request(self: &Arc<Self>, handed: &ServerRequest) {
+        if self.gateway_codex_request(handed).await {
+            return;
+        }
         let request_id = triage::request_id(&handed.method, &handed.params)
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         let mut request = HeldRequest {
@@ -2474,7 +2484,8 @@ impl Runtime {
             })
             .await?;
         for mut entry in entries {
-            let (status, error) = post_webhook(&url, &secret, &entry.event_id, &entry.body).await;
+            let (status, error) =
+                crate::webhook::post_webhook(&url, &secret, &entry.event_id, &entry.body).await;
             entry.record(status, now_ms());
             if entry.state == Delivery::Dead {
                 tracing::warn!(
@@ -2680,7 +2691,7 @@ impl Runtime {
         let body = json!({"schema_version":triage::SCHEMA_VERSION,"event_id":event_id,"test":true,
             "summary":"Vibeface webhook test","device_id":self.identity.device_id()?})
         .to_string();
-        let (status, error) = post_webhook(&url, &secret, &event_id, &body).await;
+        let (status, error) = crate::webhook::post_webhook(&url, &secret, &event_id, &body).await;
         Ok(json!({"ok":matches!(status, Some(200..=299)),"status":status,"error":error}))
     }
 
@@ -2935,41 +2946,6 @@ impl Runtime {
         })
         .await;
         Ok(())
-    }
-}
-
-/// One signed POST; the status, or the transport error.
-async fn post_webhook(
-    url: &str,
-    secret: &[u8],
-    event_id: &str,
-    body: &str,
-) -> (Option<u16>, Option<String>) {
-    let timestamp = now_ms() / 1000;
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => return (None, Some(error.to_string())),
-    };
-    match client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("x-vibeface-event-id", event_id)
-        .header("x-vibeface-timestamp", timestamp.to_string())
-        .header(
-            "x-vibeface-signature",
-            triage::signature(secret, timestamp, body),
-        )
-        .body(body.to_owned())
-        .send()
-        .await
-    {
-        Ok(response) => (Some(response.status().as_u16()), None),
-        // Without the URL: it may carry a path the user treats as private.
-        Err(error) => (None, Some(error.without_url().to_string())),
     }
 }
 

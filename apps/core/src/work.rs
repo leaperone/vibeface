@@ -259,7 +259,7 @@ impl WorkState {
 /// The target Node's execution state of one work. What the work is lives in the DAG; this keeps
 /// only what running and reconciling it needs: its thread and turn, the App Server epoch, the
 /// answer text so far and the send window.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkRecord {
     pub work_id: String,
     pub conversation: String,
