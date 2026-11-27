@@ -1,23 +1,24 @@
 import { Card } from '@/components/arc/surface'
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowDown, ArrowRight, ArrowRightLeft, ArrowUp, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useMemo, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { replyUnsettled, runtimeLabel } from '@vibeface/client/chat/protocol.ts'
+import { replyUnsettled, runtimeLabel, sameTarget } from '@vibeface/client/chat/protocol.ts'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, QueuedInput, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, InputControlAction, ManagerJob, Overwritten, PendingCheck, QueuedInput, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, providerIcons } from '@/components/kit'
 import { Icon } from '@/components/arc/icon'
 import { Input } from '@/components/arc/input'
+import { Textarea } from '@/components/arc/textarea'
 import { Text } from '@/components/arc/text'
 import { useLive } from '@/data/live'
 import { touchRow } from '@/lib/layout'
@@ -67,7 +68,7 @@ function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages' | 'workspace
     checks: pendingChecks(data, shared.nodes, conversationId),
     lost: inputs.filter(lost),
     sending: inputs.filter((pending) => !lost(pending)),
-    deferred: (shared.workspaceState?.inputs ?? []).filter((input) => input.conversation_id === conversationId && input.deferred && !input.cancelled),
+    deferred: (shared.workspaceState?.inputs ?? []).filter((input) => input.conversation_id === conversationId && input.deferred && !input.cancelled).sort((left, right) => left.effective_order - right.effective_order),
   }
 }
 
@@ -123,7 +124,7 @@ export function useChatActivity(conversationId: string, botId: string) {
         actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(ownerAway.here, lookup)}</ActionButton>} /> }] : [],
       ...need.reconciling.map((job): Row => ({ key: `reconcile:${job.trigger}`, node: <ActionCard icon={CircleQuestionMark} title="这次回复的结果待确认" actions={<ActionButton action={() => shared.refresh()}>再查一次</ActionButton>} /> })),
       ...need.checks.map((check): Row => ({ key: check.check_id, node: <ConfirmCard check={check} /> })),
-      ...need.deferred.map((input): Row => ({ key: `deferred:${input.input.message_id}`, node: <DeferredInput input={input} /> })),
+      ...need.deferred.map((input): Row => ({ key: `deferred:${input.input.message_id}`, node: <DeferredInput input={input} lane={need.deferred.filter((other) => sameTarget(other.input.target, input.input.target))} /> })),
       ...need.lost.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
     ],
     sending: need.sending.map((pending): Row => ({ key: `delivery:${pending.message_id}`, node: <InputStatus pending={pending} /> })),
@@ -133,18 +134,32 @@ export function useChatActivity(conversationId: string, botId: string) {
   }
 }
 
-function DeferredInput({ input }: { input: QueuedInput }) {
+/** As on the web: release, edit, cancel or reorder within its lane. An edit keeps the attachments; the web can drop them. */
+function DeferredInput({ input, lane }: { input: QueuedInput; lane: QueuedInput[] }) {
   const shared = useLive()
-  const control = async (kind: 'release' | 'cancel') => {
+  const [editing, setEditing] = useState<string | null>(null)
+  const index = lane.findIndex((other) => other.input.message_id === input.input.message_id)
+  const control = async (action: InputControlAction) => {
     if (!shared?.writable) return
     const receipt = await shared.queryInput({ message_id: input.input.message_id, target: input.input.target, conversation_id: input.conversation_id })
     if (!('stage' in receipt) || !['entry_accepted', 'owner_accepted', 'refused'].includes(receipt.stage)) throw new Error('这条输入可能已提交，只能查询当前结果。')
-    await shared.controlInput({ message_id: input.input.message_id, expected_event: input.control_event, action: { kind } })
+    await shared.controlInput({ message_id: input.input.message_id, expected_event: input.control_event, action })
     await shared.readWorkspaceState()
+    if (action.kind === 'edit') setEditing(null)
   }
+  const locked = !shared?.writable
+  if (editing !== null) return <ActionCard title="编辑稍后输入" icon={Hourglass} actions={<>
+    <ActionButton variant="secondary" disabled={locked} action={() => control({ kind: 'edit', text: editing, attachments: input.input.attachments ?? [] })}>保存输入修改</ActionButton>
+    <ActionButton variant="ghost" action={async () => setEditing(null)}>放弃编辑</ActionButton>
+  </>}><Textarea accessibilityLabel="编辑稍后输入" value={editing} maxLength={100000} onChangeText={setEditing} /></ActionCard>
   return <ActionCard title="已保存，稍后处理" icon={Hourglass} actions={<>
-    <ActionButton variant="secondary" disabled={!shared?.writable} action={() => control('release')}>现在处理</ActionButton>
-    <ActionButton variant="ghost" disabled={!shared?.writable} action={() => control('cancel')}>取消稍后输入</ActionButton>
+    <ActionButton variant="secondary" disabled={locked} action={() => control({ kind: 'release' })}>现在处理</ActionButton>
+    <ActionButton variant="ghost" disabled={locked} action={async () => setEditing(input.input.text)}>编辑输入</ActionButton>
+    <ActionButton variant="ghost" disabled={locked} action={() => control({ kind: 'cancel' })}>取消稍后输入</ActionButton>
+    {lane.length > 1 ? <>
+      <ActionButton variant="ghost" icon={ArrowUp} disabled={locked || index <= 0} action={() => control({ kind: 'move', before_message_id: lane[index - 1]?.input.message_id })}>上移</ActionButton>
+      <ActionButton variant="ghost" icon={ArrowDown} disabled={locked || index === lane.length - 1} action={() => control({ kind: 'move', ...(lane[index + 2] ? { before_message_id: lane[index + 2].input.message_id } : {}) })}>下移</ActionButton>
+    </> : null}
   </>}><Text numberOfLines={3}>{input.input.text || `${input.input.attachments?.length ?? 0} 个附件`}</Text></ActionCard>
 }
 

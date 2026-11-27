@@ -351,7 +351,12 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
             <ListChecks aria-hidden="true" className="size-4 shrink-0 text-secondary" /><span className="min-w-0 truncate">{statusLine}</span>
           </Button> : null}
           {showWaiting ? <Button variant="ghost" size="sm" type="button" className="max-w-full max-md:min-h-11!"
-            onClick={() => document.getElementById(waitingTarget ?? '')?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
+            onClick={() => {
+              const card = document.getElementById(waitingTarget ?? '')
+              card?.scrollIntoView({ block: 'center', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+              // Focus lands on its first choice, where a number answers it; with none, on its answer field.
+              card?.querySelector<HTMLElement>('[role="group"] button:not(:disabled), textarea:not(:disabled)')?.focus({ preventScroll: true })
+            }}>
             <terms.inbox.icon aria-hidden="true" className="size-4 shrink-0 text-warning" /><span className="min-w-0 truncate">{!workspace.connectionOnline ? '最近记录 · ' : ''}{asked ? questionParts(asked.text).ask : waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}</span><ArrowDown aria-hidden="true" className="size-3.5 shrink-0 text-secondary" />
           </Button> : null}
         </> : null}

@@ -113,7 +113,13 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
     </p> : <div className="grid gap-2">
       {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? "primary" : "secondary"} disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
-        {question.choices.length ? <div role="group" aria-label="选一个回答" className="grid min-w-0 gap-2">
+        {/* As in agent tools, a choice's number picks it while one of the choices has focus; the group alone listens, so another card never answers. */}
+        {question.choices.length ? <div role="group" aria-label="选一个回答" aria-keyshortcuts={question.choices.slice(0, 9).map((_, index) => String(index + 1)).join(' ')} className="grid min-w-0 gap-2" onKeyDown={(event) => {
+          const index = Number(event.key) - 1
+          if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.nativeEvent.isComposing || !Number.isInteger(index) || index < 0 || index >= Math.min(9, question.choices.length)) return
+          event.preventDefault()
+          void send(`choice:${index}`, question.choices[index].label)
+        }}>
           {/* Arc's button keeps its label on one centered line, so a choice uses its classes on a plain button to wrap from the start. */}
           {question.choices.map((choice, index) => <button key={index} type="button" className={`${buttonStyles.button} ${buttonStyles.ghost} -mx-2 h-auto justify-start! whitespace-normal! px-2! py-2! text-start`} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
             <span aria-hidden="true" className="flex w-4 shrink-0 justify-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>

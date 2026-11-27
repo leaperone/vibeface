@@ -2,7 +2,7 @@ import { BotFace } from '@/components/app/bot-face'
 import { Markdown,PlainText } from '@/components/app/markdown'
 import styles from "@/components/arc/conversation.module.css"
 import { ActionButton } from '@/features/workspace/present'
-import { messageKey,replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
+import { deliveryMark as markOf,messageKey,replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import { failureText,replyFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -15,13 +15,12 @@ import { MemoryPreference } from './memory-preference'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
-const mergedLabels: Record<SteerOutcome, string> = { answered: '关联回合已完成', unfinished: '关联回合未完成', unknown: '补充结果未知' }
-
 function deliveryMark(message: ChatMessage) {
-  const label = message.state === 'sending' ? '正在确认送达' : message.state === 'queued' ? '已排队' : message.state === 'merging' ? '已登记为回合补充' : message.state === 'merged' ? mergedLabels[message.merged ?? 'unknown'] : null
-  if (!label) return null
-  const Icon = message.state === 'merged' && (message.merged ?? 'unknown') === 'unknown' ? CircleQuestionMark : message.state === 'merging' || message.state === 'merged' ? Merge : Clock
-  const unknown = Icon === CircleQuestionMark
+  const mark = markOf(message.state, message.merged)
+  if (!mark) return null
+  const { label } = mark
+  const unknown = mark.kind === 'unknown'
+  const Icon = unknown ? CircleQuestionMark : mark.kind === 'merge' ? Merge : Clock
   return <span className={`flex items-center gap-1 text-sm ${unknown ? 'text-warning' : 'text-secondary'}`}><span role="img" aria-label={label} title={label}><Icon aria-hidden="true" className="size-3.5" /></span>{unknown ? <span aria-hidden="true">未确认</span> : null}</span>
 }
 
