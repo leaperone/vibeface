@@ -1,7 +1,7 @@
 import { Link, Stack, useLocalSearchParams } from 'expo-router'
 import { ChevronRight, Search } from 'lucide-react-native'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Pressable, ScrollView, View } from 'react-native'
+import { FlatList, Pressable, View } from 'react-native'
 import { searchMessages } from '@vibeface/client/workspace/history-search.ts'
 import type { MessageSearchItem, MessageSearchScope } from '@vibeface/client/workspace/types.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -72,19 +72,22 @@ export default function MessageSearch() {
   for (const item of visible.items) items.set(item.event_hash, item)
   const hits = [...items.values()].sort((a, b) => b.rank.localeCompare(a.rank) || b.created_at_ms - a.created_at_ms)
 
-  return <ScrollView keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-12">
+  return <FlatList data={hits} keyExtractor={(hit) => hit.event_hash} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-12"
+    ListHeaderComponentClassName="gap-4" ListHeaderComponent={<>
     <Stack.Screen options={{ title }} />
     <Input autoFocus accessibilityLabel={title} value={query} onChangeText={setQuery} placeholder="输入消息关键词" maxLength={256} returnKeyType="search" onSubmitEditing={() => void read()} />
     <Text accessibilityLiveRegion="polite" className="text-sm text-muted">{!term ? '先显示本地匹配，联网后检索更早的消息。' : visible.kind === 'loading' ? `已找到 ${hits.length} 条，正在检索完整历史…` : device.ready ? `${hits.length} 条匹配${visible.complete ? ' · 当前范围已检索完毕' : ' · 可继续查找更早结果'}` : `${hits.length} 条本地匹配 · 联网后可检索完整历史`}</Text>
-    {hits.map((hit) => {
+    </>}
+    renderItem={({ item: hit }) => {
       const destination = scope?.kind === 'task' ? { pathname: '/task/[taskId]' as const, params: { taskId: scope.task_id, message: hit.message_id } } : scope?.kind === 'channel' ? { pathname: '/channel/[channelId]' as const, params: { channelId: scope.channel_id, message: hit.message_id } } : { pathname: '/b/[botId]' as const, params: { botId: bot?.bot_id ?? '', message: hit.message_id } }
-      return <Link key={hit.event_hash} href={destination} asChild><Pressable accessibilityRole="link" accessibilityLabel={`查看原消息，${hit.text}`} className="gap-2 rounded-panel border border-border bg-surface p-4 active:bg-surface-muted">
+      return <Link href={destination} asChild><Pressable accessibilityRole="link" accessibilityLabel={`查看原消息，${hit.text}`} className="gap-2 rounded-panel border border-border bg-surface p-4 active:bg-surface-muted">
         <View className="flex-row items-center justify-between gap-2"><Text className="text-sm text-muted">{new Date(hit.created_at_ms).toLocaleString()} · {hit.source === 'local' ? '本地副本' : '已同步历史'}</Text><Icon as={ChevronRight} className="text-muted" /></View>
         <Text numberOfLines={5}>{hit.text}</Text>
       </Pressable></Link>
-    })}
+    }}
+    ListFooterComponentClassName="gap-4" ListFooterComponent={<>
     {term && !hits.length && (visible.kind === 'ready' || !device.ready) ? <EmptyState icon={Search} title={device.ready ? '当前已检索的记录没有匹配消息' : '本地没有匹配消息，联网后可继续检索'} /> : null}
     {visible.kind === 'failed' ? <View className="gap-2"><ErrorText error={visible.error} /><Button variant="secondary" onPress={() => void read()}><Text>重新检索</Text></Button></View> : null}
     {device.ready && term && visible.cursor && visible.kind !== 'failed' ? <Button variant="secondary" disabled={visible.kind === 'loading'} onPress={() => void read(visible.cursor ?? undefined)}><Text>{visible.kind === 'loading' ? '正在检索…' : '查找更早的匹配'}</Text></Button> : null}
-  </ScrollView>
+    </>} />
 }

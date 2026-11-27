@@ -26,6 +26,12 @@
         "NSLocalNetworkUsageDescription": "用于发现并直接连接局域网内你自己的 Vibeface 节点。",
         "NSBonjourServices": [
           "_vibeface._udp"
+        ],
+        "UISupportedInterfaceOrientations~ipad": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
         ]
       },
       "buildNumber": "17"
