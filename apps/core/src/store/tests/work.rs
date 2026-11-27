@@ -345,7 +345,11 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         .into_iter()
         .find(|w| w.work_id == remote.work_id)
         .map(|w| (w.dispatched_at_ms, w.finished_at_ms));
-    assert_eq!(times, Some((3, Some(6))), "times come from the standing events");
+    assert_eq!(
+        times,
+        Some((3, Some(6))),
+        "times come from the standing events"
+    );
 
     let local = spec("local", &net.a)?;
     store.accept_work_fixture(&net.a, &net.network, local.clone(), 7)?;
