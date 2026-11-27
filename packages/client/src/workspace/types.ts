@@ -164,7 +164,7 @@ type WorkRelations = {
   parent: string | null
   thread: string | null
   phase: WorkPhase | null
-  /** Author clocks of the dispatch and of the standing result; devices may skew. */
+  /** When the target took it and, for a result the target reported, when it ended; both by the target's clock. */
   dispatched_at_ms: number | null
   finished_at_ms: number | null
 }
