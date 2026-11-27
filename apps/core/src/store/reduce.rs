@@ -565,6 +565,8 @@ type WorkRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    String,
+    Option<String>,
 );
 
 pub(crate) fn works_from(
@@ -666,7 +668,7 @@ pub(super) fn works_query(
     params: impl rusqlite::Params,
 ) -> Result<Vec<WorkProjection>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT w.work_id,w.conversation_id,w.target_node,w.dispatch,w.progress,w.thread_id,w.turn_id,w.finish {from} AND w.dispatch IS NOT NULL ORDER BY w.conversation_id,w.dispatch_rank"
+        "SELECT w.work_id,w.conversation_id,w.target_node,w.dispatch,w.progress,w.thread_id,w.turn_id,w.finish,w.dispatch_rank,w.finish_rank {from} AND w.dispatch IS NOT NULL ORDER BY w.conversation_id,w.dispatch_rank"
     ))?;
     let rows: Vec<WorkRow> = statement
         .query_map(params, |r| {
@@ -679,12 +681,24 @@ pub(super) fn works_query(
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut works = Vec::with_capacity(rows.len());
-    for (work_id, conversation_id, target_node, dispatch, progress, thread_id, turn_id, finish) in
-        rows
+    for (
+        work_id,
+        conversation_id,
+        target_node,
+        dispatch,
+        progress,
+        thread_id,
+        turn_id,
+        finish,
+        dispatch_rank,
+        finish_rank,
+    ) in rows
     {
         let EventBody::WorkDispatched {
             trigger,
@@ -744,6 +758,12 @@ pub(super) fn works_query(
             failure_reason,
             failure,
             state: WorkStatus::of(kind, phase, outcome),
+            dispatched_at_ms: crate::store::rank_time(&dispatch_rank).unwrap_or_default(),
+            // `finish_rank` leads with its precedence.
+            finished_at_ms: finish_rank
+                .as_deref()
+                .and_then(|rank| rank.split_once(':'))
+                .and_then(|(_, rank)| crate::store::rank_time(rank)),
         });
     }
     Ok(works)

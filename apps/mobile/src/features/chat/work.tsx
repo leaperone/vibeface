@@ -1,4 +1,5 @@
 import { Card } from '@/components/arc/surface'
+import { Elapsed } from './elapsed'
 import { Link } from 'expo-router'
 import { AlarmClock, ArrowDown, ArrowRight, ArrowRightLeft, ArrowUp, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Hourglass, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useMemo, useRef, useState, type ReactNode } from 'react'
@@ -207,6 +208,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device, agent, prog
     <Icon as={Laptop} className="size-3.5 text-muted" />
     <Text numberOfLines={1} className="shrink text-sm text-muted">{device}</Text>
     <Text className="text-sm text-muted">· {stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(state)}</Text>
+    <Elapsed dot start={work.dispatched_at_ms} end={work.finished_at_ms} active={active && !stale} />
   </View>
   if (!open) {
     // A failed task's text is what it said before failing, so its cause leads.

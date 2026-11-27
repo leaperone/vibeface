@@ -23,7 +23,7 @@ const message = (message_id: string, lamport: number) => ({ message_id, role: "u
 const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
   dispatcher: 'gateway', call_ref: 'dispatch',
   continues: null, parent: null,
-  thread: null, phase: null,
+  thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
   work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null }, ...extra,
 })
 const question = (question_id: string, conversation_id: string, answer: unknown = null) => ({

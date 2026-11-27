@@ -97,7 +97,7 @@ test('a failed task waits in 待处理 under its bot until something follows it 
   const work = {
     dispatcher: 'gateway', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
   failed.workspace.openWorks = [
     { ...work, resolved: { provider: 'codex', model: null } satisfies ResolvedModel },
@@ -284,7 +284,7 @@ test('losing the entry makes active tasks stale without claiming every target is
   const work: WorkRecord = {
     dispatcher: 'gateway', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     work_id: 'w', trigger: '', target_node: 'mac', cwd: '', title: '', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null, resolved: { provider: 'codex', model: null } }
   const state = cardState(work, [unready], { state: 'running', outcome: null })
   assert.equal(state, 'running', 'the last target report is still online')

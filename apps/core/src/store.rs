@@ -193,6 +193,11 @@ pub(crate) fn rank(lamport: u64, created_at_ms: i64, hash: &str) -> String {
     format!("{lamport:020}:{created_at_ms:020}:{hash}")
 }
 
+/// The author's `created_at_ms` inside a `rank`.
+pub(crate) fn rank_time(rank: &str) -> Option<i64> {
+    rank.split(':').nth(1)?.parse().ok()
+}
+
 /// What a client names to change a projected row: the start of the hash of the event that last
 /// set it, which ends the row's rank (or is the event's hash). Any change gives a new version.
 pub(crate) fn version(rank: &str) -> String {

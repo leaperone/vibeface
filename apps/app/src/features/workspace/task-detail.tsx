@@ -1,4 +1,5 @@
 import { Markdown } from "@/components/app/markdown"
+import { Elapsed } from "@/features/workspace/elapsed.tsx"
 import { PromptInput } from "@/components/arc/conversation-composer"
 import { BusyIcon,DetailRow,Details,EmptyState,InlineError,StatusPill,toast,useAction,type Tone } from "@/components/arc/product-kit"
 import { RoutedAction } from "@/components/arc/routed-action"
@@ -151,14 +152,16 @@ export function TaskDetail({ botId, workId, from, focus }: { botId: string; work
   const inputPaused = !canContinue && (!work?.outcome || unknown || work?.outcome === "unverified")
   const inputIntent = canContinue || inputPaused ? promptIntent(input) : "new_task"
 
+  const elapsed = work ? <Elapsed start={work.dispatched_at_ms} end={work.finished_at_ms} active={taskActive(shown) && !taskStale(shown, workspace.connectionOnline)} /> : null
   const content = <>
-    {modal && state ? <div className="pb-4"><StatusPill tone={tone(state)}>{taskStale(state, workspace.connectionOnline) ? staleTaskLabel : taskLabel(state)}</StatusPill></div> : null}
+    {modal && state ? <div className="flex items-center gap-2 pb-4 text-sm text-secondary"><StatusPill tone={tone(state)}>{taskStale(state, workspace.connectionOnline) ? staleTaskLabel : taskLabel(state)}</StatusPill>{elapsed}</div> : null}
     <header hidden={modal} className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
       {/* Full screen on a phone, so it leaves like a page, from the start of its header. */}
       <RoutedAction variant="ghost" size="md" className="-ms-2 md:hidden" {...leave} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></RoutedAction>
       <ListChecks aria-hidden="true" className="size-5 shrink-0 text-secondary max-md:hidden" />
       <h2 id={titleId} className="line-clamp-2 min-w-0 flex-1 text-lg font-medium [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
       {state ? taskStale(state, workspace.connectionOnline) ? <StatusPill>{staleTaskLabel}</StatusPill> : <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
+      {modal ? null : <span className="shrink-0 text-sm text-secondary">{elapsed}</span>}
       <RoutedAction variant="ghost" size="md" className="max-md:hidden" {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></RoutedAction>
     </header>
     {!work ? <div className="grid gap-3 p-4"><EmptyState icon={ListChecks} title={!bot ? '找不到这个 Bot' : !workspace.connectionOnline ? '工作状态未知，连接后再读取' : readFailure ? '未能读取这个工作' : '正在读取工作'} /><InlineError error={readFailure} />{bot ? <Button type="button" variant="secondary" className="justify-self-start" disabled={!workspace.connectionOnline} onClick={() => setRetry((value) => value + 1)}>重新读取</Button> : null}</div> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">

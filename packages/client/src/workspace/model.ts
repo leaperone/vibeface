@@ -591,7 +591,8 @@ function work(value: unknown): WorkRecord {
   return { ...common, state, resolved: { provider: provider(resolved.provider), model: resolved.model === null ? null : text(resolved.model) },
     dispatcher: text(data.dispatcher), call_ref: text(data.call_ref),
     continues: data.continues === null ? null : text(data.continues), parent: data.parent === null ? null : text(data.parent),
-    thread: data.thread === null ? null : text(data.thread), phase: data.phase === null ? null : workPhase(data.phase) }
+    thread: data.thread === null ? null : text(data.thread), phase: data.phase === null ? null : workPhase(data.phase),
+    dispatched_at_ms: number(data.dispatched_at_ms), finished_at_ms: data.finished_at_ms == null ? null : number(data.finished_at_ms) }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
@@ -750,7 +751,7 @@ function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskSta
   return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync") ? "unverified" : outcome
 }
 
-function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "failure" | "kind" | "stop" | "coordination_job">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
+function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "failure" | "kind" | "stop" | "coordination_job" | "dispatched_at_ms" | "finished_at_ms">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
   const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
   const rawState = overviewState(work.stop ?? work.state)
   const outcome = safeOverviewOutcome(work.outcome, rawState)
@@ -774,6 +775,8 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
     thread_id: work.thread_id ?? null,
     turn_id: work.turn_id ?? null,
     phase: work.phase ?? null,
+    dispatched_at_ms: work.dispatched_at_ms ?? null,
+    finished_at_ms: work.finished_at_ms ?? null,
     ...(work.coordination_job === undefined ? {} : { coordination_job: work.coordination_job }),
     reason: work.failure_reason,
     ...failure(work.failure),
@@ -887,7 +890,8 @@ function parseOverviewTask(value: unknown): OverviewTask {
     target_node: nullableText(data.target_node), dispatcher: nullableText(data.dispatcher), call_ref: nullableText(data.call_ref),
     work_kind: overviewWorkKind(data.work_kind) ?? overviewWorkKind(data.kind),
     parent: nullableText(data.parent), continues: nullableText(data.continues), thread: nullableText(data.thread), thread_id: nullableText(data.thread_id), turn_id: nullableText(data.turn_id),
-    phase: data.phase == null ? null : optionalPhase(data.phase) ?? null, reason: nullableText(data.reason ?? data.failure_reason), ...failure(data.failure), node, source: overviewSource(data.source),
+    phase: data.phase == null ? null : optionalPhase(data.phase) ?? null, reason: nullableText(data.reason ?? data.failure_reason),
+    dispatched_at_ms: data.dispatched_at_ms == null ? null : number(data.dispatched_at_ms), finished_at_ms: data.finished_at_ms == null ? null : number(data.finished_at_ms), ...failure(data.failure), node, source: overviewSource(data.source),
     navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, ...(workId ? { work_id: workId } : {}) } : null,
     ...(data.coordination_job === undefined ? {} : { coordination_job: data.coordination_job === null ? null : scopeJob(data.coordination_job) }),
   }
@@ -935,7 +939,7 @@ function parseOverviewCheck(value: unknown): OverviewTask {
   return {
     kind: "check", item_id: checkId, check_id: checkId, work_ids: workId ? [workId] : [], work_id: workId, conversation_id: conversationId, bot,
     title: "待确认", summary: trigger, cwd: "", state: "unknown", outcome: "unverified",
-    target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
+    target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null, dispatched_at_ms: null, finished_at_ms: null,
     reason, node: null, navigation: bot ? { bot_id: bot.bot_id, conversation_id: conversationId } : null, source: "local_check",
   }
 }
@@ -1006,6 +1010,7 @@ export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: re
       state, summary: task.summary, outcome, failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
+      ...(task.dispatched_at_ms === null ? {} : { dispatched_at_ms: task.dispatched_at_ms, finished_at_ms: task.finished_at_ms }),
       ...(task.coordination_job === undefined ? {} : { coordination_job: task.coordination_job }),
       ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
     })
