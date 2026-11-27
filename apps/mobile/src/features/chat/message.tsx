@@ -31,7 +31,7 @@ function Hold({ choose, children }: { choose: (() => void) | null; children: Rea
   return <Pressable accessible={false} onLongPress={choose ?? undefined}>{children}</Pressable>
 }
 
-/** In place of the time while delivery is not plain, as on the web: waiting, taken into the running reply, or its outcome. */
+/** Beside the time while delivery is not plain, as on the web: waiting, taken into the running reply, or its outcome. */
 function Delivery({ mark }: { mark: NonNullable<ReturnType<typeof deliveryMark>> }) {
   const unknown = mark.kind === 'unknown'
   return <View accessible accessibilityLabel={mark.label} className="flex-row items-center gap-1">
@@ -69,7 +69,7 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
       {attachments}
     </MessageBubble>
     {feedback}
-    {mark ? <Delivery mark={mark} /> : time}
+    {mark ? <View className="flex-row items-center gap-1.5"><Delivery mark={mark} />{time}</View> : time}
     {preferenceOpen ? <MemoryPreference key={message.event_hash} message={message} botId={bot.bot_id} onClose={() => setPreferenceOpen(false)} /> : null}
   </Rise>
   if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">

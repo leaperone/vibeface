@@ -240,7 +240,8 @@ export default function ChatScreen() {
     const current = reading.current
     if (!current.id || !routeActive.current) return
     const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item && current.knownMessages.get(item.message.message_id) === item.message.event_hash)
-    const observed = messages.filter((item) => !item.message.state).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
+    // Delivery marks are drawn onto held messages, which still count as seen; only unsent, streaming or interrupted ones do not.
+    const observed = messages.filter((item) => !item.message.state || ['queued', 'merging', 'merged'].includes(item.message.state)).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
     setVisible((previous) => previous.id === current.id && JSON.stringify(previous.messages) === JSON.stringify(observed) ? previous : { id: current.id ?? '', messages: observed })
     if (!restoration.current.done) return
     const anchor = messages.at(-1)?.message.message_id
