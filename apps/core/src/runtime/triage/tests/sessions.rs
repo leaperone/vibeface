@@ -87,7 +87,7 @@ async fn a_deleted_bots_sessions_go_to_the_primary_bot() -> Result<()> {
 
         assert_eq!(owner_of(&node, "s3").await?.as_deref(), Some("e"), "another bot's session stays");
         assert_eq!(owner_of(&node, "s1").await?, None, "a deleted bot follows nothing");
-        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？","choices":["修","不修"]});
         assert_eq!(
             node.triage_command(raise).await?["conversation_id"], "c",
             "an event queued before the deletion asks in the primary bot's chat"
@@ -168,7 +168,7 @@ async fn a_deleted_bots_work_thread_goes_to_the_primary_bot() -> Result<()> {
         );
         delete_bot(&node, &admin, "d").await?;
 
-        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+        let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？","choices":["修","不修"]});
         assert_eq!(
             node.triage_command(raise).await?["conversation_id"], "c",
             "a deleted bot's work thread asks in the primary bot's chat"
@@ -674,7 +674,7 @@ async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
             );
 
             let accepted = node.ingest_agent_event(turn("s1", "t5", "/w")).await?;
-            let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+            let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？","choices":["修","不修"]});
             let raised = node.triage_command(raise).await?;
             assert_eq!(raised["conversation_id"], "d");
             let question = {

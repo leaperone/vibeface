@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
+import type { BotRecord, InputTarget, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
@@ -38,6 +38,38 @@ export const declined = (answer: string) => /^(拒绝|不允许|不同意|不行
 export const ignoredAnswer = "忽略"
 /** How a settled answer reads: a bare refusal says only that; a refusal with words keeps them. */
 export const answerLabel = (answer: string) => answer.trim() === ignoredAnswer ? "已忽略" : declined(answer) ? /^(拒绝|不允许|不同意|不行|不要|否|取消|deny|decline|no)$/i.test(answer.trim()) ? "已拒绝" : `已拒绝 · ${answer}` : `已回答 · ${answer}`
+
+/** A request held for the person's approval: the Node answers it with its own actions, and any other answer declines it. */
+export const heldApproval = (question: Pick<Question, "about" | "choices">) => question.about.request_id !== undefined
+  && question.choices.some((choice) => choice.action === "allow_once" || choice.action === "deny")
+
+/** What a held approval's card says about its answers, the same on every screen. */
+export const approvalNote = "允许只对这次请求有效。拒绝、忽略或自己写回答都会拒绝这次请求，写下的话会作为下一条指令发给该会话。"
+
+/** An answer as the person reads it: an approval's own action by its name, anything else as written. */
+export function answerText(question: Pick<Question, "choices">, answer: string) {
+  const action = question.choices.find((choice) => choice.label === answer)?.action
+  return action === "allow_once" ? "允许本次" : action === "deny" ? "拒绝" : answer
+}
+
+/** What a settled card says and which mark it takes. On a held approval the person's own words decline it, so they read as a refusal. */
+export function settledLabel(question: Pick<Question, "about" | "choices">, answer: string): { label: string; mark: "ignored" | "declined" | "answered" } {
+  if (answer.trim() === ignoredAnswer) return { label: "已忽略", mark: "ignored" }
+  if (heldApproval(question) && !question.choices.some((choice) => choice.label === answer)) return { label: `已拒绝 · ${answer}`, mark: "declined" }
+  const text = answerText(question, answer)
+  return { label: answerLabel(text), mark: declined(text) ? "declined" : "answered" }
+}
+
+/**
+ * The person's own words on a held approval: the Node declines the request, then the words go to the session as the person's
+ * next instruction, through the question's input target or else its bot's main chat. Null for every other answer.
+ */
+export function approvalInstruction(question: Pick<Question, "about" | "choices" | "target" | "bot" | "conversation_id">, answer: string): { text: string; target: InputTarget; conversation_id: string } | null {
+  const text = answer.trim()
+  if (!heldApproval(question) || !text || text === ignoredAnswer || question.choices.some((choice) => choice.label === answer)) return null
+  const target = question.target ?? (question.bot ? { kind: "bot_main" as const, bot_id: question.bot.bot_id } : undefined)
+  return target ? { text, target, conversation_id: question.conversation_id } : null
+}
 
 /** Nobody answered it and the device that asked did not close it. */
 export const questionOpen = (question: Question) => question.answer === null && question.closed === null

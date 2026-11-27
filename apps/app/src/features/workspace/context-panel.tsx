@@ -10,6 +10,7 @@ import { changeTitle,formatWhen,scheduleFrequency } from "@vibeface/client/works
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { contextCoverageLabels,contextIndexLabels,contextInvalidation,contextStages,memoryConflictLabel,memoryOrigins,nativeSessionObservation,nodeName,schedulerStatus,shownState,taskLabel } from "@vibeface/client/workspace/labels.ts"
 import { memoryBase,memoryResultLabel,memorySaved,memorySyncConflictLabel,type MemoryControls } from "@vibeface/client/workspace/memory.ts"
+import { answerText,heldApproval } from "@vibeface/client/workspace/questions.ts"
 import { newId } from "@vibeface/client/workspace/storage.ts"
 import type { BotChange,BotRecord,BotSettings,ContextProjection,ConversationPayload,CoordinationCheck,MemoryBase,MemoryControlResult,NodeInfo,Question,WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
@@ -353,11 +354,12 @@ function profileField(field: string) {
 }
 
 function QuestionSummary({ question }: { question: Question }) {
-  const action = question.choices.find((choice) => choice.label === question.answer?.text)?.action
-  const answer = action === 'allow_once' ? '允许本次' : action === 'deny' ? '拒绝' : question.answer?.text
-  const settled = question.answer ? action === 'deny' ? '已拒绝' : "已回答" : question.closed ? "已失效" : "等待回答"
+  const answer = question.answer ? answerText(question, question.answer.text) : undefined
+  // A held approval's 忽略 or own words decline it, as its own 拒绝 does.
+  const refused = question.answer ? heldApproval(question) && answerText(question, question.answer.text) !== "允许本次" : false
+  const settled = question.answer ? refused ? '已拒绝' : "已回答" : question.closed ? "已失效" : "等待回答"
   return <li className="grid min-w-0 gap-1 rounded-control border bg-surface px-3 py-2">
-    <div className="flex min-w-0 items-center gap-2"><StatusPill tone={question.answer ? action === 'deny' ? 'danger' : "success" : question.closed ? "neutral" : "warning"} icon={question.answer ? action === 'deny' ? CircleX : CircleCheck : question.closed ? CircleX : CircleHelp}>{settled}</StatusPill><span className="min-w-0 truncate font-medium" title={question.text}>{question.text}</span></div>
+    <div className="flex min-w-0 items-center gap-2"><StatusPill tone={question.answer ? refused ? 'danger' : "success" : question.closed ? "neutral" : "warning"} icon={question.answer ? refused ? CircleX : CircleCheck : question.closed ? CircleX : CircleHelp}>{settled}</StatusPill><span className="min-w-0 truncate font-medium" title={question.text}>{question.text}</span></div>
     {question.answer ? <p className="line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{answer}</p> : null}
   </li>
 }

@@ -410,13 +410,25 @@ impl Runtime {
                 });
                 choices
             }
-            None => labels
-                .into_iter()
-                .map(|label| Choice {
-                    label: crate::logging::scrub(&label),
-                    action: None,
-                })
-                .collect(),
+            None => {
+                ensure!(
+                    (2..=3).contains(&labels.len()),
+                    "give two or three choices; the card already adds 忽略 and a line for the user's own answer"
+                );
+                ensure!(
+                    labels
+                        .iter()
+                        .all(|label| label.trim() != crate::store::triage::IGNORED_ANSWER),
+                    "every card already offers 忽略; give real alternatives"
+                );
+                labels
+                    .into_iter()
+                    .map(|label| Choice {
+                        label: crate::logging::scrub(&label),
+                        action: None,
+                    })
+                    .collect()
+            }
         };
         Ok(EventBody::QuestionAsked {
             question_id: triage::question_id(event.node(), event.event_id()),

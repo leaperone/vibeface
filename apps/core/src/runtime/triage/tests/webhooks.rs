@@ -306,6 +306,11 @@ async fn events_dedupe_and_questions_go_once_to_the_owner_and_signed_webhooks() 
 
         let event_id = first["event_id"].as_str().unwrap();
         let raise = json!({"action":"raise","event_id":event_id,"severity":"urgent","question":"测试失败，要修吗？","choices":["修","不修"]});
+        for choices in [json!([]), json!(["修"]), json!(["修","不修","明天修","换人修"]), json!(["修","忽略"])] {
+            let mut padded = raise.clone();
+            padded["choices"] = choices.clone();
+            assert!(node.triage_command(padded).await.is_err(), "{choices} is refused: a card takes two or three real choices");
+        }
         let raised = node.triage_command(raise.clone()).await?;
         assert_eq!((raised["asked"].clone(), raised["queued_webhook"].clone()), (json!(true), json!(true)));
         assert_eq!(node.triage_command(raise).await?, raised, "a repeated raise answers the same");
@@ -313,7 +318,7 @@ async fn events_dedupe_and_questions_go_once_to_the_owner_and_signed_webhooks() 
         let rest = |session: &str| {
             pending["events"].as_array().unwrap().iter().find(|e| e["session_id"] == session).unwrap()["event_id"].clone()
         };
-        let same_session = node.triage_command(json!({"action":"raise","event_id":rest("s1"),"severity":"info","question":"again"})).await?;
+        let same_session = node.triage_command(json!({"action":"raise","event_id":rest("s1"),"severity":"info","question":"again","choices":["修","不修"]})).await?;
         assert_eq!((same_session["asked"].clone(), same_session["question_id"].clone()), (json!(false), raised["question_id"].clone()),
             "an unanswered question about the session stands");
         let quiet = node.triage_command(json!({"action":"dismiss","event_id":rest("s2")})).await?;

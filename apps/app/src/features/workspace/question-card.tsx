@@ -10,7 +10,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel,approvalTask,attentionLabel,declined,ignoredAnswer,questionMeta,questionParts,settledAnswer,sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { answerText,approvalNote,approvalTask,attentionLabel,heldApproval,ignoredAnswer,questionMeta,questionParts,settledAnswer,settledLabel,sharedProject } from "@vibeface/client/workspace/questions.ts"
 import type { Question,Severity } from "@vibeface/client/workspace/types.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import buttonStyles from "@vibeface/uiarc/button/button.module.css"
@@ -41,20 +41,22 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const taskScope = inputTarget?.kind === 'task' || inputTarget?.kind === 'channel_task' ? inputTarget.task_id : null
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
-  const displayAnswer = (value: string) => { const choice = question.choices.find((choice) => choice.label === value); return choice?.action === 'allow_once' ? '允许本次' : choice?.action === 'deny' ? '拒绝' : value }
-  const approvalChoices = question.choices.filter((choice) => choice.action === 'allow_once' || choice.action === 'deny')
-  // The Node takes only an approval's own actions for a live request; 拒绝 clears it there.
-  const ignorable = !approvalChoices.length && !(question.attention?.kind === "approval" && question.about.request_id)
+  const displayAnswer = (value: string) => answerText(question, value)
+  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it, and those words then go to the session.
+  const held = heldApproval(question)
   const { ask, detail } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
   const heldTask = inTask ? null : approvalTask(question, [...workspace.openWorks, ...(workspace.data?.works ?? [])])
   const about = heldTask ? <span className="flex min-w-0 items-center gap-1"><ListChecks aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">任务 </span><span className="min-w-0 truncate">{heldTask}</span>
     <span aria-hidden="true">·</span><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">设备 </span><span className="min-w-0 truncate">{node}</span></span> : null
-  if (settled) return <Settled ask={ask} detail={detail} about={about} focus={answering.current} role={standing === undefined || settled.beaten ? "status" : undefined}
-    mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : settled.text.trim() === ignoredAnswer ? <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" /> : declined(displayAnswer(settled.text)) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
-    <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : answerLabel(displayAnswer(settled.text))}</span>
-  </Settled>
+  if (settled) {
+    const { label: settledText, mark } = settledLabel(question, settled.text)
+    return <Settled ask={ask} detail={detail} about={about} focus={answering.current} role={standing === undefined || settled.beaten ? "status" : undefined}
+      mark={settled.beaten ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : mark === "ignored" ? <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" /> : mark === "declined" ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+      <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${displayAnswer(settled.text)}` : settledText}</span>
+    </Settled>
+  }
 
   if (question.closed) return <Settled ask={ask} detail={detail} about={about} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>
 
@@ -76,7 +78,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   // Answered in 待处理, the card leaves; the toast leads to the chat the answer went to.
   const settledToast = (value: string) => {
     const bot = question.bot
-    toast(value === ignoredAnswer ? "已忽略" : "已回答", { tone: "success", action: inputTarget && (taskScope || bot) ? { label: "查看", onClick: () => {
+    const { mark } = settledLabel(question, value)
+    toast(mark === "ignored" ? "已忽略" : mark === "declined" && held ? "已拒绝" : "已回答", { tone: "success", action: inputTarget && (taskScope || bot) ? { label: "查看", onClick: () => {
       if (taskScope) void navigate({ to: '/tasks/$taskId', params: { taskId: taskScope } })
       else if (inputTarget?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: inputTarget.channel_id } })
       else if (bot && inputTarget?.kind === 'work') void navigate({ to: '/b/$botId/work/$workId', params: { botId: bot.bot_id, workId: inputTarget.work_id } })
@@ -89,7 +92,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
     <p className="text-sm text-secondary">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
-    {approvalChoices.length ? <p className="text-sm text-secondary">允许仅对这次请求有效；拒绝会结束该请求。</p> : null}
+    {held ? <p className="text-sm text-secondary">{approvalNote}</p> : null}
     {question.attention?.kind === 'browser_takeover' ? <p className="text-sm text-secondary">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines text={detail} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-sm text-secondary">
@@ -112,26 +115,24 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
       <span aria-hidden="true">·</span>{action.busy !== null ? "正在发送" : "没确认送达"}<span aria-hidden="true">·</span>
       <Button type="button" variant="ghost" disabled={disabled} aria-busy={action.busy === "retry" || undefined} onClick={() => void send("retry", pending.text)}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />再试</Button>
     </p> : <div className="grid gap-2">
-      {approvalChoices.length ? <div className="flex flex-wrap gap-2">{approvalChoices.map((choice) => <Button key={choice.label} type="button" variant={choice.action === 'allow_once' ? "primary" : "secondary"} disabled={disabled} aria-busy={action.busy === `permission:${choice.action}` || undefined} onClick={() => void send(`permission:${choice.action}`, choice.label)}><BusyIcon busy={action.busy === `permission:${choice.action}`} icon={choice.action === 'allow_once' ? CircleCheck : CircleX} />{choice.action === 'allow_once' ? '允许本次' : '拒绝'}</Button>)}</div> : <>
-        {/* As in agent tools, a choice's number picks it while one of the choices has focus; the group alone listens, so another card never answers. */}
-        {question.choices.length ? <div role="group" aria-label="选一个回答" aria-keyshortcuts={question.choices.slice(0, 9).map((_, index) => String(index + 1)).join(' ')} className="grid min-w-0 gap-2" onKeyDown={(event) => {
-          const index = Number(event.key) - 1
-          if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.nativeEvent.isComposing || !Number.isInteger(index) || index < 0 || index >= Math.min(9, question.choices.length)) return
-          event.preventDefault()
-          void send(`choice:${index}`, question.choices[index].label)
-        }}>
-          {/* Arc's button keeps its label on one centered line, so a choice uses its classes on a plain button to wrap from the start. */}
-          {question.choices.map((choice, index) => <button key={index} type="button" className={`${buttonStyles.button} ${buttonStyles.ghost} -mx-2 h-auto justify-start! whitespace-normal! px-2! py-2! text-start`} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
-            <span aria-hidden="true" className="flex w-4 shrink-0 justify-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
-            <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{choice.label}</span>
-          </button>)}
-        </div> : null}
-        <div className="flex min-w-0 items-end gap-2">
-          <div className="min-w-0 flex-1"><Textarea label="你的回答" aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-h-11! resize-none! [field-sizing:content]" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} /></div>
-          <Button type="button" size="md" className="shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
-        </div>
-      </>}
-      {ignorable ? <Button type="button" variant="ghost" className="justify-self-start" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button> : null}
+      {/* As in agent tools, a choice's number picks it while one of the choices has focus; the group alone listens, so another card never answers. */}
+      {question.choices.length ? <div role="group" aria-label="选一个回答" aria-keyshortcuts={question.choices.slice(0, 9).map((_, index) => String(index + 1)).join(' ')} className="grid min-w-0 gap-2" onKeyDown={(event) => {
+        const index = Number(event.key) - 1
+        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.nativeEvent.isComposing || !Number.isInteger(index) || index < 0 || index >= Math.min(9, question.choices.length)) return
+        event.preventDefault()
+        void send(`choice:${index}`, question.choices[index].label)
+      }}>
+        {/* Arc's button keeps its label on one centered line, so a choice uses its classes on a plain button to wrap from the start. */}
+        {question.choices.map((choice, index) => <button key={index} type="button" className={`${buttonStyles.button} ${buttonStyles.ghost} -mx-2 h-auto justify-start! whitespace-normal! px-2! py-2! text-start`} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
+          <span aria-hidden="true" className="flex w-4 shrink-0 justify-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
+          <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{displayAnswer(choice.label)}</span>
+        </button>)}
+      </div> : null}
+      <div className="flex min-w-0 items-end gap-2">
+        <div className="min-w-0 flex-1"><Textarea label="你的回答" aria-label="你的回答" rows={1} placeholder={question.choices.length ? "或者自己写回答" : "写下你的回答"} className="max-h-60 min-h-11! resize-none! [field-sizing:content]" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} /></div>
+        <Button type="button" size="md" className="shrink-0" aria-label="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "answer" || undefined} onClick={() => void send("answer", text)}><BusyIcon busy={action.busy === "answer"} icon={SendHorizontal} /></Button>
+      </div>
+      <Button type="button" variant="ghost" className="justify-self-start" disabled={disabled} aria-busy={action.busy === "ignore" || undefined} onClick={() => void send("ignore", ignoredAnswer)}><BusyIcon busy={action.busy === "ignore"} icon={X} />忽略</Button>
     </div>}
     <InlineError error={action.error} />
   </ActionCard>
