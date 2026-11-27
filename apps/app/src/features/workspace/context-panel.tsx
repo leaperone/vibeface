@@ -9,7 +9,7 @@ import { runtimeLabel } from "@vibeface/client/chat/protocol.ts"
 import { messageOf,providerNames } from "@vibeface/client/lib/node.ts"
 import { changeTitle,formatWhen,scheduleFrequency } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { contextCoverageLabels,contextIndexLabels,contextInvalidation,contextStages,memoryConflictLabel,memoryOrigins,nativeSessionObservation,nodeName,schedulerStatus,shownState,taskActive,taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { contextCoverageLabels,contextIndexLabels,contextInvalidation,contextStages,memoryConflictLabel,memoryOrigins,nativeSessionObservation,nodeName,schedulerStatus,shownState,taskLabel } from "@vibeface/client/workspace/labels.ts"
 import { memoryBase,memoryResultLabel,memorySaved,memorySyncConflictLabel,type MemoryControls } from "@vibeface/client/workspace/memory.ts"
 import { newId } from "@vibeface/client/workspace/storage.ts"
 import type { BotChange,BotRecord,BotSettings,ContextProjection,ConversationPayload,CoordinationCheck,MemoryBase,MemoryControlResult,NodeInfo,Question,WorkRecord } from "@vibeface/client/workspace/types.ts"
@@ -323,7 +323,7 @@ function WorkSummary({ work, botId, nodes }: { work: WorkRecord; botId: string; 
   return <li className="min-w-0 rounded-control border bg-surface px-3 py-2">
     <Link to="/b/$botId/work/$workId" params={{ botId, workId: work.work_id }} className="flex min-w-0 items-start gap-2 rounded-control outline-none  ">
       <StatusPill tone={workTone(state)} icon={workIcon(state)}>{taskLabel(state)}</StatusPill>
-      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{work.summary}</span> : null}<span className="block text-sm text-secondary"><Elapsed start={work.dispatched_at_ms} end={work.finished_at_ms} active={taskActive(state)} /></span></span>
+      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{work.summary}</span> : null}<span className="block text-sm text-secondary"><Elapsed start={work.dispatched_at_ms} end={work.finished_at_ms} active={false} /></span></span>
     </Link>
   </li>
 }

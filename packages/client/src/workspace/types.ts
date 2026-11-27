@@ -165,7 +165,7 @@ type WorkRelations = {
   thread: string | null
   phase: WorkPhase | null
   /** Author clocks of the dispatch and of the standing result; devices may skew. */
-  dispatched_at_ms: number
+  dispatched_at_ms: number | null
   finished_at_ms: number | null
 }
 export type WorkRecord = WorkFields & (

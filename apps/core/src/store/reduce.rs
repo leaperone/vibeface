@@ -722,17 +722,26 @@ pub(super) fn works_query(
             Some(EventBody::WorkProgress { phase, summary, .. }) => (Some(phase), summary),
             _ => (None, String::new()),
         };
-        let (outcome, result_text, failure_reason, failure) =
+        let (outcome, result_text, failure_reason, failure, reported) =
             match finish.map(|f| serde_json::from_str(&f)).transpose()? {
                 Some(EventBody::WorkFinished {
                     outcome,
                     result_text,
                     failure_reason,
                     failure,
+                    attestation,
                     ..
-                }) => (Some(outcome), result_text, failure_reason, failure),
-                _ => (None, String::new(), None, None),
+                }) => (
+                    Some(outcome),
+                    result_text,
+                    failure_reason,
+                    failure,
+                    attestation.is_none() && outcome != WorkOutcome::Unverified,
+                ),
+                _ => (None, String::new(), None, None, false),
             };
+        let (dispatched_at_ms, finished_at_ms) =
+            crate::store::work_times(&dispatch_rank, finish_rank.as_deref(), reported);
         works.push(WorkProjection {
             work_id,
             conversation_id,
@@ -758,12 +767,8 @@ pub(super) fn works_query(
             failure_reason,
             failure,
             state: WorkStatus::of(kind, phase, outcome),
-            dispatched_at_ms: crate::store::rank_time(&dispatch_rank).unwrap_or_default(),
-            // `finish_rank` leads with its precedence.
-            finished_at_ms: finish_rank
-                .as_deref()
-                .and_then(|rank| rank.split_once(':'))
-                .and_then(|(_, rank)| crate::store::rank_time(rank)),
+            dispatched_at_ms,
+            finished_at_ms,
         });
     }
     Ok(works)

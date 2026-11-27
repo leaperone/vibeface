@@ -219,7 +219,7 @@ mod workspace_overview_tests {
             failure_reason: None,
             failure: None,
             state: WorkStatus::Finished,
-            dispatched_at_ms: 0,
+            dispatched_at_ms: None,
             finished_at_ms: None,
         };
         let value = workspace_work_summary(&work, "dag");

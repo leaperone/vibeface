@@ -1450,8 +1450,8 @@ pub struct WorkProjection {
     pub failure_reason: Option<String>,
     pub failure: Option<FailureKind>,
     pub state: WorkStatus,
-    /// The dispatch's author clock; `finished_at_ms` is the target's, so the two may skew.
-    pub dispatched_at_ms: i64,
+    /// When the target took it and, for a result the target reported, when it ended; the target's clock.
+    pub dispatched_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
 }
 

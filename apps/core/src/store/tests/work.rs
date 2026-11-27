@@ -347,7 +347,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         .map(|w| (w.dispatched_at_ms, w.finished_at_ms));
     assert_eq!(
         times,
-        Some((3, Some(6))),
+        Some((Some(3), Some(6))),
         "times come from the standing events"
     );
 
@@ -409,6 +409,16 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
     assert_eq!(
         outcome(&store, &local.work_id)?,
         Some(WorkOutcome::Completed)
+    );
+    let times = store
+        .works(&net.network, "c")?
+        .into_iter()
+        .find(|w| w.work_id == local.work_id)
+        .map(|w| (w.dispatched_at_ms, w.finished_at_ms));
+    assert_eq!(
+        times,
+        Some((Some(7), None)),
+        "the user's settlement is not when the work ended"
     );
     assert!(
         store

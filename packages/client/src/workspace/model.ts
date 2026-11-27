@@ -592,7 +592,7 @@ function work(value: unknown): WorkRecord {
     dispatcher: text(data.dispatcher), call_ref: text(data.call_ref),
     continues: data.continues === null ? null : text(data.continues), parent: data.parent === null ? null : text(data.parent),
     thread: data.thread === null ? null : text(data.thread), phase: data.phase === null ? null : workPhase(data.phase),
-    dispatched_at_ms: number(data.dispatched_at_ms), finished_at_ms: data.finished_at_ms == null ? null : number(data.finished_at_ms) }
+    dispatched_at_ms: data.dispatched_at_ms == null ? null : number(data.dispatched_at_ms), finished_at_ms: data.finished_at_ms == null ? null : number(data.finished_at_ms) }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
 export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[] {
@@ -1010,7 +1010,7 @@ export function openWorksFromOverview(overview: WorkspaceOverview, openWorks: re
       state, summary: task.summary, outcome, failure_reason: task.reason, ...failure(task.failure), kind: task.work_kind ?? undefined,
       dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
       thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
-      ...(task.dispatched_at_ms === null ? {} : { dispatched_at_ms: task.dispatched_at_ms, finished_at_ms: task.finished_at_ms }),
+      dispatched_at_ms: task.dispatched_at_ms, finished_at_ms: task.finished_at_ms,
       ...(task.coordination_job === undefined ? {} : { coordination_job: task.coordination_job }),
       ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
     })

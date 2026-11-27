@@ -194,8 +194,23 @@ pub(crate) fn rank(lamport: u64, created_at_ms: i64, hash: &str) -> String {
 }
 
 /// The author's `created_at_ms` inside a `rank`.
-pub(crate) fn rank_time(rank: &str) -> Option<i64> {
+fn rank_time(rank: &str) -> Option<i64> {
     rank.split(':').nth(1)?.parse().ok()
+}
+
+/// When a work's target took it and when that target reported its result, both by the target's clock.
+/// A result it did not report, the user's settlement or another Node's unknown, gives no end.
+pub(crate) fn work_times(
+    dispatch_rank: &str,
+    finish_rank: Option<&str>,
+    reported: bool,
+) -> (Option<i64>, Option<i64>) {
+    let finished = finish_rank
+        .filter(|_| reported)
+        // `finish_rank` leads with its precedence.
+        .and_then(|rank| rank.split_once(':'))
+        .and_then(|(_, rank)| rank_time(rank));
+    (rank_time(dispatch_rank), finished)
 }
 
 /// What a client names to change a projected row: the start of the hash of the event that last

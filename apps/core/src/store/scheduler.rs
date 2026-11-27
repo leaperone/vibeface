@@ -1477,7 +1477,7 @@ mod trigger_boundary_tests {
             failure_reason: None,
             failure: None,
             state: WorkStatus::Accepted,
-            dispatched_at_ms: 0,
+            dispatched_at_ms: None,
             finished_at_ms: None,
         };
         for key in ["assignment:a:b", "task:", "schedule:s:-1", "work:"] {
