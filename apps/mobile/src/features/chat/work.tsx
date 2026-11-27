@@ -158,11 +158,13 @@ function DeferredQueue({ inputs }: { inputs: QueuedInput[] }) {
       if (action.kind === 'edit') setEditing(null)
     } catch (caught) { setError(messageOf(caught)) } finally { running.current = false; setBusy(null) }
   }
-  const button = (item: QueuedInput, action: InputControlAction, label: string, options: { icon?: LucideIcon; variant?: 'secondary' | 'ghost'; disabled?: boolean } = {}) => {
+  const lockedFor = (item: QueuedInput) => {
     const pending = shared?.pendingMessages.find((value) => value.message_id === item.input.message_id)
-    const locked = busy !== null || !shared?.writable || Boolean(pending?.receipt && ['submitting', 'provider_accepted', 'associated', 'unknown'].includes(pending.receipt.stage))
+    return busy !== null || !shared?.writable || Boolean(pending?.receipt && ['submitting', 'provider_accepted', 'associated', 'unknown'].includes(pending.receipt.stage))
+  }
+  const button = (item: QueuedInput, action: InputControlAction, label: string, options: { icon?: LucideIcon; variant?: 'secondary' | 'ghost'; disabled?: boolean } = {}) => {
     const mine = busy === `${item.input.message_id}:${label}`
-    return <Button key={label} variant={options.variant ?? 'ghost'} disabled={locked || options.disabled} onPress={() => void control(item, action, label)}>
+    return <Button key={label} variant={options.variant ?? 'ghost'} disabled={lockedFor(item) || options.disabled} onPress={() => void control(item, action, label)}>
       {mine ? <Icon as={LoaderCircle} /> : options.icon ? <Icon as={options.icon} /> : null}<Text>{label}</Text>
     </Button>
   }
@@ -177,7 +179,7 @@ function DeferredQueue({ inputs }: { inputs: QueuedInput[] }) {
       </>}><Textarea accessibilityLabel="编辑稍后输入" value={draft.text} maxLength={100000} onChangeText={(text) => setEditing({ id: draft.id, text })} /></ActionCard>
       return <ActionCard key={item.input.message_id} title="已保存，稍后处理" icon={Hourglass} actions={<>
         {button(item, { kind: 'release' }, '现在处理', { variant: 'secondary' })}
-        <Button variant="ghost" disabled={busy !== null || !shared?.writable} onPress={() => setEditing({ id: item.input.message_id, text: item.input.text })}><Text>编辑输入</Text></Button>
+        <Button variant="ghost" disabled={lockedFor(item)} onPress={() => setEditing({ id: item.input.message_id, text: item.input.text })}><Text>编辑输入</Text></Button>
         {button(item, { kind: 'cancel' }, '取消稍后输入')}
         {lane.length > 1 ? <>
           {button(item, { kind: 'move', before_message_id: lane[index - 1]?.input.message_id }, '上移', { icon: ArrowUp, disabled: index <= 0 })}
