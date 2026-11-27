@@ -64,13 +64,13 @@ export function PendingSection() {
   }
   if (!items.length) return null
   return <View className="gap-3">
-    <View className="flex-row flex-wrap items-center justify-between gap-2"><Text role="heading" className="px-1 text-lg font-medium">待处理</Text>{questions.length && shared ? <Button variant="secondary" disabled={!shared.writable || busy !== null} accessibilityLabel={`移出待处理（${questions.length}）`} onPress={() => void clearQuestions()}><Icon as={ListChecks} /><Text>移出待处理（{questions.length}）</Text></Button> : null}</View>
+    <View className="flex-row flex-wrap items-center justify-between gap-2"><Text role="heading" className="px-1 text-lg font-medium">待处理</Text>{questions.length && shared ? <Button variant="secondary" disabled={!shared.writable || busy !== null} onPress={() => void clearQuestions()}><Icon as={ListChecks} /><Text>移出待处理（{questions.length}）</Text></Button> : null}</View>
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} /> : null)}
     {inputs.length ? <View className="gap-3"><Text role="heading" className="px-1 text-sm font-medium text-muted">待确认</Text>{inputs.map((input) => <View key={input.message_id} className="gap-2"><Text numberOfLines={2} className="text-sm">{input.text}</Text><InputLocation target={input.target} conversationId={input.conversation_id} /><InputStatus pending={input} /></View>)}</View> : null}
     {attention.length ? <Text role="heading" className="mt-3 px-1 text-sm font-medium text-muted">更新</Text> : null}
     {attention.length && shared ? <View className="flex-row flex-wrap justify-end gap-2">
-      <Button variant="ghost" disabled={busy !== null} accessibilityLabel="忽略提醒" onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
-      <Button variant="secondary" disabled={busy !== null} accessibilityLabel="全部已读" onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
+      <Button variant="ghost" disabled={busy !== null} onPress={() => void run('ignore', async () => { shared.ignoreNotifications(attention.map((item) => item.notification.notification_id)) }, '已忽略提醒，仅此设备隐藏。')}><Icon as={EyeOff} /><Text>忽略提醒</Text></Button>
+      <Button variant="secondary" disabled={busy !== null} onPress={() => void run('read', async () => { await shared.markNotificationsRead(attention.map((item) => item.notification.notification_id)) }, '提醒已标记为已读。')}><Icon as={CheckCheck} /><Text>全部已读</Text></Button>
     </View> : null}
     {error ? <ErrorText error={error} /> : status ? <Text role="status" className="text-sm text-muted">{status}</Text> : null}
     {items.map((item) => item.kind === 'rotate' ? <RotateHintCard key={item.key} />

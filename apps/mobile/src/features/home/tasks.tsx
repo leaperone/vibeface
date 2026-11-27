@@ -140,7 +140,7 @@ function MobileMasthead({ filter, onFilter, ...counts }: Record<TaskGroup, numbe
 
 
 function MobileEmpty({ bot, read }: { bot?: Pick<BotRecord, 'bot_id' | 'name'>; read: boolean }) {
-  return <View className="items-center gap-3 px-6 py-12"><View className="size-16 items-center justify-center"><Icon as={ListChecks} className="size-6 text-muted" /></View><Text role="heading" className="text-center text-lg font-medium">{read ? '当前记录没有未完成的任务' : '任务状态尚未读取'}</Text><Text className="max-w-[300px] text-center text-sm text-muted">{read ? '这里展示当前设备已知的任务。Bot 的协作记录在上下文和协作中查看。' : '连接并完成首读后，才能确认是否有任务。'}</Text>{bot ? <Link href={`/b/${bot.bot_id}`} asChild><Button className="mt-2" accessibilityLabel={`打开 ${bot.name}`}><Text>打开 {bot.name}</Text><Icon as={ArrowUpRight} /></Button></Link> : null}</View>
+  return <View className="items-center gap-3 px-6 py-12"><Icon as={ListChecks} className="size-6 text-muted" /><Text role="heading" className="text-center text-lg font-medium">{read ? '当前记录没有未完成的任务' : '任务状态尚未读取'}</Text><Text className="max-w-[300px] text-center text-sm text-muted">{read ? 'Bot 的协作记录在上下文和协作中查看。' : '连接并完成首读后，才能确认是否有任务。'}</Text>{bot ? <Link href={`/b/${bot.bot_id}`} asChild><Button className="mt-2"><Text>打开 {bot.name}</Text><Icon as={ArrowUpRight} /></Button></Link> : null}</View>
 }
 
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
