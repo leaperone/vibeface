@@ -44,7 +44,7 @@ export const heldApproval = (question: Pick<Question, "about" | "choices">) => q
   && question.choices.some((choice) => choice.action === "allow_once" || choice.action === "deny")
 
 /** What a held approval's card says about its answers, the same on every screen. */
-export const approvalNote = "允许只对这次请求有效。拒绝、忽略或自己写回答都会拒绝这次请求，写下的话会作为下一条指令发给该会话。"
+export const approvalNote = "只允许这一次；忽略或自己写回答都算拒绝，写下的话会转给 Bot。"
 
 /** An answer as the person reads it: an approval's own action by its name, anything else as written. */
 export function answerText(question: Pick<Question, "choices">, answer: string) {
