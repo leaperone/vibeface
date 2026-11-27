@@ -171,6 +171,7 @@ test('stopped and interrupted replies are labelled; completed replies are not', 
   assert.equal(replyStatusLabel(undefined), '')
   assert.equal(replyStatusLabel('stopped'), '已中断')
   assert.equal(replyStatusLabel('interrupted'), '已中断')
+  assert.equal(replyStatusLabel('failed'), '失败')
 })
 
 test('retry requires explicit not-started evidence and an affirmative job receipt', () => {

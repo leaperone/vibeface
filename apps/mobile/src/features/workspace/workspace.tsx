@@ -7,7 +7,7 @@ import { AppState, Pressable, ScrollView, View } from 'react-native'
 import { KeyboardAwareScrollView, KeyboardStickyView, type KeyboardAwareScrollViewRef } from 'react-native-keyboard-controller'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { inputTargetKey, promptIntent } from '@vibeface/client/chat/protocol.ts'
+import { inputTargetKey, promptIntent, sameTarget } from '@vibeface/client/chat/protocol.ts'
 import { networkKey, newId, storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { ContextProjection, InputTarget, PendingMessage, ScopeContext, WorkspaceChannel, WorkspaceCommand, WorkspaceHistory, WorkspaceTask } from '@vibeface/client/workspace/types.ts'
 import { contextSourceLabels, contextSourceSummary, inputReceiptDescriptor, pendingInputLabel, workspaceTaskGroup, workspaceTaskStateDescriptor } from '@vibeface/client/workspace/presentation.ts'
@@ -201,11 +201,6 @@ function ChannelForm({ source, shared, isCurrent }: { source: ChannelSource; sha
       if (current() && isCurrent()) router.replace(`/channel/${command.channel_id}`)
     })}><Text>{busy ? '正在保存' : draft.kind === 'edit' ? '保存频道' : '创建频道'}</Text></Button>
   </KeyboardAwareScrollView>
-}
-
-function sameTarget(left: InputTarget, right: InputTarget) {
-  if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
-  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 export function InputLocation({ target, conversationId }: { target: InputTarget; conversationId: string }) {

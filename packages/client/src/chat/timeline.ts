@@ -1,6 +1,7 @@
 import { placeByTime } from "../workspace/questions.ts"
 import type { ManagerJob, NotificationRecord, WorkRecord } from "../workspace/types.ts"
 import { scheduleTrigger } from "../workspace/bot-settings.ts"
+import { replyStatusLabel } from "./protocol.ts"
 import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
@@ -17,8 +18,7 @@ export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readon
     id: message.message_id,
     text: message.text.trim().split('\n')[0]?.slice(0, 160) || '查看原回复',
     state: jobs.some((job) => job.reply_message_id === message.message_id && (job.pending_check || job.state === 'reconciling')) ? '结果待确认'
-      : message.status === 'completed' ? '已回复' : message.status === 'failed' ? '失败'
-      : message.status === 'stopped' || message.status === 'interrupted' ? '已中断' : '新回复',
+      : message.status === 'completed' ? '已回复' : replyStatusLabel(message.status) || '新回复',
   }))
 }
 
