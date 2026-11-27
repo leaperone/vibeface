@@ -306,7 +306,7 @@ async fn events_dedupe_and_questions_go_once_to_the_owner_and_signed_webhooks() 
 
         let event_id = first["event_id"].as_str().unwrap();
         let raise = json!({"action":"raise","event_id":event_id,"severity":"urgent","question":"测试失败，要修吗？","choices":["修","不修"]});
-        for choices in [json!([]), json!(["修"]), json!(["修","不修","明天修","换人修"]), json!(["修","忽略"])] {
+        for choices in [json!([]), json!(["修"]), json!(["修","不修","明天修","换人修"]), json!(["修","忽略"]), json!(["修"," 忽略 "]), json!(["修"," 修 "])] {
             let mut padded = raise.clone();
             padded["choices"] = choices.clone();
             assert!(node.triage_command(padded).await.is_err(), "{choices} is refused: a card takes two or three real choices");

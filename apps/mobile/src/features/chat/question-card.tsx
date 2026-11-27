@@ -4,7 +4,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { answerText, approvalNote, attentionLabel, approvalTask, heldApproval, ignoredAnswer, questionMeta, questionParts, settledAnswer, settledLabel, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { answerText, approvalNote, attentionLabel, approvalTask, ignoredAnswer, questionMeta, questionParts, settledAnswer, settledLabel, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import type { AnswerResult } from '@vibeface/client/workspace/types.ts'
 import { ArrowUp, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, Laptop, RotateCw, TriangleAlert, X, type LucideIcon } from 'lucide-react-native'
 import { useRef, useState } from 'react'
@@ -48,8 +48,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, shared?.answered[id] ?? result?.text, question.answer?.author, ready?.principal.device_id)
   const displayAnswer = (value: string) => answerText(question, value)
-  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it, and those words then go to the session.
-  const held = heldApproval(question)
+  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it and stay as the reason.
+  const note = approvalNote(question)
   const raced = result?.status === 'already_answered' && settled?.text === result.text && result.text !== attempted.current
   const elsewhere = settled?.elsewhere || raced
   const warned = settled?.beaten || raced
@@ -87,7 +87,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const { icon, tone } = looks[question.severity]
   return <ActionCard kind="approval" icon={approval ? Hand : icon} tone={tone} title={ask}>
     <Text className="text-sm text-muted">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${workspace.members.find((item) => item.device_id === question.attention?.device_id)?.name ?? '运行设备'}` : ''}</Text>
-    {held ? <Text className="text-sm text-muted">{approvalNote}</Text> : null}
+    {note ? <Text className="text-sm text-muted">{note}</Text> : null}
     {question.attention?.kind === 'browser_takeover' ? <Text className="text-sm text-muted">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</Text> : null}
     {detail ? <Text className="text-base">{detail}</Text> : null}
     {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
@@ -111,8 +111,9 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
     </View> : <View className="gap-2">
       {question.choices.map((choice, index) => <Button variant="ghost" key={index} accessibilityRole="button" accessibilityLabel={displayAnswer(choice.label)} accessibilityState={{ disabled, busy: busy === `choice:${index}` }} disabled={disabled} onPress={() => void send(`choice:${index}`, choice.label)}
         className={cn(row, 'active:bg-surface-muted', disabled && 'opacity-50')}>
-        {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className="w-4 text-center text-muted">{index + 1}</Text>}
-        <Text className="min-w-0 flex-1 font-medium">{displayAnswer(choice.label)}</Text>
+        {/* The one choice that approves a held request reads as the primary action. */}
+        {busy === `choice:${index}` ? <Icon as={LoaderCircle} className="mt-0.5 size-4 text-muted" /> : <Text className={cn('w-4 text-center', choice.action === 'allow_once' ? 'text-accent' : 'text-muted')}>{index + 1}</Text>}
+        <Text className={cn('min-w-0 flex-1 font-medium', choice.action === 'allow_once' && 'text-accent')}>{displayAnswer(choice.label)}</Text>
       </Button>)}
       <View className="flex-row items-end gap-2">
         <Textarea maxFontSizeMultiplier={2} accessibilityLabel="你的回答" placeholder={question.choices.length ? '或者自己写回答' : '写下你的回答'}

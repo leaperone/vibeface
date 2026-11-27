@@ -29,7 +29,7 @@ import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJo
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { answerLabel, attentionLabel, approvalTask, awaitsAnswer, declined, foldAnswers, ignoredAnswer, projectName, questionMeta, questionOpen, settledAnswer, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
+import { awaitsAnswer, foldAnswers, ignoredAnswer, projectName, questionOpen, sharedProject, questionParts } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
@@ -4979,7 +4979,8 @@ test('bound permission choices show readable actions and return their original s
     const readable = selected === 'allow_once' ? '允许本次' : '拒绝'
     const raw = selected === 'allow_once' ? labels.allow_once : labels.deny
     const press = () => {
-      const button = render().find(({ type, props }) => type === 'Button' && (props.accessibilityLabel === readable || componentText(props.children) === readable))
+      // A numbered row reads its number, then the action.
+      const button = render().find(({ type, props }) => (type === 'Button' || type === 'button') && (props.accessibilityLabel === readable || new RegExp(`^\\d?${readable}$`).test(componentText(props.children))))
       assert.ok(button)
       if (platform === 'web') { assert.ok(button.props.onClick); button.props.onClick() }
       else { assert.ok(typeof button.props.onPress === 'function'); button.props.onPress() }
@@ -4989,8 +4990,9 @@ test('bound permission choices show readable actions and return their original s
       assert.match(componentText(elements), /允许本次/)
       assert.match(componentText(elements), /拒绝/)
       assert.doesNotMatch(componentText(elements), /decision|accept|decline/)
-      assert.equal(elements.some(({ type }) => type === 'Textarea' || type === 'TextInput'), false)
-      assert.doesNotMatch(componentText(elements), /忽略/, 'a held approval takes only its own actions')
+      assert.equal(elements.some(({ type }) => type === 'Textarea' || type === 'TextInput'), true, 'a held approval also offers a written answer')
+      assert.match(componentText(elements), /忽略/, 'a held approval also offers 忽略')
+      assert.match(componentText(elements), /只允许这一次；忽略或自己写回答都算拒绝。/)
       shared.writable = false; press(); assert.equal(sent.length, 0)
       shared.writable = true; press(); assert.deepEqual(sent, [raw])
       shared.pendingAnswers = [{ question_id: question.question_id, text: raw }]
@@ -5001,6 +5003,8 @@ test('bound permission choices show readable actions and return their original s
       shared.answered = { [question.question_id]: raw }
       assert.match(componentText(render()), selected === 'allow_once' ? /已回答 · 允许本次/ : /已拒绝/)
       assert.doesNotMatch(componentText(render()), /decision|accept|decline/)
+      shared.answered = { [question.question_id]: '先跑测试' }
+      assert.match(componentText(render()), /已拒绝 · 先跑测试/, 'written words on a held approval read as the reason for a refusal')
     } finally { app.close() }
   }
 })
@@ -5014,7 +5018,7 @@ test("question cards send a choice on tap, send written text from the last line,
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/arc/product-kit': kit, '@tanstack/react-router': router })
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@/components/arc/product-kit': kit, '@tanstack/react-router': router })
   const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
   const question = { target: { kind: 'bot_main', bot_id: 'bot' }, question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
   const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
@@ -5107,7 +5111,7 @@ test("a question without choices offers only the answer line and 忽略", () => 
     '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ writable: true, nodes: [], answered: {}, pendingAnswers: [], bots: [], openWorks: [] }) },
     '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
     '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
-    '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
+    '@vibeface/client/workspace/questions.ts': workspaceQuestions,
     '@/components/arc/product-kit': { useAction: () => ({ busy: null, error: null }) },
     '@tanstack/react-router': { useNavigate: () => () => {} },
   })
@@ -5129,7 +5133,7 @@ test("mobile questions send a choice on tap, preserve literal text, ignore on de
       '@/data/context': { useWorkspace: () => ({ members: [], bots: [], actions: { answer: (...args: unknown[]) => { sent.push(args); return hold.promise } } }) },
       '@/data/live': { useLive: () => shared },
       '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'mobile', source: 'membership', can_manage: false } } }) },
-      '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
+      '@vibeface/client/workspace/questions.ts': workspaceQuestions,
       '@vibeface/client/lib/errors.ts': errors,
       'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
       '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
@@ -5193,7 +5197,7 @@ test("remounted question cards identify the answer author and reserve warning st
         '@/data/live': { useLive: () => shared },
         '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { principal: { device_id: 'self', source: 'membership', can_manage: false } } }) },
         '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
-        '@vibeface/client/workspace/questions.ts': { answerLabel, attentionLabel, approvalTask, declined, ignoredAnswer, questionMeta, questionParts, settledAnswer, sharedProject },
+        '@vibeface/client/workspace/questions.ts': workspaceQuestions,
         '@/components/arc/product-kit': { useAction: () => ({ busy: null, error: null }) },
         '@tanstack/react-router': { useNavigate: () => () => {} },
       })

@@ -28,7 +28,7 @@
 
 1. Node 给请求分配 `request_id`，挂起并记入 `node.log`（方法和线程，不含命令文本），然后作为 `needs_input` 事件（带 `request_id`）立即唤醒本机协调 Agent。事件只含方法、原因和问题，命令、补丁和路径不进事件。
 2. Agent 用 `vibeface requests` 查看挂起的请求（含完整参数），用 `vibeface respond <request_id> '<result-json>'` 回答。只有仍在待处理队列、且没有已提问 `question_id` 的请求能这样回答；同一 `request_id` 只回答一次，重复调用返回第一次的结果。
-3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题>` 在负责该线程的 Bot 聊天里提问。挂起的审批只用 Node 给出的“允许本次”（原请求支持时）和“拒绝”，`--choice` 只用于普通提问，必须给 2 到 3 个。提问挂住请求直到有回答，不设超时。本人回答保存为签名消息后，持有原请求的 Node 领取一条独立的私有回答控制（计入分诊次数，但不受 `daily_decision_limit` 预算暂停影响），在新的协调会话里核验原请求、传输代次、权限和响应 schema，只向仍活跃的原请求应答一次；它不进入 Bot 的 Main/Task 回合，Agent 不能用 `respond` 替本人回答已提问的请求，结果未知时不重放。线程不属于任何 Bot 时立即兜底。
+3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题>` 在负责该线程的 Bot 聊天里提问。挂起的审批只用 Node 给出的“允许本次”（原请求支持时）和“拒绝”，`--choice` 不用于挂起的审批；不带 `--request-id` 的普通提问必须给 2 到 3 个互不相同的选项。提问挂住请求直到有回答，不设超时。本人回答保存为签名消息后，持有原请求的 Node 领取一条独立的私有回答控制（计入分诊次数，但不受 `daily_decision_limit` 预算暂停影响），在新的协调会话里核验原请求、传输代次、权限和响应 schema，只向仍活跃的原请求应答一次；它不进入 Bot 的 Main/Task 回合，Agent 不能用 `respond` 替本人回答已提问的请求，结果未知时不重放。线程不属于任何 Bot 时立即兜底。
 4. 没有配置协调 Agent、唤醒失败，或 Agent 120 秒内既没回答也没提问时，Node 按方法给出确定的拒绝并记录：
 
 | 请求 | 兜底回复 |
@@ -206,7 +206,7 @@ Core 封装后的存储与脱敏输出格式（普通事件 schema_version 1）�
 
 ## 5. 回答回到会话
 
-回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，或用 `vibeface respond <请求> '<json>' --node <设备>` 应答挂起的请求，重试只回读。
+回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。普通问题的回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，重试只回读。挂起请求的回答按第 3 步沿私有回答控制只应答原请求一次；挂起的审批只有“允许本次”批准，“拒绝”、“忽略”和自己写的话（含 Grok 的 `text`）都按拒绝递交，文字只作为拒绝理由留在回答里，不另发给会话。
 
 Grok Bot 用 HTTPS 调 webhook 正文里的 `answer.url`（即 `triage_settings` 的 `decision_url`）：`POST <answer.url>`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。`forwarding.any` 的公共节点不校验令牌也不核对成员，经 iroh 的 `vibeface/decision/1` 按设备编号经 mesh 转给任一目标设备。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的只转给当前成员 Node，非成员目标拒绝。`answer.url` 是 `<public_url>/api/decision`；`public_url` 不是公网 HTTPS 时，改用默认 bootstrap 节点（`config/public-bootstrap.json` 的 `issuer`）在 mesh 记录里公告、且 `/api/info` 验证为该设备的网关，即 `https://node.vibeface.dev:4792/api/decision`；验证不过就仍用 `public_url`。答复带着决定令牌，所以从不改用其他设备公告的网关。令牌错误返回 401。每台 Node 同时最多处理 16 个 decision 请求，每分钟最多记 256 个来源、每来源 12 次（IPv6 按 /56 计），超出回 429，来源按 [node.md](../node.md) 的 `--trusted-proxy` 规则认定。
 

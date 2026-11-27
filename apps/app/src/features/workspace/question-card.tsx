@@ -42,8 +42,9 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const standing = question.answer?.text ?? answer
   const settled = settledAnswer(standing, workspace.answered[id], question.answer?.author, ready?.principal.device_id)
   const displayAnswer = (value: string) => answerText(question, value)
-  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it, and those words then go to the session.
+  // A held approval takes the Node's own actions; 忽略 or the person's own words decline it and stay as the reason.
   const held = heldApproval(question)
+  const note = approvalNote(question)
   const { ask, detail } = questionParts(question.text)
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   // Read back later, an answered approval says which task on which device it settled.
@@ -92,7 +93,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
     <p className="text-sm text-secondary">{attentionLabel(question)}{question.attention?.device_id ? ` · 处理设备 ${nodeName(question.attention.device_id, { nodes: workspace.nodes, directory })}` : ''}</p>
-    {held ? <p className="text-sm text-secondary">{approvalNote}</p> : null}
+    {note ? <p className="text-sm text-secondary">{note}</p> : null}
     {question.attention?.kind === 'browser_takeover' ? <p className="text-sm text-secondary">请在运行设备的浏览器中完成操作，确认结果后再回来回答。</p> : null}
     <Lines text={detail} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-sm text-secondary">
@@ -124,8 +125,9 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
       }}>
         {/* Arc's button keeps its label on one centered line, so a choice uses its classes on a plain button to wrap from the start. */}
         {question.choices.map((choice, index) => <button key={index} type="button" className={`${buttonStyles.button} ${buttonStyles.ghost} -mx-2 h-auto justify-start! whitespace-normal! px-2! py-2! text-start`} disabled={disabled} aria-busy={action.busy === `choice:${index}` || undefined} onClick={() => void send(`choice:${index}`, choice.label)}>
-          <span aria-hidden="true" className="flex w-4 shrink-0 justify-center tabular-nums text-secondary">{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
-          <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">{displayAnswer(choice.label)}</span>
+          {/* The one choice that approves a held request reads as the primary action. */}
+          <span aria-hidden="true" className={`flex w-4 shrink-0 justify-center tabular-nums ${choice.action === "allow_once" ? "text-accent-strong" : "text-secondary"}`}>{action.busy === `choice:${index}` ? <BusyIcon busy /> : index + 1}</span>
+          <span className={`min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere] ${choice.action === "allow_once" ? "font-medium text-accent-strong" : ""}`}>{displayAnswer(choice.label)}</span>
         </button>)}
       </div> : null}
       <div className="flex min-w-0 items-end gap-2">

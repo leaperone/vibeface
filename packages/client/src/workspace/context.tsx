@@ -28,7 +28,7 @@ import { createConversationCache } from "./conversation-cache.ts"
 import { ConversationReadOwner, markVisibleMessagesRead, readConversationSnapshot } from "./conversation-read.ts"
 import type { ValidatedSnapshot } from "./conversation-snapshot.ts"
 import { notificationPreferences, notificationPreview, systemNotifications } from "./system-notifications.ts"
-import { answerId, approvalInstruction, questionInboxDismissible, questionInboxKey } from "./questions.ts"
+import { answerId, questionInboxDismissible, questionInboxKey } from "./questions.ts"
 import { memoryController, memoryResultLabel, memorySaved } from "./memory.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
@@ -1742,13 +1742,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       await outboxChanged()
       setAnswered((previous) => ({ ...previous, [question.question_id]: result.text }))
       scheduleRefresh()
-      // The person's own words declined a held approval; they go on to the session as the next instruction, saved once like any input.
-      const instruction = result.status === "answered" ? approvalInstruction(question, result.text) : null
-      if (instruction) {
-        const forward = (): Promise<unknown> => sendMessage(instruction.text, [], [], { target: instruction.target, conversation_id: instruction.conversation_id })
-          .catch((caught) => showError(caught, "把这段话发给会话", () => void forward()))
-        await forward()
-      }
       return result
     }),
     /** A work waiting for the person, from any conversation: their signed choice settles it. */

@@ -411,16 +411,26 @@ impl Runtime {
                 choices
             }
             None => {
-                ensure!(
-                    (2..=3).contains(&labels.len()),
-                    "give two or three choices; the card already adds 忽略 and a line for the user's own answer"
-                );
-                ensure!(
-                    labels
-                        .iter()
-                        .all(|label| label.trim() != crate::store::triage::IGNORED_ANSWER),
-                    "every card already offers 忽略; give real alternatives"
-                );
+                // A plain question offers two or three real alternatives; the card adds 忽略 and a
+                // written answer. A held request keeps the labels its own question needs.
+                if request_id.is_none() {
+                    ensure!(
+                        (2..=3).contains(&labels.len()),
+                        "give two or three choices; the card already adds 忽略 and a line for the user's own answer"
+                    );
+                    let mut seen = std::collections::HashSet::new();
+                    for label in &labels {
+                        let label = label.trim();
+                        ensure!(
+                            label != crate::store::triage::IGNORED_ANSWER,
+                            "every card already offers 忽略; give real alternatives"
+                        );
+                        ensure!(
+                            seen.insert(label),
+                            "each choice must differ from the others"
+                        );
+                    }
+                }
                 labels
                     .into_iter()
                     .map(|label| Choice {

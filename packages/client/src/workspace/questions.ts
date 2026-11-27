@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, InputTarget, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, Question, WorkCard, WorkRecord } from "./types.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
@@ -43,8 +43,9 @@ export const answerLabel = (answer: string) => answer.trim() === ignoredAnswer ?
 export const heldApproval = (question: Pick<Question, "about" | "choices">) => question.about.request_id !== undefined
   && question.choices.some((choice) => choice.action === "allow_once" || choice.action === "deny")
 
-/** What a held approval's card says about its answers, the same on every screen. */
-export const approvalNote = "只允许这一次；忽略或自己写回答都算拒绝，写下的话会转给 Bot。"
+/** What a held approval's card says about its answers, the same on every screen; none when it cannot be allowed at all. */
+export const approvalNote = (question: Pick<Question, "about" | "choices">) => heldApproval(question) && question.choices.some((choice) => choice.action === "allow_once")
+  ? "只允许这一次；忽略或自己写回答都算拒绝。" : null
 
 /** An answer as the person reads it: an approval's own action by its name, anything else as written. */
 export function answerText(question: Pick<Question, "choices">, answer: string) {
@@ -58,17 +59,6 @@ export function settledLabel(question: Pick<Question, "about" | "choices">, answ
   if (heldApproval(question) && !question.choices.some((choice) => choice.label === answer)) return { label: `已拒绝 · ${answer}`, mark: "declined" }
   const text = answerText(question, answer)
   return { label: answerLabel(text), mark: declined(text) ? "declined" : "answered" }
-}
-
-/**
- * The person's own words on a held approval: the Node declines the request, then the words go to the session as the person's
- * next instruction, through the question's input target or else its bot's main chat. Null for every other answer.
- */
-export function approvalInstruction(question: Pick<Question, "about" | "choices" | "target" | "bot" | "conversation_id">, answer: string): { text: string; target: InputTarget; conversation_id: string } | null {
-  const text = answer.trim()
-  if (!heldApproval(question) || !text || text === ignoredAnswer || question.choices.some((choice) => choice.label === answer)) return null
-  const target = question.target ?? (question.bot ? { kind: "bot_main" as const, bot_id: question.bot.bot_id } : undefined)
-  return target ? { text, target, conversation_id: question.conversation_id } : null
 }
 
 /** Nobody answered it and the device that asked did not close it. */

@@ -223,8 +223,8 @@ fn answer_input_from(
 pub(crate) const IGNORED_ANSWER: &str = "忽略";
 
 /// What a held approval's answer sends to its request. Only the choice carrying the Node's
-/// one-time action approves; 忽略 or the user's own words decline it, and the client then
-/// sends those words to the session as the user's next instruction.
+/// one-time action approves; 忽略 or the user's own words decline it, and those words stay
+/// only in the recorded answer as the reason.
 pub(crate) fn approval_answer_result(
     question: &Value,
     text: &str,
