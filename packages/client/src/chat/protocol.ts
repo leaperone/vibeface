@@ -3,7 +3,7 @@ import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 import { failureText, outcomeUnknown } from '../lib/errors.ts'
 import { providerNames } from '../lib/node.ts'
-import type { InputIntent, InputTarget, ManagerJob, ProviderStage, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
+import type { InputIntent, InputTarget, ManagerJob, ProviderStage, SteerOutcome, TurnRuntime, NodeInfo, WorkspaceCommand, WorkspaceInputBody } from '../workspace/types.ts'
 import type { FailureKind } from '../lib/errors.ts'
 
 /** Examples fill an editable draft; they never send or grant permission. */
@@ -119,6 +119,11 @@ export function prepareSend(input: {
     report_results: pending.report_results,
   } }
 }
+/** Whether two inputs wait in the same deferred lane: a task's lane is the same in its channel. */
+export function sameTarget(left: InputTarget, right: InputTarget) {
+  if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
+  return JSON.stringify(left) === JSON.stringify(right)
+}
 export function inputTargetKey(target: InputTarget): string {
   switch (target.kind) {
     case 'bot_main': return JSON.stringify([target.kind, target.bot_id])
@@ -149,6 +154,15 @@ const beforeStart = new Set<FailureKind>(['missing_key', 'missing_binary', 'exec
 export function retryText(text: string, failure: FailureKind | undefined, traces: boolean): string {
   if (failure && beforeStart.has(failure) && !traces) return text
   return `上次没回完，可能已经做了一部分。先看看做过什么，做过的不要重做，再接着完成${text.trim() ? `：\n${text}` : '。'}`
+}
+const mergedLabels: Record<SteerOutcome, string> = { answered: '关联回合已完成', unfinished: '关联回合未完成', unknown: '补充结果未知' }
+/** What a sent message's mark says; `unknown` when a supplement's outcome is not known. Null once it is plainly delivered. */
+export function deliveryMark(state: string | undefined, merged?: SteerOutcome): { label: string; kind: 'wait' | 'merge' | 'unknown' } | null {
+  if (state === 'sending') return { label: '正在确认送达', kind: 'wait' }
+  if (state === 'queued') return { label: '已排队', kind: 'wait' }
+  if (state === 'merging') return { label: '已登记为回合补充', kind: 'merge' }
+  if (state === 'merged') return { label: mergedLabels[merged ?? 'unknown'], kind: (merged ?? 'unknown') === 'unknown' ? 'unknown' : 'merge' }
+  return null
 }
 export function replyStatusLabel(status: string | undefined): string {
   if (status === 'stopped') return '已中断'

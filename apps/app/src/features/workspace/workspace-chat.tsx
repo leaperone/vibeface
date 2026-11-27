@@ -6,7 +6,7 @@ import { ResultFeedback } from '@/features/chat/elements/result-feedback'
 import '@/features/chat/chat.css'
 import { webPlatform } from '@/lib/platform'
 import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
-import { inputTargetKey,promptIntent } from '@vibeface/client/chat/protocol.ts'
+import { inputTargetKey,promptIntent,sameTarget } from '@vibeface/client/chat/protocol.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
@@ -31,11 +31,6 @@ function subscribeContextWidth(change: () => void) {
   const query = window.matchMedia(narrowContextQuery)
   query.addEventListener('change', change)
   return () => query.removeEventListener('change', change)
-}
-
-function sameTarget(left: InputTarget, right: InputTarget) {
-  if ((left.kind === 'task' || left.kind === 'channel_task') && (right.kind === 'task' || right.kind === 'channel_task')) return left.task_id === right.task_id
-  return JSON.stringify(left) === JSON.stringify(right)
 }
 
 export function InputTargetLink({ target, conversationId }: { target: InputTarget; conversationId: string }) {

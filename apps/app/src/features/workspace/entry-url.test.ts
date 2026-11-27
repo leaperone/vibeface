@@ -34,7 +34,7 @@ import * as errors from "@vibeface/client/lib/errors.ts"
 import { joinDestination } from '@vibeface/client/identity/switch-network.ts'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
-import { messageKey, replyStatusLabel, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, starterExamples, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
+import { deliveryMark, messageKey, replyStatusLabel, sameTarget, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, awaitsDevice, botReach, botCanSend, canRetryJob, replyUnsettled, runtimeLabel, canSend, composerHint, starterExamples, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
 import { addDeviceCopy, deviceCopy, joinCopy, offlineCopy, setUpOnManager, waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, chatUpdates, firstUnread, messageTimes, taskMessage } from "@vibeface/client/chat/timeline.ts"
 import { accessOf } from "@vibeface/client/identity/access.ts"
@@ -2183,7 +2183,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/workspace/memory.ts') return preferenceMemory
     if (specifier === '@vibeface/client/workspace/feedback.ts') return resultFeedback
-    if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, ...dependencies[specifier] as object }
+    if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, deliveryMark, sameTarget, ...dependencies[specifier] as object }
     if (specifier === '@/features/chat/memory-summary') {
       const filename = fileURLToPath(new URL('../../../../../apps/mobile/src/features/chat/memory-summary.tsx', import.meta.url))
       const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText

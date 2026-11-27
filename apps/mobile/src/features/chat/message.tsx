@@ -1,4 +1,5 @@
-import { Bot, CirclePause, CircleX, Clock, RotateCcw } from 'lucide-react-native'
+import { Bot, CirclePause, CircleQuestionMark, CircleX, Clock, Merge, RotateCcw } from 'lucide-react-native'
+import { deliveryMark } from '@vibeface/client/chat/protocol.ts'
 import { memo, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
@@ -30,6 +31,15 @@ function Hold({ choose, children }: { choose: (() => void) | null; children: Rea
   return <Pressable accessible={false} onLongPress={choose ?? undefined}>{children}</Pressable>
 }
 
+/** Beside the time while delivery is not plain, as on the web: waiting, taken into the running reply, or its outcome. */
+function Delivery({ mark }: { mark: NonNullable<ReturnType<typeof deliveryMark>> }) {
+  const unknown = mark.kind === 'unknown'
+  return <View accessible accessibilityLabel={mark.label} className="flex-row items-center gap-1">
+    <Icon as={unknown ? CircleQuestionMark : mark.kind === 'merge' ? Merge : Clock} className={unknown ? 'text-warning' : 'text-muted'} />
+    {unknown ? <Text className="text-sm text-warning">未确认</Text> : null}
+  </View>
+}
+
 /** A screen-reader-only button after the message, since VoiceOver exposes actions only on elements it can focus. */
 function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
   return choose ? <Pressable accessibilityRole="button" accessibilityLabel="消息操作" accessibilityHint="复制、分享或引用" onPress={choose} className="absolute size-px overflow-hidden" /> : null
@@ -43,6 +53,7 @@ function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
  */
 export const Message = memo(function Message({ message, bot, time: shown, offline, retry, attachmentScope, readAttachment, onCopy, onShare, onQuote, remember = false, conversationId }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown>; attachmentScope?: string; readAttachment?: ReadAttachment; remember?: boolean; conversationId?: string } & MessageActionsProps) {
   const user = message.role === 'user'
+  const mark = user ? deliveryMark(message.state, message.merged) : null
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
   const cause = failed ? replyFailure(message.failure, message.detail) : failureText(message.failure)
@@ -58,7 +69,7 @@ export const Message = memo(function Message({ message, bot, time: shown, offlin
       {attachments}
     </MessageBubble>
     {feedback}
-    {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted" /> : time}
+    {mark ? <View className="flex-row items-center gap-1.5"><Delivery mark={mark} />{time}</View> : time}
     {preferenceOpen ? <MemoryPreference key={message.event_hash} message={message} botId={bot.bot_id} onClose={() => setPreferenceOpen(false)} /> : null}
   </Rise>
   if (message.role === 'bot') return <Rise entering={entering} className="max-w-[85%] items-start gap-1">

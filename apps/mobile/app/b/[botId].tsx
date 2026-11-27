@@ -35,7 +35,7 @@ import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useInbox, useLive, useOpenNotificationConversation } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
-import type { InputIntent, InputTarget, Question } from '@vibeface/client/workspace/types.ts'
+import type { InputIntent, InputTarget, ManagerJob, Question } from '@vibeface/client/workspace/types.ts'
 import type { ReadAttachment } from '@/features/chat/attachments'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
@@ -67,8 +67,18 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
  * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
  * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
  */
-function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean): Entry[] {
+/** As on the web: a message sent while the bot replies waits behind it, or is taken into the running turn; a merged one keeps the outcome. */
+function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: boolean): ChatMessage {
+  if (message.role !== 'user' || message.state) return message
+  const own = jobs.filter((job) => job.message_id === message.message_id)
+  if (replying && own.some((job) => ['pending_delivery', 'queued', 'steering'].includes(job.state))) return { ...message, state: own.some((job) => job.state === 'steering') ? 'merging' : 'queued' }
+  const steered = own.find((job) => job.state === 'steered')
+  return steered ? { ...message, state: 'merged', merged: steered.outcome } : message
+}
+
+function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean, jobs: readonly ManagerJob[]): Entry[] {
   const rows: Entry[] = []
+  const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
   const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
@@ -86,7 +96,7 @@ function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: 
     rows.push(...(chat.before.get(message.message_id) ?? []).map(question))
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.time && previous.message.role === message.role
-    if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message, time: times.get(message.message_id), grouped })
+    if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message: delivered(message, jobs, replying), time: times.get(message.message_id), grouped })
     rows.push(...(failures.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   }
   rows.push(...chat.rest.map(question))
@@ -218,7 +228,8 @@ export default function ChatScreen() {
   const offline = unreachable(device.link)
   // Times say the date once it is no longer today, so a new day builds the rows again too.
   const day = new Date().toDateString()
-  const listed = useMemo(() => chat && bot ? entries(chat, extras.failures, bot, offline) : [], [chat, extras.failures, bot, offline, day])
+  const jobs = live && live.conversationId === id ? live.data?.scheduler?.jobs : undefined
+  const listed = useMemo(() => chat && bot ? entries(chat, extras.failures, bot, offline, jobs ?? []) : [], [chat, extras.failures, bot, offline, day, jobs])
   const history = live && live.conversationId === id ? live.data?.history : undefined
   const rows: Entry[] = history && live && (!history.messages.complete || !history.questions.complete) ? [...listed, { key: 'history-controls', node: <HistoryControls key={`${live.generation}:${id}`} workspace={live} sections={['messages', 'questions']} /> }] : listed
   const [visible, setVisible] = useState<{ id: string; messages: VisibleChatMessage[] }>({ id: '', messages: [] })
@@ -229,7 +240,8 @@ export default function ChatScreen() {
     const current = reading.current
     if (!current.id || !routeActive.current) return
     const messages = event.viewableItems.filter((token) => token.isViewable && 'message' in token.item).map((token) => token.item).filter((item): item is Extract<Entry, { message: ChatMessage }> => 'message' in item && current.knownMessages.get(item.message.message_id) === item.message.event_hash)
-    const observed = messages.filter((item) => !item.message.state).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
+    // Delivery marks are drawn onto held messages, which still count as seen; only unsent, streaming or interrupted ones do not.
+    const observed = messages.filter((item) => !item.message.state || ['queued', 'merging', 'merged'].includes(item.message.state)).map((item) => ({ message_id: item.message.message_id, event_hash: item.message.event_hash }))
     setVisible((previous) => previous.id === current.id && JSON.stringify(previous.messages) === JSON.stringify(observed) ? previous : { id: current.id ?? '', messages: observed })
     if (!restoration.current.done) return
     const anchor = messages.at(-1)?.message.message_id
