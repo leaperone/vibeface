@@ -165,8 +165,7 @@ export function deliveryMark(state: string | undefined, merged?: SteerOutcome): 
   return null
 }
 export function replyStatusLabel(status: string | undefined): string {
-  if (status === 'stopped') return '已中断'
-  if (status === 'interrupted') return '已中断'
+  if (status === 'stopped' || status === 'interrupted') return '已中断'
   if (status === 'failed') return '失败'
   return ''
 }

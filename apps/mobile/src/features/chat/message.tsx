@@ -1,5 +1,5 @@
 import { Bot, CirclePause, CircleQuestionMark, CircleX, Clock, Merge, RotateCcw } from 'lucide-react-native'
-import { deliveryMark } from '@vibeface/client/chat/protocol.ts'
+import { deliveryMark, replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
 import { memo, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
@@ -20,8 +20,6 @@ import { MemoryPreference } from './memory-preference'
 const Rise = withUniwind(Animated.View)
 // As on the web: a new message rises 5px into place once.
 const rise = FadeInDown.duration(settle).easing(easeOut).withInitialValues({ transform: [{ translateY: 5 }] }).reduceMotion(ReduceMotion.System)
-
-const ended: Record<string, string> = { stopped: '已中断', interrupted: '已中断', failed: '失败' }
 
 /**
  * Long-pressing the text opens the copy, share and quote sheet. The press area is not an accessibility element, so links
@@ -54,7 +52,7 @@ function MessageActionsButton({ choose }: { choose: (() => void) | null }) {
 export const Message = memo(function Message({ message, bot, time: shown, offline, retry, attachmentScope, readAttachment, onCopy, onShare, onQuote, remember = false, conversationId }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown>; attachmentScope?: string; readAttachment?: ReadAttachment; remember?: boolean; conversationId?: string } & MessageActionsProps) {
   const user = message.role === 'user'
   const mark = user ? deliveryMark(message.state, message.merged) : null
-  const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
+  const stopped = replyStatusLabel(message.state === 'interrupted' ? 'interrupted' : message.status)
   const failed = message.status === 'failed'
   const cause = failed ? replyFailure(message.failure, message.detail) : failureText(message.failure)
   const entering = message.created_at_ms > Date.now() - 2000 ? rise : undefined

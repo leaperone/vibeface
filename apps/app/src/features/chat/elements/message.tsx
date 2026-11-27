@@ -55,7 +55,7 @@ export function Message({ message, conversationId, schedule, time: shown, retry,
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
   const full = when?.toLocaleString('zh-CN')
-  const ended = message.state === 'interrupted' ? '已中断' : replyStatusLabel(message.status)
+  const ended = replyStatusLabel(message.state === 'interrupted' ? 'interrupted' : message.status)
   const failed = ended === '失败'
   const cause = failed ? replyFailure(message.failure, detail) : failureText(message.failure)
   const again = retry ? <ActionButton variant="ghost" className="-ms-1" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : null
