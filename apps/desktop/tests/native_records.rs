@@ -16,7 +16,7 @@ const WORK: &str = r###"{
     "continues":null,"parent":null,"thread":null,"phase":"finishing",
     "summary":"已读取附件","thread_id":"thread-1","turn_id":"turn-1",
     "outcome":"completed","result_text":"## 完成\n\n受控结果。","failure_reason":null,
-    "failure":null,"state":"finished","target":{"kind":"channel_task","channel_id":"channel-a","task_id":"task-a","bot_id":"bot-a"},
+    "failure":null,"state":"finished","dispatched_at_ms":1000,"finished_at_ms":4000,"target":{"kind":"channel_task","channel_id":"channel-a","task_id":"task-a","bot_id":"bot-a"},
     "source_events":["event-dispatched","event-finished"]
   },
   "subagents":[],

@@ -107,6 +107,8 @@ pub struct WorkRecord {
     pub failure_reason: Option<String>,
     pub failure: Option<FailureKind>,
     pub state: WorkState,
+    pub dispatched_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
     pub target: Option<InputTarget>,
     pub source_events: Vec<String>,
 }
