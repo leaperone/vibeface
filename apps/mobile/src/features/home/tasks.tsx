@@ -1,4 +1,5 @@
 import { Card } from '@/components/arc/surface'
+import { Elapsed } from '@/features/chat/elapsed'
 import { Metric } from '@/components/arc/metric'
 import { Link } from 'expo-router'
 import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, type LucideIcon } from 'lucide-react-native'
@@ -178,6 +179,7 @@ const TaskRow = memo(function TaskRow({ work, projected, waiting, bot, lookup, c
         <Text numberOfLines={2} className="max-w-[45%] shrink text-sm text-muted">{bot ? bot.name : '已删除的 Bot'}</Text>
         {agent ? <><Text className="text-sm text-muted">·</Text><Icon as={providerIcons[agent]} className="size-3.5 text-muted" /><Text className="text-sm text-muted">{providerNames[agent]}</Text></> : null}
         <Text className="text-sm text-muted">·</Text><Icon as={Laptop} className="size-3.5 text-muted" /><Text numberOfLines={1} className="shrink text-sm text-muted">{device}</Text>
+        <Elapsed dot start={work.dispatched_at_ms} end={work.finished_at_ms} active={taskActive(shown) && !stale} />
       </View>
       {line ? <Text numberOfLines={2} className={cn('text-sm', failed ? 'text-danger' : 'text-muted')}>{line}</Text> : null}
     </View>

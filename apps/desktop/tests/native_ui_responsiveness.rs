@@ -143,7 +143,7 @@ async fn serve(
                             "work_id":"held-work","conversation_id":"chat","target_node":node.device_id(),"trigger":"reply","dispatcher":node.device_id(),"kind":"codex",
                             "cwd":"/controlled","title":"Controlled work","prompt":"No Provider calls","call_ref":"controlled-call","model":null,"resolved":{"provider":"codex","model":null},
                             "continues":null,"parent":null,"thread":null,"phase":"finishing","summary":format!("record batch {count}"),"thread_id":"thread","turn_id":"turn",
-                            "outcome":"completed","result_text":"complete controlled result","failure_reason":null,"failure":null,"state":"finished","target":null,"source_events":[]
+                            "outcome":"completed","result_text":"complete controlled result","failure_reason":null,"failure":null,"state":"finished","dispatched_at_ms":null,"finished_at_ms":null,"target":null,"source_events":[]
                         },"subagents":[],"coverage":{"source":"shared_history","complete":false}})
                     },
                     "conversation_history"=>{

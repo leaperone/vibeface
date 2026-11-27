@@ -499,9 +499,21 @@ const WORK_SUMMARY: &str = "json_object(
     'continues',json_extract(w.dispatch,'$.continues'),'parent',json_extract(w.dispatch,'$.parent'),'thread',json_extract(w.dispatch,'$.thread'),
     'phase',json_extract(w.progress,'$.phase'),'summary',coalesce(json_extract(w.progress,'$.summary'),''),
     'thread_id',w.thread_id,'turn_id',w.turn_id,'outcome',json_extract(w.finish,'$.outcome'),
-    'failure_reason',json_extract(w.finish,'$.failure_reason'),'failure',json_extract(w.finish,'$.failure'),'source','dag')";
+    'failure_reason',json_extract(w.finish,'$.failure_reason'),'failure',json_extract(w.finish,'$.failure'),'source','dag',
+    'dispatch_rank',w.dispatch_rank,'finish_rank',w.finish_rank,'attested',json_extract(w.finish,'$.attestation') IS NOT NULL)";
 
 fn finish_work_summary(value: &mut Value) -> Result<()> {
+    let fields = value.as_object_mut().unwrap();
+    let dispatch_rank = fields.remove("dispatch_rank").unwrap_or_default();
+    let finish_rank = fields.remove("finish_rank").unwrap_or_default();
+    let attested = fields.remove("attested").unwrap_or_default();
+    let (dispatched, finished) = crate::store::work_times(
+        dispatch_rank.as_str().unwrap_or_default(),
+        finish_rank.as_str(),
+        attested == json!(0) && value["outcome"] != "unverified",
+    );
+    value["dispatched_at_ms"] = json!(dispatched);
+    value["finished_at_ms"] = json!(finished);
     value["state"] = json!(WorkStatus::of(
         serde_json::from_value(value["kind"].clone())?,
         serde_json::from_value(value["phase"].clone())?,

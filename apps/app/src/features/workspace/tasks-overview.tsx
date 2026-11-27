@@ -1,4 +1,5 @@
 import { RoutedAction } from "@/components/arc/routed-action"
+import { Elapsed } from "@/features/workspace/elapsed.tsx"
 import taskStyles from "@/components/arc/task-compositions.module.css"
 import { TaskRunSummary } from "@/components/arc/task-run-summary"
 import { Select } from "@vibeface/uiarc/select/select.tsx"
@@ -203,6 +204,7 @@ function TaskOverviewCard({ work, projected, bot, waiting, lookup, connected, pr
               <span className="inline-flex min-w-0 items-center gap-1.5"><DeviceIcon aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate" title={device}>{device}</span></span>
               <span aria-hidden="true">·</span>
               <span className="inline-flex min-w-0 items-center gap-1.5"><FolderOpen aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate" title={work.cwd || "未指定项目"}>{project}</span></span>
+              <Elapsed dot start={work.dispatched_at_ms} end={work.finished_at_ms} active={taskActive(shown) && !stale} />
             </p>
           </div>
           <ChevronRight aria-hidden="true" className="mt-1 size-4 shrink-0 text-secondary transition-transform duration-200 group-hover:translate-x-0.5" />

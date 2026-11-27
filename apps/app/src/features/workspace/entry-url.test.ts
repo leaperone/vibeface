@@ -250,7 +250,7 @@ test("works, reply status and pending checks keep their exact shape", () => {
   const work = {
     dispatcher: 'gateway', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null, resolved: { provider: "codex", model: null } }
   const scheduler = { scope_jobs: [], jobs: [{ scope: { kind: 'main' as const }, trigger: "message:one", state: "queued", message_id: "one" }], unanswered: [], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped" }
@@ -404,7 +404,7 @@ test("workspace preserves bot and message requests while routing native decision
   const work: WorkRecord = {
     dispatcher: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     work_id: "work", trigger: "t", target_node: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
@@ -3228,7 +3228,7 @@ const parityWork = (extra: Partial<WorkRecord> = {}) => {
   const work = parseConversation({ ...context, works: [{
     dispatcher: 'gateway', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     resolved: { provider: 'codex', model: null }, work_id: 'work', trigger: 'message:one', target_node: 'worker', cwd: '/project', title: '核对项目', prompt: '完整请求', state: 'running', summary: '✓ 读记录\n→ 核对结果\n· 等待同步', outcome: null, result_text: '', failure_reason: null, kind: 'codex', thread_id: 'session', ...extra }] }).works[0]
   assert.ok(work && work.resolved)
   return work
@@ -5215,7 +5215,7 @@ test("task overview keeps pending decisions with their task and every real task 
   const work = {
     dispatcher: 'gateway', call_ref: 'dispatch',
     continues: null, parent: null,
-    thread: null, phase: null,
+    thread: null, phase: null, dispatched_at_ms: 0, finished_at_ms: null,
     resolved: { provider: 'codex', model: null }, trigger: 'message:one', target_node: 'offline', cwd: '/project', title: '检查项目', prompt: '', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
   const approvalRows = [{ target: { kind: 'work', work_id: 'held' }, question_id: 'approval', conversation_id: 'chat', bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }], about: { node: 'offline', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'offline', created_at_ms: 1, answer: null, closed: null }]
   const approvalQuestions = workspaceModel.parseQuestions({ questions: approvalRows })
