@@ -165,7 +165,7 @@ test('all nineteen sections retain their typed records through repeated pages', 
   const hash = 'a'.repeat(64), other = 'b'.repeat(64)
   const fixtures: Record<HistorySection, unknown> = {
     messages: message('messages', 1),
-    works: { work_id: 'works', trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null } },
+    works: { work_id: 'works', trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null }, dispatched_at_ms: 0, finished_at_ms: null },
     changes: { change_id: 'changes', conversation_id: 'chat', cause: null, event_hash: 'change', created_at_ms: 1, change: { kind: 'profile', name: { before: 'old', after: 'new' } } },
     questions: { question_id: 'questions', conversation_id: 'chat', target: { kind: 'bot_main', bot_id: 'bot' }, bot: null, severity: 'info', text: '?', choices: [], about: { node: 'entry', agent: null, session_id: 'session', cwd: '/', summary: '' }, author: 'entry', created_at_ms: 1, answer: null, closed: null },
     sessions: { node: 'entry', agent: 'codex', session_id: 'sessions', cwd: '/', summary: '', muted: false, created_at_ms: 1 },
@@ -213,7 +213,7 @@ test('all nineteen sections retain their typed records through repeated pages', 
 
 test('historical Works preserve server order and accepted rows replace pending delivery summaries once', () => {
   const initial = snapshot({ deliveries: [{ work_id: 'work', target_node: 'entry', state: 'dispatch_waiting', cwd: '/' }, { work_id: 'work', target_node: 'entry', state: 'stop_waiting' }] })
-  const work = (work_id: string) => ({ work_id, trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null } })
+  const work = (work_id: string) => ({ work_id, trigger: 't', target_node: 'entry', cwd: '/', title: '', prompt: '', summary: '', outcome: null, result_text: '', failure_reason: null, state: 'running', dispatcher: 'entry', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null }, dispatched_at_ms: 0, finished_at_ms: null })
   const loaded = mergeHistoryPage(initial, page('works', [work('old-z'), work('work')]))
   assert.deepEqual(loaded.works.map((item) => [item.work_id, item.state, item.stop]), [['old-z', 'running', undefined], ['work', 'running', 'stop_waiting']])
   assert.equal(loaded.deliveries.length, 2)

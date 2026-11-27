@@ -1450,6 +1450,9 @@ pub struct WorkProjection {
     pub failure_reason: Option<String>,
     pub failure: Option<FailureKind>,
     pub state: WorkStatus,
+    /// When the target took it and, for a result the target reported, when it ended; the target's clock.
+    pub dispatched_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
 }
 
 /// Where a work stands, as every device reads it from the DAG.

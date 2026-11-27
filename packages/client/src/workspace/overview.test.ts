@@ -37,7 +37,7 @@ const work = (extra: Record<string, unknown> = {}): OpenWork => parseOpenWorks({
   work_id: "work-1", conversation_id: "chat-1", trigger: "message:m1", dispatcher: "gateway", call_ref: "dispatch-1",
   target_node: "worker", cwd: "/project", title: "检查部署", prompt: "检查", state: "running", phase: "running",
   summary: "执行中", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread: "provider-thread",
-  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", resolved: { provider: "codex", model: null }, ...extra,
+  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", resolved: { provider: "codex", model: null }, dispatched_at_ms: 0, finished_at_ms: null, ...extra,
 }] })[0]!
 const question = (extra: Partial<Question> = {}): Question => ({
   question_id: "question-1", conversation_id: "chat-1", bot: { bot_id: "bot-chat-1", name: "Bot" }, severity: "attention",

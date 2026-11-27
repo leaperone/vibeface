@@ -61,6 +61,8 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
         "thread_id": work.thread_id,
         "turn_id": work.turn_id,
         "phase": work.phase,
+        "dispatched_at_ms": work.dispatched_at_ms,
+        "finished_at_ms": work.finished_at_ms,
         "source": source,
     });
     if let Some(reason) = workspace_bounded_opt(work.failure_reason.as_deref(), 512) {
@@ -217,6 +219,8 @@ mod workspace_overview_tests {
             failure_reason: None,
             failure: None,
             state: WorkStatus::Finished,
+            dispatched_at_ms: None,
+            finished_at_ms: None,
         };
         let value = workspace_work_summary(&work, "dag");
         assert!(value.get("prompt").is_none());

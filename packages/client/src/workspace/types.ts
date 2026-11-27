@@ -164,13 +164,16 @@ type WorkRelations = {
   parent: string | null
   thread: string | null
   phase: WorkPhase | null
+  /** When the target took it and, for a result the target reported, when it ended; both by the target's clock. */
+  dispatched_at_ms: number | null
+  finished_at_ms: number | null
 }
 export type WorkRecord = WorkFields & (
   | (WorkRelations & { state: WorkState; resolved: ResolvedModel })
   | (Partial<WorkRelations> & { state: DispatchState; resolved?: never })
 )
 /** The fields a task card can read from either full work or an overview summary. */
-export type WorkCard = Pick<WorkRecord, "work_id" | "target" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop">
+export type WorkCard = Pick<WorkRecord, "work_id" | "target" | "target_node" | "cwd" | "title" | "state" | "summary" | "outcome" | "failure_reason" | "failure" | "kind" | "dispatcher" | "call_ref" | "continues" | "parent" | "thread" | "thread_id" | "turn_id" | "phase" | "stop" | "dispatched_at_ms" | "finished_at_ms">
 export type OpenWorkCard = WorkCard & { conversation_id: string }
 export const providerStages = ['validate', 'install', 'launch', 'authentication', 'model_list', 'session_start', 'turn_start', 'run', 'read_back', 'interrupt', 'compact', 'handoff', 'record'] as const
 export type ProviderStage = typeof providerStages[number]
@@ -435,6 +438,8 @@ type OverviewTaskCommon = {
   thread_id: string | null
   turn_id: string | null
   phase: WorkPhase | null
+  dispatched_at_ms: number | null
+  finished_at_ms: number | null
   reason: string | null
   failure?: FailureKind
   node: OverviewNode | null

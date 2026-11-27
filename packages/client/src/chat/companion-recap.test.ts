@@ -41,7 +41,7 @@ test('a question, its task and the underlying work appear once; two actual quest
   const data = snapshot({ works: [{
     work_id: 'work', target: { kind: 'task', task_id: 'release' }, trigger: 'task:release', target_node: 'node', cwd: '',
     title: '底层工作', prompt: '执行', state: 'unverified', summary: '', outcome: null, result_text: '', failure_reason: null,
-    dispatcher: 'node', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null },
+    dispatcher: 'node', call_ref: 'call', continues: null, parent: null, thread: null, phase: null, resolved: { provider: 'codex', model: null }, dispatched_at_ms: 0, finished_at_ms: null,
   }] })
   const first = inboxQuestion(question('first', { kind: 'task', task_id: 'release' }))
   const input = { ...base(), data, workspaceState: workspace([task('release', 'waiting_user')]), inbox: [first] }

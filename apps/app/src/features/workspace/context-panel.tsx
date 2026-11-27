@@ -1,4 +1,5 @@
 import { HistoryControls } from '../chat/history-controls'
+import { Elapsed } from "@/features/workspace/elapsed.tsx"
 "use client"
 
 import { Details,SettingsGroup,SettingsRow,StatusPill,useAction,type Tone } from "@/components/arc/product-kit"
@@ -323,7 +324,7 @@ function WorkSummary({ work, botId, nodes }: { work: WorkRecord; botId: string; 
   return <li className="min-w-0 rounded-control border bg-surface px-3 py-2">
     <Link to="/b/$botId/work/$workId" params={{ botId, workId: work.work_id }} className="flex min-w-0 items-start gap-2 rounded-control outline-none  ">
       <StatusPill tone={workTone(state)} icon={workIcon(state)}>{taskLabel(state)}</StatusPill>
-      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{work.summary}</span> : null}</span>
+      <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={work.title}>{work.title || "未命名工作"}</span>{work.summary ? <span className="block line-clamp-2 text-sm text-secondary [overflow-wrap:anywhere]">{work.summary}</span> : null}<span className="block text-sm text-secondary"><Elapsed start={work.dispatched_at_ms} end={work.finished_at_ms} active={false} /></span></span>
     </Link>
   </li>
 }

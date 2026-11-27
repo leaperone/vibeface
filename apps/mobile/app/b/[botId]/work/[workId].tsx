@@ -1,4 +1,5 @@
 import { useSelectionOwner } from '@/lib/use-selection-owner'
+import { Elapsed } from '@/features/chat/elapsed'
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { Bot, Circle, CircleCheck, CircleDot, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, Square, type LucideIcon } from 'lucide-react-native'
 import { useCallback, useRef, useState, type ReactNode } from 'react'
@@ -133,6 +134,7 @@ function TaskDetail({ botId, workId, focus }: { botId: string; workId: string; f
     {readError ? <View className="gap-2"><Text className="text-danger">{readError}</Text><Button variant="secondary" className="self-start" onPress={() => setRetry((value) => value + 1)}><Text>重新读取</Text></Button></View> : null}
     <View className="gap-1">
       {taskStale(state, shared.connectionOnline && shared.synced) ? <Text className="font-medium text-muted">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
+      <Elapsed start={work.dispatched_at_ms} end={work.finished_at_ms} active={taskActive(shown) && !taskStale(shown, shared.connectionOnline && shared.synced)} />
       {device || work.cwd || agent ? <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
         {agent ? <Meta icon={providerIcons[agent]} label="AI">{providerNames[agent]}</Meta> : null}
         {device ? <Meta icon={Laptop} label="设备">{nodeName(device, lookup)}</Meta> : null}

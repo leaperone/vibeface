@@ -1,4 +1,5 @@
 import { Card } from '@/components/arc/surface'
+import { elapsedLabel } from '@vibeface/client/workspace/elapsed.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { Bot, CalendarClock, CircleHelp, Laptop, ListChecks, MessagesSquare, Send, type LucideIcon } from 'lucide-react-native'
@@ -102,7 +103,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
       <SettingsRow icon={ListChecks} label="工作" description={`${data.works.length} 项已加载工作`} />
       {data.works.map((work) => {
         const state = shownState(work, nodes)
-        return <SettingsRow key={work.work_id} icon={ListChecks} label={work.title || '任务'} description={taskStale(state, connected) ? staleTaskLabel : taskLabel(state)} href={`/b/${bot.bot_id}/work/${work.work_id}`} />
+        return <SettingsRow key={work.work_id} icon={ListChecks} label={work.title || '任务'} description={`${taskStale(state, connected) ? staleTaskLabel : taskLabel(state)}${work.finished_at_ms == null || work.dispatched_at_ms == null ? '' : ` · 用时 ${elapsedLabel(work.finished_at_ms - work.dispatched_at_ms)}`}`} href={`/b/${bot.bot_id}/work/${work.work_id}`} />
       })}
       <Fold label="最近消息摘要">{loadedMessages.length ? loadedMessages.map((message) => <View key={message.message_id} className="gap-1"><Text className="text-sm font-medium">{message.sender?.name ?? (message.role === 'user' ? '你' : 'Bot')} · {formatWhen(message.created_at_ms)}</Text><Text selectable>{message.text}</Text></View>) : <Text className="text-muted">当前记录没有聊天消息</Text>}</Fold>
     </SettingsGroup>

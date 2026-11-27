@@ -1477,6 +1477,8 @@ mod trigger_boundary_tests {
             failure_reason: None,
             failure: None,
             state: WorkStatus::Accepted,
+            dispatched_at_ms: None,
+            finished_at_ms: None,
         };
         for key in ["assignment:a:b", "task:", "schedule:s:-1", "work:"] {
             work.trigger = key.into();
@@ -5622,6 +5624,15 @@ impl Store {
             else {
                 continue;
             };
+            // Only work and task inputs can steer a raw work turn.
+            if !matches!(
+                route.target,
+                crate::workspace::InputTarget::Work { .. }
+                    | crate::workspace::InputTarget::Task { .. }
+                    | crate::workspace::InputTarget::ChannelTask { .. }
+            ) {
+                continue;
+            }
             let Ok(resolved) = super::workspace::resolve_input_target_from(
                 &self.connection,
                 network,
