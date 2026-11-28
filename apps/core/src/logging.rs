@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{BufRead, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::{layer::Context, registry::LookupSpan};
@@ -46,7 +46,7 @@ const STATE_EVENTS: &[&str] = &[
     "sync.stalled",
     "sync.recovered",
 ];
-static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static PRIVATE_PATHS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
 pub fn add_private_path(path: &Path) {
     if !path.is_absolute() || path.parent().is_none() {
@@ -54,7 +54,7 @@ pub fn add_private_path(path: &Path) {
     }
     let mut paths = PRIVATE_PATHS
         .get_or_init(Default::default)
-        .lock()
+        .write()
         .expect("private paths");
     let text = path.to_string_lossy().trim_end_matches('/').to_owned();
     let mut additions = vec![text];
@@ -183,8 +183,11 @@ impl Record {
 /// Blanks known secrets, invite tickets and bearer credentials. Every log line passes here.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut text = text.to_owned();
-    if let Some(paths) = PRIVATE_PATHS.get() {
-        for path in paths.lock().expect("private paths").iter() {
+    // Registered paths are absolute, including their JSON-escaped forms.
+    if text.contains(['/', '\\'])
+        && let Some(paths) = PRIVATE_PATHS.get()
+    {
+        for path in paths.read().expect("private paths").iter() {
             text = text.replace(path, "[local-path]");
         }
     }
@@ -284,7 +287,7 @@ struct Repeat {
 /// The Node's log file and the secrets it must never contain.
 pub struct Sink {
     file: Mutex<Rotating>,
-    secrets: Mutex<Vec<String>>,
+    secrets: RwLock<Vec<String>>,
     repeats: Mutex<Vec<Repeat>>,
 }
 
@@ -305,16 +308,20 @@ impl Sink {
                 max_bytes,
                 keep,
             }),
-            secrets: Mutex::new(environment_secrets()),
+            secrets: RwLock::new(environment_secrets()),
             repeats: Mutex::default(),
         })
     }
 
     pub fn add_secret(&self, secret: &str) {
-        let mut secrets = self.secrets.lock().expect("log secrets");
+        let mut secrets = self.secrets.write().expect("log secrets");
         if secret.len() >= 8 && !secrets.iter().any(|known| known == secret) {
             secrets.push(secret.to_owned());
         }
+    }
+
+    fn redact(&self, text: &str) -> String {
+        redact(text, &self.secrets.read().expect("log secrets"))
     }
 
     #[cfg(test)]
@@ -420,7 +427,7 @@ impl Sink {
 
     fn line(&self, record: &Record) -> Option<String> {
         let line = serde_json::to_string(record).ok()?;
-        let mut line = redact(&line, &self.secrets.lock().expect("log secrets"));
+        let mut line = self.redact(&line);
         line.push('\n');
         Some(line)
     }
@@ -490,7 +497,7 @@ pub fn add_secret(secret: &str) {
 /// `text` with the secrets known to this process blanked, for a raw cause shown outside node.log.
 pub fn scrub(text: &str) -> String {
     match SINK.get() {
-        Some(sink) => redact(text, &sink.secrets.lock().expect("log secrets")),
+        Some(sink) => sink.redact(text),
         None => redact(text, &environment_secrets()),
     }
 }
@@ -1168,6 +1175,19 @@ mod tests {
         assert_eq!(
             redact(&private_message, &[]),
             "failed at [local-path]/src/lib.rs"
+        );
+        assert_eq!(
+            redact(
+                &format!("{token} Bearer abc-test vibeface1fixture"),
+                std::slice::from_ref(&token)
+            ),
+            "[redacted] Bearer [redacted] [invite]"
+        );
+        let nested = private_project.join(r"nested\fixture");
+        add_private_path(&nested);
+        assert_eq!(
+            redact(&serde_json::to_string(&nested).unwrap(), &[]),
+            r#""[local-path]""#
         );
         let dir = scratch("log-redact");
         let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();

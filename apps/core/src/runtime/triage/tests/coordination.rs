@@ -734,7 +734,14 @@ async fn ordinary_coordination_refreshes_source_access_before_taking_the_turn_lo
                     "refresh_token":"synthetic-source-owned-refresh","account_id":"fixture"}}))?,
             )?;
             let active = (index == 1).then(|| node.triage.turn.try_lock().unwrap());
-            tokio::time::timeout(Duration::from_secs(5), node.wake_agent()).await??;
+            tokio::time::timeout(Duration::from_secs(5), node.wake_agent())
+                .await
+                .with_context(|| {
+                    format!(
+                        "refreshing source access with turn lock held: {}",
+                        active.is_some()
+                    )
+                })??;
             let local = node.providers();
             assert_eq!(
                 local
@@ -749,7 +756,11 @@ async fn ordinary_coordination_refreshes_source_access_before_taking_the_turn_lo
                 "a busy turn defers the launch without blocking access refresh"
             );
             drop(active);
-            tokio::time::timeout(Duration::from_secs(5), node.wake_agent()).await??;
+            tokio::time::timeout(Duration::from_secs(5), node.wake_agent())
+                .await
+                .with_context(|| {
+                    format!("applying provider launch after releasing the turn lock, pass {index}")
+                })??;
             assert!(!node.pending_provider_launches.load(Ordering::SeqCst));
             let source_login: Value =
                 serde_json::from_slice(&std::fs::read(source.join("auth.json"))?)?;
