@@ -1,7 +1,7 @@
 import type { OwnedPickedFile } from '../platform/files'
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import type { useDevice } from '@vibeface/client/identity/context.tsx'
-import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, SteerOutcome, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, SteerOutcome } from '@vibeface/client/workspace/types.ts'
 
 export type { Question }
 
@@ -38,7 +38,6 @@ export type Conversation = {
   hidden: ReadonlySet<string>
   /** The row 新消息 sits above: what this chat's badge counted, from its first in the order shown. */
   unread: string | null
-  works: WorkRecord[]
   replying: boolean
   status: string | null
   stoppable: boolean

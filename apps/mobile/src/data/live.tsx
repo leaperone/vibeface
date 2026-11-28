@@ -193,7 +193,7 @@ function Live({ children }: { children: ReactNode }) {
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
       origin: { kind: 'network' },
-      messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
+      messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.

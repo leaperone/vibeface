@@ -60,10 +60,6 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
   return contentSize.height > 0 && layoutMeasurement.height > 0 && Math.min(Math.max(0, distance), range) > 64
 }
 
-/**
- * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
- * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
- */
 /** As on the web: a message sent while the bot replies waits behind it, or is taken into the running turn; a merged one keeps the outcome. */
 function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: boolean): ChatMessage {
   if (message.role !== 'user' || message.state) return message
@@ -73,6 +69,10 @@ function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: 
   return steered ? { ...message, state: 'merged', merged: steered.outcome } : message
 }
 
+/**
+ * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
+ * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
+ */
 function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean, jobs: readonly ManagerJob[]): Entry[] {
   const rows: Entry[] = []
   const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))

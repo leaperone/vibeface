@@ -1,26 +1,9 @@
 import { placeByTime } from "../workspace/questions.ts"
 import type { ManagerJob, NotificationRecord, WorkRecord } from "../workspace/types.ts"
 import { scheduleTrigger } from "../workspace/bot-settings.ts"
-import { replyStatusLabel } from "./protocol.ts"
 import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
-
-/** Only actual unread replies; completion is separate from any verification stated inside them. */
-export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readonly ManagerJob[], fresh: ReadonlySet<string>) {
-  if (!fresh.size) return []
-  const seen = new Set<string>()
-  return messages.filter((message) => {
-    if (message.role !== 'assistant' || !fresh.has(message.event_hash) || seen.has(message.event_hash)) return false
-    seen.add(message.event_hash)
-    return true
-  }).map((message) => ({
-    id: message.message_id,
-    text: message.text.trim().split('\n')[0]?.slice(0, 160) || '查看原回复',
-    state: jobs.some((job) => job.reply_message_id === message.message_id && (job.pending_check || job.state === 'reconciling')) ? '结果待确认'
-      : message.status === 'completed' ? '已回复' : replyStatusLabel(message.status) || '新回复',
-  }))
-}
 
 /** The Node's order, the same on every device; a message without a rank yet keeps its place after the ranked ones. */
 export function byRank<T extends Pick<TranscriptMessage, "rank">>(messages: readonly T[]): T[] {

@@ -13,7 +13,7 @@ import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, t
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, InputControlAction, ManagerJob, Overwritten, PendingCheck, QueuedInput, QueueHoldReason, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, InputControlAction, ManagerJob, Overwritten, PendingCheck, QueuedInput, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton, ErrorText } from '@/components/action'
 import { Button } from '@/components/arc/button'
@@ -44,17 +44,17 @@ function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string
 
 type Live = NonNullable<ReturnType<typeof useLive>>
 type Data = NonNullable<Live['data']>
-type Summary = { failures: ReadonlyMap<string, Row[]>; attention: number; tasks: number; hold: QueueHoldReason | null }
-const quiet: Summary = { failures: new Map(), attention: 0, tasks: 0, hold: null }
+type Summary = { failures: ReadonlyMap<string, Row[]>; attention: number }
+const quiet: Summary = { failures: new Map(), attention: 0 }
 
-/** Each work in the state the chat shows; `going`: counted by the status line as a task in progress. */
+/** Each work in the state the chat shows. */
 function shownTasks(shared: Pick<Live, 'nodes' | 'connectionOnline'>, data: Data) {
   const asking = new Set(data.questions.filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   return data.works.map((work) => {
     const state = chatTaskState(work, data.works, shared.nodes)
     const shownAs = state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state
     const away = shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)
-    return { work, state: shownAs, stale: taskStale(shownAs, shared.connectionOnline), away, going: shared.connectionOnline && !away && (taskActive(shownAs) || shownAs === 'awaiting_children') }
+    return { work, state: shownAs, stale: taskStale(shownAs, shared.connectionOnline), away }
   })
 }
 
@@ -76,14 +76,14 @@ function needsPerson(shared: Pick<Live, 'nodes' | 'pendingMessages' | 'workspace
 
 /**
  * What the chat knows besides messages. The list keeps only `failures`, a one-line JobLine after the message that got no
- * reply; everything else lives on the activity page, counted by `attention`, `tasks` and `hold` for the status line.
+ * reply; everything else lives on the activity page, counted by `attention` for the header badge.
  */
 export function useChatSummary(conversationId: string): Summary {
   const shared = useLive()
   const data = shared && shared.conversationId === conversationId ? shared.data : null
-  const nodes = shared?.nodes, connectionOnline = shared?.connectionOnline, pendingMessages = shared?.pendingMessages, workspaceState = shared?.workspaceState
+  const nodes = shared?.nodes, pendingMessages = shared?.pendingMessages, workspaceState = shared?.workspaceState
   return useMemo(() => {
-    if (!data || !nodes || connectionOnline === undefined || !pendingMessages) return quiet
+    if (!data || !nodes || !pendingMessages) return quiet
     const jobs = data.scheduler?.jobs ?? []
     const shown = new Set(data.messages.map((message) => message.message_id))
     const failures = new Map<string, Row[]>()
@@ -95,10 +95,8 @@ export function useChatSummary(conversationId: string): Summary {
     return {
       failures,
       attention: (need.ownerAway ? 1 : 0) + need.reconciling.length + need.checks.length + need.lost.length + need.deferred.length,
-      tasks: shownTasks({ nodes, connectionOnline }, data).filter((task) => task.going).length,
-      hold: jobs.find((job) => job.state === 'queued')?.hold_reason ?? null,
     }
-  }, [data, nodes, connectionOnline, pendingMessages, workspaceState, conversationId])
+  }, [data, nodes, pendingMessages, workspaceState, conversationId])
 }
 
 /** The activity page: what needs the person, inputs on their way, then tasks, changes and runtimes, newest first. */

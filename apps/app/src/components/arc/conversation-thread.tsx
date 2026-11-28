@@ -10,7 +10,7 @@ export type ChatEntry =
   | { key: string; anchor?: undefined; node: ReactNode }
 
 /** Arc chat-thread with unread navigation, anchored history and live streamed content. */
-export function Chat({ entries, empty, focus, focusRequest = 0, remember = false }: { entries: ChatEntry[]; empty: ReactNode; focus?: string; focusRequest?: number; remember?: boolean }) {
+export function Chat({ entries, empty, focus, remember = false }: { entries: ChatEntry[]; empty: ReactNode; focus?: string; remember?: boolean }) {
   const viewport = useRef<HTMLDivElement>(null)
   const content = useRef<HTMLDivElement>(null)
   const anchor = useRef<{ key: string; offset: number } | null>(null)
@@ -18,7 +18,7 @@ export function Chat({ entries, empty, focus, focusRequest = 0, remember = false
   const [away,setAway] = useState(false)
   const [now,setNow] = useState(0)
   const unreadShown = useRef(false)
-  const focused = useRef<{ id: string; request: number } | null>(null)
+  const focused = useRef<string | null>(null)
   const newestSend = entries.filter(entry => entry.anchor === true).at(-1)?.key
   const lastSend = useRef(newestSend)
   function latest() { const view = viewport.current; if (view) view.scrollTo({ top: view.scrollHeight, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); reading.current = false; anchor.current = null; setAway(false) }
@@ -46,17 +46,17 @@ export function Chat({ entries, empty, focus, focusRequest = 0, remember = false
     if (!entries.length) return
     if (newestSend !== lastSend.current) { lastSend.current = newestSend; reading.current = false; anchor.current = null }
     place()
-    if (focus && (focused.current?.id !== focus || focused.current.request !== focusRequest)) {
+    if (focus && focused.current !== focus) {
       const key = entries.find((entry) => entry.key === focus || 'message' in entry && entry.message.message_id === focus)?.key
       const row = [...viewport.current?.querySelectorAll<HTMLElement>('[data-history-key]') ?? []].find((row) => row.dataset.historyKey === key)
-      if (row) { row.scrollIntoView({ block: 'center' }); row.focus({ preventScroll: true }); focused.current = { id: focus, request: focusRequest }; capture(); return }
+      if (row) { row.scrollIntoView({ block: 'center' }); row.focus({ preventScroll: true }); focused.current = focus; capture(); return }
     }
     if (!focus && !unreadShown.current && entries.some(entry => entry.key === 'unread')) {
       unreadShown.current = true
       viewport.current?.querySelector('[data-history-key="unread"]')?.scrollIntoView({ block: 'nearest' })
       capture()
     }
-  },[entries,newestSend,focus,focusRequest])
+  },[entries,newestSend,focus])
   useEffect(() => { setNow(Date.now()) },[])
   // The composer grows on focus and the status above it comes and goes; the newest message stays in view, or the one being read keeps its place.
   useEffect(() => { const node = content.current, view = viewport.current; if (!node || !view) return; const resize = new ResizeObserver(place); resize.observe(node); resize.observe(view); return () => resize.disconnect() },[entries.length === 0])
