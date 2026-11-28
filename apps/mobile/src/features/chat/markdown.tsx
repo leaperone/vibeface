@@ -82,17 +82,17 @@ const capped = (node: ReactNode) => isValidElement(node) ? cloneElement(node as 
 /** The library frames the scrolled content, so a long line ran off the frame; this frames the visible window instead. */
 class Reply extends Renderer {
   constructor(private frame: ViewStyle) { super() }
-  code(text: string, _language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
-    return <CodeBlock key={this.getKey()} text={text} frame={this.frame} containerStyle={containerStyle}>{this.text(text, textStyle)}</CodeBlock>
+  code(text: string, language?: string, containerStyle?: ViewStyle, textStyle?: TextStyle) {
+    return <CodeBlock key={this.getKey()} text={text} language={language?.trim().split(/\s+/)[0]} frame={this.frame} containerStyle={containerStyle}>{this.text(text, textStyle)}</CodeBlock>
   }
   text(...args: Parameters<Renderer['text']>) { return capped(super.text(...args)) }
   heading(...args: Parameters<Renderer['heading']>) { return capped(super.heading(...args)) }
 }
 
-function CodeBlock({ text, frame, containerStyle, children }: { text: string; frame: ViewStyle; containerStyle?: ViewStyle; children: ReactNode }) {
+function CodeBlock({ text, language, frame, containerStyle, children }: { text: string; language?: string; frame: ViewStyle; containerStyle?: ViewStyle; children: ReactNode }) {
   const copy = useClipboardAction(text)
   return <View style={frame}>
-    <View className="flex-row justify-end px-1"><Button variant="ghost" size="sm" disabled={copy.busy} accessibilityLabel="复制代码块" onPress={() => { void copy.copy(text) }}><Text>{copy.copied ? '已复制' : copy.busy ? '复制中' : '复制代码'}</Text></Button></View>
+    <View className="flex-row items-center justify-end gap-2 px-2">{language ? <Text numberOfLines={1} className="mr-auto shrink font-mono text-sm text-secondary">{language}</Text> : null}<Button variant="ghost" size="sm" disabled={copy.busy} accessibilityLabel="复制代码块" onPress={() => { void copy.copy(text) }}><Text>{copy.copied ? '已复制' : copy.busy ? '复制中' : '复制代码'}</Text></Button></View>
     <ScrollView horizontal contentContainerStyle={containerStyle}><View>{children}</View></ScrollView>
     {copy.error ? <Text accessibilityLiveRegion="polite" className="px-3 pb-3 text-sm text-danger">{copy.error}</Text> : null}
   </View>
