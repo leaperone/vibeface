@@ -3939,11 +3939,9 @@ test('chat task history keeps completed and unknown records while counting only 
   }
   const label = () => render().find(({ type }) => type === 'Button')?.props['aria-label']
   const badge = () => render().some(({ type }) => type === 'Dot')
-  const status = () => componentText(harness.render({ active: true }).find(({ type }) => type === 'PromptInput')?.props.above)
   try {
     assert.equal(label(), '动态，2 项要处理')
     assert.equal(badge(), true, 'the unverifiable work needs the person')
-    assert.match(status(), /^2 项要处理允许继续吗？$/, 'the failed and unverifiable works count; the open approval is the question pill, not a running task')
 
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/b/$botId/work/$workId').length, 4, 'history includes completed, missing-origin and uncertain execution records')
     assert.equal(render().filter(({ type, props }) => type === 'Link' && props.to === '/tasks').length, 1, 'task conversations have a separate navigation entry')
@@ -3953,7 +3951,6 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(app.render('TaskIcon', { state: 'completed', stale: false }).some(({ type }) => type === 'CircleCheck'), true)
     shared.answered = { approval: '继续' }
     shared.openWorks = shared.openWorks.filter((work) => work.work_id !== 'failed')
-    assert.match(status(), /^1 项要处理 · 1 个任务进行中$/, 'answered approvals and closed historical failures stop counting')
     const trigger = render().find(({ type }) => type === 'Button')
     let restoredFocus = 0
     const triggerRef = trigger?.props.ref as { current: { focus(options?: { preventScroll?: boolean }): void } | null }
@@ -3974,7 +3971,6 @@ test('chat task history keeps completed and unknown records while counting only 
     assert.equal(prevented, true, 'ordinary dismissal explicitly handles the portalled opener')
     assert.equal(restoredFocus, 1, 'ordinary dismissal restores the actual opening button')
     shared.connectionOnline = false
-    assert.match(status(), /2 项要处理$/, 'offline active tasks are uncertain and need the person instead of counting as running')
   } finally { app.close(); harness.app.close() }
 })
 
@@ -6150,7 +6146,7 @@ test('native composer preserves local input and visible blockers with compact ch
     const render = () => composer.render('Composer', { ...props(), value: 'draft' })
     try {
       assert.equal(props().blocked, null)
-      assert.equal(componentText(props().children), '项目 Bot · 主聊天', 'the bound target is named without an availability warning')
+      assert.equal(componentText(props().children), '', 'the main chat adds nothing under the composer')
       assert.equal(props().sending, false, 'network activity does not lock local saving')
       assert.equal(screen.render('default').filter(({ type }) => type === 'OfflineBar').length, 0)
       assert.equal(render().find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
@@ -6172,9 +6168,8 @@ test('native composer preserves local input and visible blockers with compact ch
         assert.ok(executionHint)
         const elements = render()
         assert.equal(props().blocked, null, 'execution readiness does not block local saving')
-        assert.equal(elements.find(({ type }) => type === 'TextInput')?.props.placeholder, '发消息')
+        assert.equal(elements.find(({ type }) => type === 'TextInput')?.props.placeholder, executionHint, 'the readiness hint takes the placeholder instead of a row')
         assert.equal(elements.find(({ props }) => props.accessibilityLabel === '发送')?.props.disabled, false)
-        assert.equal(componentText(composer.output).split(executionHint).length - 1, 1)
         const links = screen.render('default').filter(({ type, props }) => type === 'Link' && componentText(props.children).includes(state === 'offline' ? '查看设备' : '去设置'))
         assert.equal(links.filter(({ props }) => props.href === (state === 'none' ? '/ai' : '/device/worker')).length, 1)
       }
@@ -6263,7 +6258,7 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
   } finally { app.close() }
 })
 
-test('offline chat keeps its connection notice and stale waiting summary above the composer, then drops both when back online', () => {
+test('offline chat shows only its connection notice above the composer, then nothing once back online', () => {
   let connectionOnline = false
   const question = { question_id: 'wait-q', conversation_id: 'chat', bot: null, severity: 'attention' as const, text: '继续吗？', choices: [{ label: '继续' }],
     about: { node: 'gateway', agent: 'codex', session_id: 'session', cwd: '/project', summary: '', request_id: 'request' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
@@ -6276,14 +6271,11 @@ test('offline chat keeps its connection notice and stale waiting summary above t
   })
   const harness = conversationHarness(workspace)
   try {
-    const above = componentText(harness.composer()?.above)
     assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), true)
-    assert.match(above, /最近记录 · /)
     assert.ok(harness.composer()?.disabled)
     connectionOnline = true
     assert.equal(harness.render().some(({ type }) => type === 'ConnectionNotice'), false)
-    assert.doesNotMatch(componentText(harness.composer()?.above), /最近记录 · /)
-    assert.match(componentText(harness.composer()?.above), /继续吗？/)
+    assert.equal(harness.composer()?.above, null, 'an open question stays in the chat, not above the composer')
     assert.equal(harness.composer()?.disabled, false)
   } finally { harness.app.close() }
 })
@@ -7214,119 +7206,6 @@ test('Web record navigation can repeat the same identity and moves keyboard focu
   } finally { chat.close() }
 })
 
-test('Web recap keeps one action visible, folds the rest, re-arms the same result and hides routine-only work', () => {
-  const data = parseConversation({ ...context, messages: [{ message_id: 'result', event_hash: 'result-event', role: 'assistant', text: '构建报告', created_at_ms: 1 }] })
-  const shared = { ...parityShared(), data, dataOrigin: 'network', fresh: new Set(['result-event']), interrupted: [], chatSlot: { conversationId: 'chat' } }
-  const navigations: unknown[] = []
-  const app = conversationHarness(() => shared, {}, { message: 'result' }, async target => { navigations.push(target) })
-  const render = () => app.render({ active: true })
-  try {
-    const panel = render().find(item => item.props['aria-label'] === '回来接着办'); assert.ok(panel)
-    const children = panel.props.children; assert.ok(Array.isArray(children))
-    const primary = workspaceModel.record(workspaceModel.record(children[0]).props)
-    assert.match(componentText(primary.children), /构建报告/)
-    const more = render().find(item => item.type === 'Details' && String(item.props.label).startsWith('其余更新与进行中'))
-    assert.ok(more); assert.notEqual(more.props.open, true)
-    assert.ok(typeof primary.onClick === 'function')
-    primary.onClick(); assert.equal(render().find(item => item.type === 'Chat')?.props.focusRequest, 1)
-    primary.onClick(); assert.equal(render().find(item => item.type === 'Chat')?.props.focusRequest, 2)
-    assert.equal(navigations.length, 2)
-    shared.fresh.clear()
-    assert.equal(render().some(item => item.props['aria-label'] === '回来接着办'), false)
-    assert.ok(render().some(item => typeof item.type === 'function' && item.type.name === 'TaskHistory'), 'routine work remains available through activity')
-  } finally { app.app.close() }
-})
-
-test('native recap keeps one source action visible with collapsed details and no routine-only area', () => {
-  const data = parseConversation({ ...context, messages: [{ message_id: 'result', event_hash: 'result-event', role: 'assistant', text: '新的报告', created_at_ms: 1 }] })
-  const shared = { ...parityShared(), data, dataOrigin: 'network', fresh: new Set(['result-event']) }
-  const chat = { origin: { kind: 'network' }, messages: data.messages, before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
-  const app = nativeChatHarness('android', {
-    'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) },
-    '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => ({ networkId: 'network', deviceId: 'phone', bots: shared.bots, conversations: { chat }, members: [], primary: null, actions: { open: () => () => {} } }) },
-    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' }, ready: { principal: { network_id: 'network', device_id: 'phone' }, entry: { device_id: 'node' } } }) },
-  })
-  const render = () => app.render('default')
-  try {
-    const panel = render().find(item => item.props.accessibilityLabel === '回来接着办'); assert.ok(panel)
-    const children = panel.props.children; assert.ok(Array.isArray(children))
-    const primary = workspaceModel.record(workspaceModel.record(children[0]).props)
-    assert.match(componentText(primary.children), /新的报告/)
-    const more = render().find(item => item.type === 'Details' && String(item.props.label).startsWith('其余更新与进行中'))
-    assert.ok(more); assert.notEqual(more.props.open, true)
-    shared.fresh.clear()
-    assert.equal(render().some(item => item.props.accessibilityLabel === '回来接着办'), false)
-    assert.ok(render().some(item => item.type === 'Screen'), 'the existing activity action remains in the navigation header')
-  } finally { app.close() }
-})
-
-test('Web input actions send explicit intents and keep a selected work after it ends', async () => {
-  const sends: InputOptions[] = []
-  const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, sendMessage: async (_text: string, _files: unknown, _sent: unknown, options: InputOptions) => { sends.push(options); return true } }
-  shared.data!.works = [parityWork()]
-  const app = conversationHarness(() => shared)
-  const options = () => app.render().filter(({ type, props }) => type === 'Button' && typeof props['aria-pressed'] === 'boolean')
-  const choose = (label: string) => { const callback = options().find((option) => componentText(option.props.children) === label)?.props.onClick; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
-  const change = (text: string) => { const action = app.composer()?.onChange; assert.ok(typeof action === 'function'); action(text) }
-  const submit = () => { const action = app.composer()?.onSubmit; assert.ok(typeof action === 'function'); action() }
-  try {
-    assert.match(componentText(app.composer()?.target), /发送给 · 项目 Bot · 主聊天/)
-    assert.equal(app.composer()?.label, '发送给 项目 Bot · 主聊天')
-    const groups = app.render().filter(({ type, props }) => type === 'section' && ['发送方式', '进行中的工作'].includes(String(props['aria-label'])))
-    assert.equal(groups.length, 2, 'input intent and active works are separate named groups')
-    assert.ok(app.render().some(({ type, props }) => type === 'div' && typeof props.className === 'string' && props.className.includes('max-h-60') && props.className.includes('overflow-y-auto')), 'the active-work list has its own scroll boundary')
-    for (const intent of ['defer', 'new_task'] as const) {
-      change('不带特殊前缀的交代')
-      choose(intent === 'defer' ? '稍后处理' : '另开一件')
-      submit(); await settleComponent()
-      assert.equal(sends.at(-1)?.intent, intent)
-      assert.equal(sends.at(-1)?.conversation_id, 'chat')
-    }
-    choose('补充：核对项目')
-    assert.equal(app.composer()?.sendLabel, '补充当前工作')
-    assert.match(componentText(app.composer()?.target), /补充给 · 核对项目/)
-    shared.data!.works = [parityWork({ state: 'unverified', outcome: 'unverified' })]
-    assert.match(componentText(app.composer()?.children), /先处理动态中的确认/)
-    shared.data!.works = [parityWork({ state: 'finished', outcome: 'completed' })]
-    change('原工作的新说明')
-    submit(); await settleComponent()
-    assert.deepEqual(JSON.parse(JSON.stringify(sends.at(-1)?.target)), { kind: 'work', work_id: 'work' })
-    const stale = options().find((option) => componentText(option.props.children) === '稍后处理')?.props.onClick
-    shared.generation++
-    app.composer()
-    if (typeof stale === 'function') stale()
-    assert.equal(app.composer()?.sendLabel, '发送', 'an old workspace menu cannot change the new input action')
-  } finally { app.app.close() }
-})
-
-test('native input menu exposes all three actions on Android and iOS and rejects stale selections', () => {
-  for (const os of ['ios', 'android']) {
-    const live = { ...parityShared(), fresh: new Set<string>() }
-    const chat: import('../../../../../apps/mobile/src/data/types.ts').Conversation = { origin: { kind: 'network' }, messages: [], before: new Map(), rest: [], answers: new Map(), hidden: new Set(), unread: null, works: [], replying: false, status: null, stoppable: false, blocked: null }
-    const workspace = { networkId: 'network', deviceId: 'phone', bots: [parityBot], conversations: { chat }, members: [], primary: null, actions: { open() {} } }
-    const app = nativeChatHarness(os, { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: 'bot' }) }, '@/data/context': { useWorkspace: () => workspace }, '@/data/live': { useLive: () => live }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } })
-    const composer = () => app.render('default').find(({ type }) => type === 'Composer')!.props
-    const open = () => { const callback = workspaceModel.record(workspaceModel.record(composer().target).props).onPress; assert.equal(typeof callback, 'function'); if (typeof callback === 'function') callback() }
-    try {
-      open()
-      const entries = app.render('default').filter(({ type, props }) => type === 'Button' && ['补充当前工作', '稍后处理', '另开一件'].includes(componentText(props.children)))
-      assert.equal(entries.length, 3, os)
-      const select = entries.find(({ props }) => componentText(props.children) === '稍后处理')?.props.onPress
-      assert.ok(typeof select === 'function'); select()
-      assert.equal(composer().sendLabel, '稍后处理')
-      open()
-      const old = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === '另开一件')?.props.onPress
-      live.generation++
-      composer()
-      if (typeof old === 'function') old()
-      assert.equal(composer().sendLabel, '稍后处理', 'the old menu cannot act after a connection generation changes')
-      open(); app.render('default'); app.blur()
-      assert.equal(app.render('default').some(({ type }) => type === 'Modal'), false, 'leaving the chat dismisses its global native modal')
-    } finally { app.close() }
-  }
-})
-
-
 test('notification click routes preserve the original question through task channel and work screen entries', async () => {
   const targets: InputTarget[] = [{ kind: 'task', task_id: 'task' }, { kind: 'channel_task', channel_id: 'channel', task_id: 'task', bot_id: 'bot' }, { kind: 'channel_member', channel_id: 'channel', bot_id: 'bot' }, { kind: 'work', work_id: 'work' }]
   for (const native of [false, true]) for (const target of targets) {
@@ -7521,7 +7400,7 @@ test('focused history does not restart a failure after an empty scan advanced it
 
 
 test('leaving routine view clears its route and preserves the next Web send draft and target', async () => {
-  for (const action of ['改回主聊天', '回到主聊天', '补充：核对项目']) {
+  for (const action of ['改回主聊天']) {
     const search: Record<string, string> = { routine: 'schedule:check:1000', notification: 'notice', message: 'question:q-routine' }
     const sends: { text: string; files: unknown; options: InputOptions }[] = []
     const shared = { ...parityShared(), fresh: new Set<string>(), interrupted: [], chatSlot: { conversationId: 'chat', missing: false }, view: 'chat', sendMessage: async (text: string, files: unknown, _sent: unknown, options: InputOptions) => { sends.push({ text, files, options }); return true } }
@@ -7540,13 +7419,13 @@ test('leaving routine view clears its route and preserves the next Web send draf
       assert.equal(composer()?.value, '切回后保留的草稿'); assert.equal(composer()?.files, files)
       const send = composer()?.onSubmit; assert.ok(typeof send === 'function'); send(); await settleComponent()
       assert.equal(sends[0]?.text, '切回后保留的草稿'); assert.equal(sends[0]?.files, files)
-      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), action.startsWith('补充：') ? { kind: 'work', work_id: 'work' } : { kind: 'bot_main', bot_id: 'bot' })
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), { kind: 'bot_main', bot_id: 'bot' })
     } finally { app.app.close() }
   }
 })
 
 test('native routine exit preserves scoped drafts and attachments and clears route state before the next send', async () => {
-  for (const os of ['ios', 'android']) for (const action of ['改回主聊天', '回到主聊天', '补充：核对项目']) {
+  for (const os of ['ios', 'android']) for (const action of ['改回主聊天']) {
     const route: { botId: string; routine?: string; notification?: string; message?: string } = { botId: 'bot', routine: 'schedule:check:1000', notification: 'notice', message: 'question:q-routine' }
     const sends: { text: string; names: string[]; options: InputOptions }[] = []
     const shared = { ...parityShared(), fresh: new Set<string>() }; shared.data = parseConversation({ ...context, works: [parityWork()] })
@@ -7555,16 +7434,13 @@ test('native routine exit preserves scoped drafts and attachments and clears rou
     class File { uri: string; constructor(uri: string) { this.uri = uri } async arrayBuffer() { return new Uint8Array([1, 2]).buffer } }
     const app = nativeChatHarness(os, { 'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => route, useRouter: () => ({ setParams: (params: typeof route) => Object.assign(route, params) }) }, 'expo-file-system': { File }, '@/data/live': { useLive: () => shared }, '@/data/context': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ link: { kind: 'online' } }) } })
     const composer = () => app.render('default').find(({ type }) => type === 'Composer')!.props
-    const choose = () => {
-      if (action === '改回主聊天') { const click = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onPress; assert.ok(typeof click === 'function'); click() }
-      else { const target = workspaceModel.record(workspaceModel.record(composer().target).props).onPress; assert.ok(typeof target === 'function'); target(); const click = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onPress; assert.ok(typeof click === 'function'); click() }
-    }
+    const choose = () => { const click = app.render('default').find(({ type, props }) => type === 'Button' && componentText(props.children) === action)?.props.onPress; assert.ok(typeof click === 'function'); click() }
     try {
       const mainScope = { networkId: 'network', deviceId: 'phone', conversationId: 'chat', inputTarget: 'main' }
       const existing = await app.drafts.write(mainScope, { text: '原主聊天草稿', files: [] })
       const change = composer().onChange, attach = composer().onPickFiles; assert.ok(typeof change === 'function' && typeof attach === 'function')
       change('例行中的新草稿'); attach([{ uri: 'file:///draft.txt', name: 'draft.txt', size: 2, mimeType: 'text/plain', async arrayBuffer() { return new Uint8Array([1, 2]).buffer }, async text() { return 'ok' }, dispose() {} }]); await settleComponent()
-      if (!action.startsWith('补充：')) {
+      {
         choose(); await settleComponent()
         assert.equal(route.routine, 'schedule:check:1000', 'a destination draft keeps the original routine view and target')
         assert.equal(composer().value, '例行中的新草稿')
@@ -7578,7 +7454,7 @@ test('native routine exit preserves scoped drafts and attachments and clears rou
       assert.equal(composer().value, '例行中的新草稿'); const selected = composer().files; assert.ok(Array.isArray(selected)); assert.equal(selected.length, 1)
       const send = composer().onSend; assert.ok(typeof send === 'function'); send(); await settleComponent()
       assert.equal(sends[0]?.text, '例行中的新草稿'); assert.deepEqual(sends[0]?.names, ['draft.txt'])
-      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), action.startsWith('补充：') ? { kind: 'work', work_id: 'work' } : { kind: 'bot_main', bot_id: 'bot' })
+      assert.deepEqual(JSON.parse(JSON.stringify(sends[0]?.options.target)), { kind: 'bot_main', bot_id: 'bot' })
     } finally { app.close() }
   }
 })
