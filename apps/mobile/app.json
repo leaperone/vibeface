@@ -34,7 +34,7 @@
           "UIInterfaceOrientationLandscapeRight"
         ]
       },
-      "buildNumber": "17"
+      "buildNumber": "2611.28.2"
     },
     "android": {
       "package": "one.leaper.vibeface",
@@ -53,7 +53,7 @@
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.WRITE_EXTERNAL_STORAGE"
       ],
-      "versionCode": 250019
+      "versionCode": 26112802
     },
     "plugins": [
       "expo-router",
@@ -73,7 +73,9 @@
           },
           "android": {
             "enabled": true,
-            "singleShareMimeTypes": ["text/plain"],
+            "singleShareMimeTypes": [
+              "text/plain"
+            ],
             "multipleShareMimeTypes": []
           }
         }
@@ -159,7 +161,7 @@
       ]
     ],
     "extra": {
-      "releaseVersion": "0.0.1-hourly.2026111300"
+      "releaseVersion": "0.0.1-hourly.2026112802"
     }
   }
 }
