@@ -733,54 +733,7 @@ pub fn validate_memory(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Obvious credentials: private key blocks, bearer tokens, secret assignments, well-known key
-/// prefixes and long unbroken runs that mix cases and digits as keys do.
-pub fn looks_secret(text: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "-----begin",
-        "bearer ",
-        "password=",
-        "password:",
-        "passwd=",
-        "secret=",
-        "api_key=",
-        "apikey=",
-        "token=",
-    ];
-    const PREFIXES: &[&str] = &[
-        "sk-",
-        "sk_",
-        "ghp_",
-        "gho_",
-        "ghs_",
-        "ghu_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "xapp-",
-        "akia",
-        "aiza",
-        "glpat-",
-        "hf_",
-        "npm_",
-    ];
-    let lower = text.to_lowercase();
-    if MARKERS.iter().any(|marker| lower.contains(marker)) {
-        return true;
-    }
-    text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
-        .any(|word| {
-            let lower = word.to_ascii_lowercase();
-            (word.len() >= 20 && PREFIXES.iter().any(|prefix| lower.starts_with(prefix)))
-                || (word.len() >= 32
-                    && word
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
-                    && word.chars().any(|c| c.is_ascii_digit())
-                    && word.chars().any(|c| c.is_ascii_uppercase())
-                    && word.chars().any(|c| c.is_ascii_lowercase()))
-        })
-}
+pub use vibeface_bridge::looks_secret;
 
 impl BotChange {
     /// Every change sets something new; a removal needs something to remove.

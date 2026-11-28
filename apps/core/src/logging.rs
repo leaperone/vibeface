@@ -430,12 +430,7 @@ impl Sink {
     }
 }
 
-/// Whether a variable of this name holds a key, token or password.
-pub fn credential_name(name: &str) -> bool {
-    ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
-}
+pub use vibeface_bridge::credential_name;
 
 /// Model keys and other credentials the Node process was started with.
 fn environment_secrets() -> Vec<String> {

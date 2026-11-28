@@ -3,20 +3,15 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-/// Whether an environment value is a credential worth hiding in shared records. Ordinary values
-/// such as `DEBUG=1` or a workspace path must not be replaced, or every "1" in a reply vanishes.
-pub(crate) fn credential_value(name: &str, value: &str) -> bool {
-    if value.len() < 8 {
-        return false;
-    }
-    if ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+/// Whether a variable of this name holds a key, token or password.
+pub fn credential_name(name: &str) -> bool {
+    ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
-    {
-        return true;
-    }
-    let lower = value.to_ascii_lowercase();
-    if [
+}
+
+fn has_marker(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
         "-----begin",
         "bearer ",
         "password=",
@@ -26,45 +21,56 @@ pub(crate) fn credential_value(name: &str, value: &str) -> bool {
         "api_key=",
         "apikey=",
         "token=",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return true;
-    }
-    value
-        .split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
-        .any(|word| {
-            let lower = word.to_ascii_lowercase();
-            url_with_password(word)
-                || (word.len() >= 20
-                    && [
-                        "sk-",
-                        "sk_",
-                        "ghp_",
-                        "gho_",
-                        "ghs_",
-                        "ghu_",
-                        "github_pat_",
-                        "xoxb-",
-                        "xoxp-",
-                        "xapp-",
-                        "akia",
-                        "aiza",
-                        "glpat-",
-                        "hf_",
-                        "npm_",
-                    ]
-                    .iter()
-                    .any(|prefix| lower.starts_with(prefix)))
-                || (word.len() >= 32
-                    && word
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
-                    && word.chars().any(|c| c.is_ascii_digit())
-                    && word.chars().any(|c| c.is_ascii_uppercase())
-                    && word.chars().any(|c| c.is_ascii_lowercase()))
-        })
+    ];
+    MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+}
+
+fn key_shaped_word(word: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xapp-",
+        "akia",
+        "aiza",
+        "glpat-",
+        "hf_",
+        "npm_",
+    ];
+    let lower = word.to_ascii_lowercase();
+    (word.len() >= 20 && PREFIXES.iter().any(|prefix| lower.starts_with(prefix)))
+        || (word.len() >= 32
+            && word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+            && word.chars().any(|c| c.is_ascii_digit())
+            && word.chars().any(|c| c.is_ascii_uppercase())
+            && word.chars().any(|c| c.is_ascii_lowercase()))
+}
+
+/// Obvious credentials: private key blocks, bearer tokens, secret assignments, well-known key
+/// prefixes and long unbroken runs that mix cases and digits as keys do.
+pub fn looks_secret(text: &str) -> bool {
+    has_marker(&text.to_lowercase()) || words(text).any(key_shaped_word)
+}
+
+/// Whether an environment value is a credential worth hiding in shared records. Ordinary values
+/// such as `DEBUG=1` or a workspace path must not be replaced, or every "1" in a reply vanishes.
+pub(crate) fn credential_value(name: &str, value: &str) -> bool {
+    value.len() >= 8
+        && (credential_name(name)
+            || has_marker(&value.to_ascii_lowercase())
+            || words(value).any(|word| url_with_password(word) || key_shaped_word(word)))
 }
 
 /// A connection string such as `postgres://user:pass@host/db` carries its password in the
@@ -186,7 +192,7 @@ pub(crate) fn redact_stream_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::{credential_value, redact_progress, redact_stream_progress};
+    use super::{credential_value, looks_secret, redact_progress, redact_stream_progress};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -309,6 +315,15 @@ mod tests {
         assert_eq!(snapshot["text"], "[redacted]");
         assert!(!pending.contains_key("left"));
         assert!(pending.contains_key("right"));
+    }
+
+    #[test]
+    fn shared_text_and_environment_values_keep_distinct_policies() {
+        assert!(looks_secret("token="));
+        assert!(!credential_value("DEBUG", "token="));
+        let database = "postgres://test:fixture@localhost/db";
+        assert!(credential_value("DATABASE_URL", database));
+        assert!(!looks_secret(database));
     }
 
     #[test]
