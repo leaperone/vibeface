@@ -35,7 +35,7 @@ import { ArrowRightLeft,Bot,ChevronRight,CircleCheck,CircleQuestionMark,CircleSt
 import { useEffect,useMemo,useRef,useState,type ReactNode,type RefObject } from 'react'
 import { ChangeCard } from './change-card'
 import './chat.css'
-import type { ChatMessage } from './elements/message'
+import type { ChatMessage } from '@vibeface/client/chat/types.ts'
 import { HistoryControls } from './history-controls'
 
 const emptyList: never[] = []

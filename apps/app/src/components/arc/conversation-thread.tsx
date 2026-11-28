@@ -1,4 +1,5 @@
-import { Message,type ChatMessage } from '@/features/chat/elements/message'
+import { Message } from '@/features/chat/elements/message'
+import type { ChatMessage } from '@vibeface/client/chat/types.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { ArrowDown } from 'lucide-react'
