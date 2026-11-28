@@ -147,6 +147,7 @@ pub enum OfflineBlockReason {
     NotMember,
     NodeRemoved,
 }
+/// Keep the native SDK variant order: index-based serializers observe it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {

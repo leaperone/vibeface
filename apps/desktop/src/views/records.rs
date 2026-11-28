@@ -22,15 +22,7 @@ impl RecordScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Provider {
-    Codex,
-    Cursor,
-    Claude,
-    Pi,
-    Opencode,
-}
+pub use vibeface_control::provider::Provider;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkKind {

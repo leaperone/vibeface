@@ -46,14 +46,8 @@ impl Provider {
         Self::Opencode,
     ];
 
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Claude => "claude",
-            Self::Pi => "pi",
-            Self::Opencode => "opencode",
-        }
+    pub fn name(self) -> &'static str {
+        WireProvider::from(self).name()
     }
 
     pub const fn watch(self) -> Option<Watch> {
@@ -468,7 +462,10 @@ mod tests {
         );
         for provider in Provider::ALL {
             let wire = WireProvider::from(provider);
-            assert_eq!(wire.name(), provider.name());
+            assert_eq!(
+                wire.name(),
+                provider.to_possible_value().unwrap().get_name()
+            );
         }
     }
 

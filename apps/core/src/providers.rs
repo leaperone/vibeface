@@ -680,13 +680,7 @@ impl Provider {
 
     /// How config, events, the CLI and peers name the provider; serde and clap agree.
     pub fn name(self) -> &'static str {
-        match self {
-            Provider::Codex => "codex",
-            Provider::Cursor => "cursor",
-            Provider::Claude => "claude",
-            Provider::Pi => "pi",
-            Provider::Opencode => "opencode",
-        }
+        vibeface_control::provider::Provider::from(self).name()
     }
 
     /// How the owner reads the provider's name.
