@@ -1587,7 +1587,7 @@ test("workspace preserves bot and message requests while routing native decision
         '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName }, '@vibeface/client/workspace/home.ts': { unreachable },
         '@vibeface/client/chat/protocol.ts': { inputIntents, inputIntentLabel, promptIntent, awaitsDevice: () => false, botReach, botCanSend, composerHint, inputTargetKey, reachDevice, replyUnsettled, starterExamples, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
         '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
-        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
+        '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0 }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
         '@/features/chat/chrome': { ChatMaterial: 'ChatMaterial', useChatChrome: () => glass ? { kind: 'glass', colorScheme: theme } : { kind: 'solid' } },
       }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
       const stack = { Screen: 'Screen', Protected: 'Protected' }
@@ -5934,7 +5934,7 @@ function nativeChatHarness(os: string, dependencies: Record<string, unknown>) {
     '@vibeface/client/lib/node.ts': { messageOf, providerNames },
     '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/home.ts': { unreachable }, '@vibeface/client/workspace/bot-settings.ts': { botCopy, scheduleName },
     '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState', Details: 'Details' }, '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' },
-    '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0, tasks: 0, hold: null }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
+    '@vibeface/client/workspace/questions.ts': workspaceQuestions, '@vibeface/client/workspace/labels.ts': taskLabels, '@/features/chat/work': { useChatSummary: () => ({ failures: new Map(), attention: 0 }), useChatActivity: () => null }, '@/lib/layout': { useWide: () => false },
     ...dependencies,
   }, { requestAnimationFrame: (run: () => void) => run() })
 }
