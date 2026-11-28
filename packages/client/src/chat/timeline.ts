@@ -16,6 +16,14 @@ export function mergedOutcomes(jobs: readonly Pick<ManagerJob, "message_id" | "s
   return new Map(jobs.flatMap((job) => job.state === 'steered' && job.message_id ? [[job.message_id, job.outcome] as const] : []))
 }
 
+/** Reply turns that failed or were rejected without a reply of their own in the history, by the shown message they answered. */
+export function unrepliedFailures<J extends Pick<ManagerJob, "message_id" | "reply_message_id" | "state">>(jobs: readonly J[], messages: readonly { message_id: string }[]) {
+  const shown = new Set(messages.map((message) => message.message_id))
+  const failures = new Map<string, J[]>()
+  for (const job of jobs) if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) failures.set(job.message_id, [...failures.get(job.message_id) ?? [], job])
+  return failures
+}
+
 /** The person's messages a running reply holds: waiting behind it, or being taken into it. None while no reply runs. */
 export function heldMessages(jobs: readonly Pick<ManagerJob, "message_id" | "state">[]) {
   const held = new Map<string, 'queued' | 'merging'>()

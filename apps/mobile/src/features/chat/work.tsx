@@ -7,6 +7,7 @@ import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { replyUnsettled, runtimeLabel, sameTarget } from '@vibeface/client/chat/protocol.ts'
+import { unrepliedFailures } from '@vibeface/client/chat/timeline.ts'
 import { messageOf, providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
 import { chatTaskState, interruptedCopy, nodeName, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
@@ -85,12 +86,7 @@ export function useChatSummary(conversationId: string): Summary {
   return useMemo(() => {
     if (!data || !nodes || !pendingMessages) return quiet
     const jobs = data.scheduler?.jobs ?? []
-    const shown = new Set(data.messages.map((message) => message.message_id))
-    const failures = new Map<string, Row[]>()
-    for (const job of jobs) {
-      const at = job.reply_message_id && shown.has(job.reply_message_id) ? job.reply_message_id : job.message_id
-      if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '') && at) failures.set(at, [...failures.get(at) ?? [], { key: `job:${job.trigger}`, node: <JobLine job={job} /> }])
-    }
+    const failures = new Map([...unrepliedFailures(jobs, data.messages)].map(([at, failed]) => [at, failed.map((job): Row => ({ key: `job:${job.trigger}`, node: <JobLine job={job} /> }))]))
     const need = needsPerson({ nodes, pendingMessages, workspaceState: workspaceState ?? null }, data, conversationId)
     return {
       failures,

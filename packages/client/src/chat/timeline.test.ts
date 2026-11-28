@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { ManagerJob } from "../workspace/types.ts"
-import { chatTimeline, firstUnread, heldMessages, mergedOutcomes, sameReplyText, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
+import { chatTimeline, firstUnread, heldMessages, mergedOutcomes, sameReplyText, unrepliedFailures, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
 
 const minute = 60_000
 const at = (hour: number, min: number, day = 30) => new Date(2026, 9, day, hour, min, 5).getTime()
@@ -154,4 +154,12 @@ test('a running reply holds later messages as queued or merging; nothing is held
   assert.deepEqual([...heldMessages([job('r', 'running'), job('a', 'queued'), job('b', 'steering'), job('c', 'pending_delivery')])], [['a', 'queued'], ['b', 'merging'], ['c', 'queued']])
   assert.equal(heldMessages([job('r', 'running'), job('d', 'completed')]).has('d'), false)
   assert.deepEqual([...mergedOutcomes([job('a', 'steered', 'answered'), job('b', 'completed')])], [['a', 'answered']])
+})
+
+test('a failed or rejected turn without its own reply sits after the shown message it answered', () => {
+  const job = (message_id: string | undefined, state: ManagerJob['state'], reply_message_id?: string) => ({ message_id, state, reply_message_id })
+  const messages = [{ message_id: 'ask' }, { message_id: 'replied' }, { message_id: 'answer' }]
+  const failures = unrepliedFailures([job('ask', 'failed'), job('ask', 'rejected'), job('replied', 'failed', 'answer'), job('gone', 'failed'), job(undefined, 'failed'), job('ask', 'completed')], messages)
+  assert.deepEqual([...failures.keys()], ['ask'])
+  assert.deepEqual(failures.get('ask')?.map((item) => item.state), ['failed', 'rejected'])
 })

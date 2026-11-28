@@ -72,6 +72,7 @@ test('job state groups name real states, and chat screens use the shared chat he
     { rule: 'job state lists come from jobGroups', pattern: /\[[^\]]*['"][a-z_]+['"][^\]]*\]\s*\.includes\(\s*job\.state\s*\)/ },
     { rule: 'streamed and stored replies are compared by sameReplyText', pattern: /\.trim\(\)\.startsWith\(/ },
     { rule: 'merged and held messages come from mergedOutcomes and heldMessages', pattern: /state === ['"]steered['"]\)\s*\.map/ },
+    { rule: 'failure rows come from unrepliedFailures', pattern: /state [!=]== ['"]failed['"] [&|]{2} job\.state [!=]== ['"]rejected['"]/ },
   ]
   const offenders = chatSources.flatMap(files).flatMap((path) => {
     const source = readFileSync(join(root, path), 'utf8')

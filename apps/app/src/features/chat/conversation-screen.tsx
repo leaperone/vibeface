@@ -15,7 +15,7 @@ import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
-import { chatTimeline,firstUnread,heldMessages,mergedOutcomes } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline,firstUnread,heldMessages,mergedOutcomes,unrepliedFailures } from '@vibeface/client/chat/timeline.ts'
 import { routineState } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples,useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -130,7 +130,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && replyUnsettled(job))
     ? async () => { setSendError(null); await workspace.retryReply(messageId) } : undefined
   const retry = retryOf(endedAsk)
-  const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
+  const failures = unrepliedFailures(jobs, data?.messages ?? [])
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const held = heldMessages(jobs)
   const entries: ChatEntry[] = []
@@ -148,9 +148,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
     const recordedJob = jobs.find((job) => job.reply_message_id === message.message_id || !job.reply_message_id && job.message_id === message.message_id)
     if (message.message_id === newest?.message_id && !retry && (message.status === 'failed' && !recordedJob?.pending_check && (!recordedJob || !canRetryJob(recordedJob)) || merged.has(message.message_id) && (merged.get(message.message_id) ?? 'unknown') === 'unknown')) requery = true
-    for (const job of jobs) {
-      if (job.message_id !== message.message_id) continue
-      if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
+    for (const job of failures.get(message.message_id) ?? []) {
       // A reply that ended with no message of its own: 重试 sits on this line while the message is the newest.
       const again = message.role === 'user' && message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} refresh={() => workspace.refresh()} /> })
