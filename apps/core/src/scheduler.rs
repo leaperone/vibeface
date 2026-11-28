@@ -379,57 +379,67 @@ async fn prepare_turn_from(
         let local = node.identity.device_id()?;
         let actor_settings = settings.clone();
         let allowed_roots = local_settings.roots.clone();
-        local_settings.roots = node.store.call("scheduler.prepare_assignment", move |store| {
-            let settings = actor_settings;
-            let task = store
-            .workspace_task(&network, &task_id)?
-                .context("task not found")?;
-            let assignment = task
-                .current_assignment
-                .as_ref()
-            .map(|id| store.workspace_assignment(&network, id))
-                .transpose()?
-                .flatten()
-                .context("task has no execution assignment")?;
-            ensure!(
-                assignment.execution_node == local,
-                "task assignment belongs to another Node"
-            );
-            Runtime::validate_assignment_roots(&assignment.resource_roots)
-                .map_err(ManagerError::not_started)?;
-            let mut allowed = allowed_roots;
-            allowed.push(settings.workspace.clone());
-            let allowed = allowed
-                .into_iter()
-                .map(|root| root.canonicalize().map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?;
-            let roots = assignment
-                .resource_roots
-                .iter()
-                .map(|root| PathBuf::from(root).canonicalize().map_err(Into::into))
-                .collect::<Result<Vec<_>>>()?;
-            ensure!(
-                !roots.is_empty()
-                    && roots
-                        .iter()
-                        .all(|root| allowed.iter().any(|allowed| root.starts_with(allowed))),
-                "task resource permission was revoked"
-            );
-            ensure!(
-                roots
+        local_settings.roots = node
+            .store
+            .call("scheduler.prepare_assignment", move |store| {
+                let settings = actor_settings;
+                let task = store
+                    .workspace_task(&network, &task_id)?
+                    .context("task not found")?;
+                let assignment = task
+                    .current_assignment
+                    .as_ref()
+                    .map(|id| store.workspace_assignment(&network, id))
+                    .transpose()?
+                    .flatten()
+                    .context("task has no execution assignment")?;
+                ensure!(
+                    assignment.execution_node == local,
+                    "task assignment belongs to another Node"
+                );
+                Runtime::validate_assignment_roots(&assignment.resource_roots)
+                    .map_err(ManagerError::not_started)?;
+                let mut allowed = allowed_roots;
+                allowed.push(settings.workspace.clone());
+                let allowed = allowed
+                    .into_iter()
+                    .map(|root| root.canonicalize().map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?;
+                let roots = assignment
+                    .resource_roots
                     .iter()
-                    .any(|root| settings.workspace.starts_with(root)),
-                "task workspace is outside its assignment snapshot"
-            );
-            Ok(roots)
-        }).await?;
+                    .map(|root| PathBuf::from(root).canonicalize().map_err(Into::into))
+                    .collect::<Result<Vec<_>>>()?;
+                ensure!(
+                    !roots.is_empty()
+                        && roots
+                            .iter()
+                            .all(|root| allowed.iter().any(|allowed| root.starts_with(allowed))),
+                    "task resource permission was revoked"
+                );
+                ensure!(
+                    roots
+                        .iter()
+                        .any(|root| settings.workspace.starts_with(root)),
+                    "task workspace is outside its assignment snapshot"
+                );
+                Ok(roots)
+            })
+            .await?;
     }
     let resolved = if let SessionScope::Task { work_id } = scope {
         let network = network.to_owned();
         let work_id = work_id.clone();
-        Some(node.store.call("scheduler.task_selection", move |store| {
-            Ok(store.work(&network, &work_id)?.context("accepted task work missing")?.resolved)
-            }).await?)
+        Some(
+            node.store
+                .call("scheduler.task_selection", move |store| {
+                    Ok(store
+                        .work(&network, &work_id)?
+                        .context("accepted task work missing")?
+                        .resolved)
+                })
+                .await?,
+        )
     } else {
         None
     };
@@ -449,21 +459,23 @@ async fn prepare_turn_from(
         let network = network.to_owned();
         let conversation = conversation.clone();
         let resolved = resolved.clone();
-        node.store.call("scheduler.stable_context", move |store| {
-            let bot = store.bot_for_conversation(&network, &conversation)?;
-            let bot_model = (!explicit && resolved.is_none())
-                .then(|| bot_model(&settings, bot.as_ref()))
-                .flatten();
-            if !explicit {
-                settings = turn_settings(settings, bot.as_ref(), resolved.as_ref());
-            }
-            Ok((
+        node.store
+            .call("scheduler.stable_context", move |store| {
+                let bot = store.bot_for_conversation(&network, &conversation)?;
+                let bot_model = (!explicit && resolved.is_none())
+                    .then(|| bot_model(&settings, bot.as_ref()))
+                    .flatten();
+                if !explicit {
+                    settings = turn_settings(settings, bot.as_ref(), resolved.as_ref());
+                }
+                Ok((
                     configured_bot_value(bot.as_ref()),
                     skill_index(store, &network, bot.as_ref())?,
                     bot_model,
                     settings,
-            ))
-        }).await?
+                ))
+            })
+            .await?
     };
     let provider = settings.provider;
     node.refresh_provider_login(provider).await?;
@@ -648,13 +660,25 @@ async fn turn(
     let Some(mut claimed) = ({
         let identity = node.identity.clone();
         let network = network.clone();
-        let session = SessionKey { conversation_id: conversation.clone(), scope: scope.clone() };
+        let session = SessionKey {
+            conversation_id: conversation.clone(),
+            scope: scope.clone(),
+        };
         let session_config = session_config.clone();
         let limits = node.config.scheduling;
-        node.store.call("scheduler.claim", move |store| {
-            store.authorize_node(&network, &identity.device_id()?)?;
-            store.claim_next_in_session(&identity, &network, &session, boot_id(), &session_config, &limits)
-        }).await?
+        node.store
+            .call("scheduler.claim", move |store| {
+                store.authorize_node(&network, &identity.device_id()?)?;
+                store.claim_next_in_session(
+                    &identity,
+                    &network,
+                    &session,
+                    boot_id(),
+                    &session_config,
+                    &limits,
+                )
+            })
+            .await?
     }) else {
         return Ok(None);
     };
@@ -1144,25 +1168,28 @@ async fn turn(
             let conversation = conversation.clone();
             let trigger = trigger.clone();
             let local = node.identity.device_id()?;
-            node.store.call("scheduler.current_attempt", move |store| {
-                let current = store
-                    .scheduler_job(&conversation, &trigger)?
-                    .context("scheduler job missing")?;
-                let owner = store
-                    .conversation(&network, &conversation)?
-                    .and_then(|c| c.owner);
-                let moved =
-                current.kind != TriggerKind::AgentTask && owner != Some(local);
-                Ok((current, moved))
-            }).await?
+            node.store
+                .call("scheduler.current_attempt", move |store| {
+                    let current = store
+                        .scheduler_job(&conversation, &trigger)?
+                        .context("scheduler job missing")?;
+                    let owner = store
+                        .conversation(&network, &conversation)?
+                        .and_then(|c| c.owner);
+                    let moved = current.kind != TriggerKind::AgentTask && owner != Some(local);
+                    Ok((current, moved))
+                })
+                .await?
         };
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
         let no_execution = {
             let job = (current).to_owned();
-            node.store.call("scheduler.scheduler_attempt_not_started", move |store| {
-                store.scheduler_attempt_not_started(&job)
-            }).await
+            node.store
+                .call("scheduler.scheduler_attempt_not_started", move |store| {
+                    store.scheduler_attempt_not_started(&job)
+                })
+                .await
         }?;
         let terminal = if (cancellation || (stopped && no_execution)) && tools_fenced {
             JobOutcome::Cancelled(
@@ -1187,9 +1214,11 @@ async fn turn(
         {
             {
                 let reservation = reservation;
-                node.store.call("scheduler.refund_scheduler_budget", move |store| {
-                    store.refund_scheduler_budget(reservation, boot_id())
-                }).await
+                node.store
+                    .call("scheduler.refund_scheduler_budget", move |store| {
+                        store.refund_scheduler_budget(reservation, boot_id())
+                    })
+                    .await
             }?;
         }
         let text = partial.lock().expect("partial text").text();
@@ -1201,9 +1230,20 @@ async fn turn(
             let attempt_id = (attempt.id).to_owned();
             let outcome = terminal;
             let text = (prefix(&text, REPLY_LIMIT)).to_owned();
-            node.store.call("scheduler.finish_job", move |store| {
-                store.finish_job(&identity, &network, &conversation, &trigger, &attempt_id, outcome, &text, crate::runtime::now_ms())
-            }).await
+            node.store
+                .call("scheduler.finish_job", move |store| {
+                    store.finish_job(
+                        &identity,
+                        &network,
+                        &conversation,
+                        &trigger,
+                        &attempt_id,
+                        outcome,
+                        &text,
+                        crate::runtime::now_ms(),
+                    )
+                })
+                .await
         }?;
         Ok(invocation_value(&job, &network))
     }
@@ -1212,12 +1252,14 @@ async fn turn(
     if final_result.is_err()
         && !sdk_live
         && let Some(reservation) = budget.take()
-    && let Err(error) = {
-        let reservation = reservation;
-        node.store.call("scheduler.refund_scheduler_budget", move |store| {
-            store.refund_scheduler_budget(reservation, boot_id())
-        }).await
-    }
+        && let Err(error) = {
+            let reservation = reservation;
+            node.store
+                .call("scheduler.refund_scheduler_budget", move |store| {
+                    store.refund_scheduler_budget(reservation, boot_id())
+                })
+                .await
+        }
     {
         final_result = final_result.map_err(|failure| {
             failure.context(format!("scheduler budget refund failed: {error:#}"))
@@ -1227,9 +1269,16 @@ async fn turn(
         let identity = (node.identity).to_owned();
         let network = (network).to_owned();
         let job = (job).to_owned();
-        node.store.call("scheduler.settle_workspace_assignment", move |store| {
-            store.settle_workspace_assignment(&identity, &network, &job, crate::runtime::now_ms())
-        }).await
+        node.store
+            .call("scheduler.settle_workspace_assignment", move |store| {
+                store.settle_workspace_assignment(
+                    &identity,
+                    &network,
+                    &job,
+                    crate::runtime::now_ms(),
+                )
+            })
+            .await
     } {
         tracing::warn!(event="workspace.assignment.reconcile_pending",%error,"assignment waits for lifecycle reconciliation");
     }
@@ -1265,7 +1314,12 @@ async fn record_failure(
     error: &anyhow::Error,
     otherwise: TurnExecution,
 ) -> Result<SchedulerJob> {
-    let attempt = job.state.attempt().context("manager attempt missing")?.id.clone();
+    let attempt = job
+        .state
+        .attempt()
+        .context("manager attempt missing")?
+        .id
+        .clone();
     let job = job.clone();
     let (stage, mut execution) = match error.downcast_ref::<ManagerError>() {
         Some(error) => (
@@ -1278,33 +1332,37 @@ async fn record_failure(
         ),
         None => (ProviderStage::Record, otherwise),
     };
-    node.store.call("scheduler.record_failure", move |store| {
-        let current = store.scheduler_job(&job.conversation_id, &job.trigger)?.context("scheduler job missing")?;
-        if execution == TurnExecution::NotStarted
-            && (current.tool_calls
-                || current.pending_check
-                || current.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.execution == TurnExecution::Started
-                        || otherwise == TurnExecution::NotStarted
-                            && runtime.execution == TurnExecution::Unknown
-                }))
-        {
-            execution = TurnExecution::Unknown;
-        }
-        if current.runtime.is_none()
-            && execution == TurnExecution::NotStarted
-            && store.scheduler_attempt_not_started(&current)?
-        {
-            return Ok(current);
-        }
-        store.update_turn_runtime(
-            &job.conversation_id,
-            &job.trigger,
-            &attempt,
-            stage,
-            execution,
-        )
-    }).await
+    node.store
+        .call("scheduler.record_failure", move |store| {
+            let current = store
+                .scheduler_job(&job.conversation_id, &job.trigger)?
+                .context("scheduler job missing")?;
+            if execution == TurnExecution::NotStarted
+                && (current.tool_calls
+                    || current.pending_check
+                    || current.runtime.as_ref().is_some_and(|runtime| {
+                        runtime.execution == TurnExecution::Started
+                            || otherwise == TurnExecution::NotStarted
+                                && runtime.execution == TurnExecution::Unknown
+                    }))
+            {
+                execution = TurnExecution::Unknown;
+            }
+            if current.runtime.is_none()
+                && execution == TurnExecution::NotStarted
+                && store.scheduler_attempt_not_started(&current)?
+            {
+                return Ok(current);
+            }
+            store.update_turn_runtime(
+                &job.conversation_id,
+                &job.trigger,
+                &attempt,
+                stage,
+                execution,
+            )
+        })
+        .await
 }
 
 /// What a turn streams. A reply streams into its chat; an agent task's turn is its work's progress,
@@ -1338,9 +1396,11 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
             {
                 let attempt_id = (attempt).to_owned();
                 let process_group = group;
-                node.store.call("scheduler.record_manager_process", move |store| {
-                    store.record_manager_process(&attempt_id, process_group)
-                }).await
+                node.store
+                    .call("scheduler.record_manager_process", move |store| {
+                        store.record_manager_process(&attempt_id, process_group)
+                    })
+                    .await
             }
         })
     })
@@ -1352,29 +1412,36 @@ pub(crate) async fn confirm_cursor_seen(
     shown: &Shown,
     result: &vibeface_bridge::agent::AgentResult,
 ) -> Result<()> {
-    let attempt = job.state.attempt().context("Cursor attempt missing")?.id.clone();
+    let attempt = job
+        .state
+        .attempt()
+        .context("Cursor attempt missing")?
+        .id
+        .clone();
     let shown = shown.clone();
     let session_id = result.session_id.clone();
-    node.store.call("scheduler.confirm_cursor_seen", move |store| {
-        let locator = store
-        .manager_turn_record(&attempt)?
-            .context("completed Cursor locator missing")?;
-        ensure!(
-            session_id.as_deref() == Some(locator.thread.as_str()),
-            "completed Cursor agent does not match its locator"
-        );
-        let turn = locator
-            .turn
-            .as_deref()
-            .context("completed Cursor run missing")?;
-        store.record_manager_turn(
-            &attempt,
-            &locator.server,
-            &locator.thread,
-            Some(turn),
-            &shown,
-        )
-    }).await
+    node.store
+        .call("scheduler.confirm_cursor_seen", move |store| {
+            let locator = store
+                .manager_turn_record(&attempt)?
+                .context("completed Cursor locator missing")?;
+            ensure!(
+                session_id.as_deref() == Some(locator.thread.as_str()),
+                "completed Cursor agent does not match its locator"
+            );
+            let turn = locator
+                .turn
+                .as_deref()
+                .context("completed Cursor run missing")?;
+            store.record_manager_turn(
+                &attempt,
+                &locator.server,
+                &locator.thread,
+                Some(turn),
+                &shown,
+            )
+        })
+        .await
 }
 
 pub(crate) fn turn_recorder(
@@ -1419,23 +1486,25 @@ pub(crate) fn turn_recorder(
                     let network = network.clone();
                     let conversation = conversation.clone();
                     let trigger = trigger.clone();
-                    node.store.call("scheduler.record_started", move |store| {
-                        let started = store.update_turn_runtime(
-                            &conversation,
-                            &trigger,
-                            &attempt,
-                            ProviderStage::Run,
-                            TurnExecution::Started,
-                        )?;
-                        store.record_context_started(&attempt)?;
-                        store.started_workspace_assignment(
-                            &identity,
-                            &network,
-                            &started,
-                            crate::runtime::now_ms(),
-                        )?;
-                        Ok(matches!(started.scope, SessionScope::WorkspaceTask { .. }))
-                    }).await?
+                    node.store
+                        .call("scheduler.record_started", move |store| {
+                            let started = store.update_turn_runtime(
+                                &conversation,
+                                &trigger,
+                                &attempt,
+                                ProviderStage::Run,
+                                TurnExecution::Started,
+                            )?;
+                            store.record_context_started(&attempt)?;
+                            store.started_workspace_assignment(
+                                &identity,
+                                &network,
+                                &started,
+                                crate::runtime::now_ms(),
+                            )?;
+                            Ok(matches!(started.scope, SessionScope::WorkspaceTask { .. }))
+                        })
+                        .await?
                 };
                 node.publish_changed(&network, &conversation, Changed::Job(&trigger));
                 if workspace_started {
@@ -1454,13 +1523,26 @@ pub(crate) fn turn_recorder(
             let server = server.clone();
             let shown = shown.lock().expect("shown").clone();
             Box::pin(async move {
-                node.store.call("scheduler.record_native_turn", move |store| {
-                    if cursor {
-                        store.record_manager_locator(&attempt, &server, &thread, turn.as_deref())
-                    } else {
-                        store.record_manager_turn(&attempt, &server, &thread, turn.as_deref(), &shown)
-                    }
-                }).await
+                node.store
+                    .call("scheduler.record_native_turn", move |store| {
+                        if cursor {
+                            store.record_manager_locator(
+                                &attempt,
+                                &server,
+                                &thread,
+                                turn.as_deref(),
+                            )
+                        } else {
+                            store.record_manager_turn(
+                                &attempt,
+                                &server,
+                                &thread,
+                                turn.as_deref(),
+                                &shown,
+                            )
+                        }
+                    })
+                    .await
             })
         }),
     }

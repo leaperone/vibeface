@@ -352,8 +352,15 @@ pub async fn serve_gateway(node: Arc<Runtime>, mut socket: ClientSocket) -> Resu
     if !node.config.forwarding.any {
         let member = async {
             let network = node.membership_state().await?.genesis.network_id;
-            { let network = network.clone(); let target = target.clone();
-                node.store.call("gateway_authorize", move |store| store.authorize_node(&network, &target)).await }
+            {
+                let network = network.clone();
+                let target = target.clone();
+                node.store
+                    .call("gateway_authorize", move |store| {
+                        store.authorize_node(&network, &target)
+                    })
+                    .await
+            }
         };
         if let Err(error) = member.await {
             return refuse(&mut socket, "target_not_member", error).await;
@@ -934,11 +941,15 @@ async fn dispatch(
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.
             let principal = principal(node, session).await?;
             session.subscribed = Some(principal.can_manage);
-            let vector: std::collections::BTreeMap<String, u64> = { let network = principal.network_id.clone();
-                node.store.call("subscribe_heads", move |store| store.heads(&network)).await }?
-                .into_iter()
-                .map(|(author, (seq, _))| (author, seq))
-                .collect();
+            let vector: std::collections::BTreeMap<String, u64> = {
+                let network = principal.network_id.clone();
+                node.store
+                    .call("subscribe_heads", move |store| store.heads(&network))
+                    .await
+            }?
+            .into_iter()
+            .map(|(author, (seq, _))| (author, seq))
+            .collect();
             let behind = params["vector"].as_object().is_some_and(|seen| {
                 seen.iter().any(|(author, seq)| {
                     seq.as_u64()
@@ -996,8 +1007,14 @@ async fn dispatch(
         "invite" => {
             manager_view(node, session).await?;
             let record: InviteRecord = from_field(&params, "record")?;
-            let join_id = { let device = session.device_id.clone();
-                node.store.call("register_invite", move |store| store.register_invite(&record, &device)).await }?;
+            let join_id = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("register_invite", move |store| {
+                        store.register_invite(&record, &device)
+                    })
+                    .await
+            }?;
             Ok(json!({"join_id":join_id,"entry":node.share_link()?.to_string()}))
         }
         "entrances" => {
@@ -1008,8 +1025,15 @@ async fn dispatch(
             )
         }
         "join_check" => {
-            let state = { let secret = text(&params, "secret")?.to_owned(); let device = session.device_id.clone();
-                node.store.call("invite_state", move |store| store.invite_state(&secret, &device)).await }?;
+            let state = {
+                let secret = text(&params, "secret")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("invite_state", move |store| {
+                        store.invite_state(&secret, &device)
+                    })
+                    .await
+            }?;
             Ok(json!({"invite":state}))
         }
         "join" => {
@@ -1018,18 +1042,24 @@ async fn dispatch(
                 join.public_key == session.device_id,
                 "join key differs from this channel's device"
             );
-            let request = { let device = session.device_id.clone();
-                node.store.call("join", move |store| store.join(&join, &device)).await }?;
+            let request = {
+                let device = session.device_id.clone();
+                node.store
+                    .call("join", move |store| store.join(&join, &device))
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
             let Some(join_id) = params.get("join_id") else {
                 manager_view(node, session).await?;
-                let mut pending = serde_json::to_value(
-                    { let device = session.device_id.clone();
-                    node.store.call("pending_joins", move |store| store.pending_joins(&device)).await }?,
-                )?;
+                let mut pending = serde_json::to_value({
+                    let device = session.device_id.clone();
+                    node.store
+                        .call("pending_joins", move |store| store.pending_joins(&device))
+                        .await
+                }?)?;
                 // A join waits on the Node whose invite it used; managers see it from any entry.
                 if let Some(local) = pending.as_array_mut() {
                     for remote in node.remote_joins(&session.device_id).await {
@@ -1045,10 +1075,16 @@ async fn dispatch(
             };
             let join_id = join_id.as_str().context("join_id must be a string")?;
             let reveal = params.get("reveal").and_then(Value::as_str);
-            let request =
-                { let join_id = join_id.to_owned(); let device = session.device_id.clone();
-                    let reveal = reveal.map(str::to_owned);
-                    node.store.call("join_status", move |store| store.join_status(&join_id, &device, reveal.as_deref())).await }?;
+            let request = {
+                let join_id = join_id.to_owned();
+                let device = session.device_id.clone();
+                let reveal = reveal.map(str::to_owned);
+                node.store
+                    .call("join_status", move |store| {
+                        store.join_status(&join_id, &device, reveal.as_deref())
+                    })
+                    .await
+            }?;
             if reveal.is_some() {
                 node.join_changed(&request.network_id);
             }
@@ -1062,22 +1098,37 @@ async fn dispatch(
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
                 state.project()?.member(&session.device_id)?;
-                result["addresses"] = json!(node.store.call("address_book", |store| store.address_book()).await?);
+                result["addresses"] = json!(
+                    node.store
+                        .call("address_book", |store| store.address_book())
+                        .await?
+                );
                 result["state"] = serde_json::to_value(state)?;
             }
             Ok(result)
         }
         "join_withdraw" => {
-            let request = { let join_id = text(&params, "join_id")?.to_owned(); let device = session.device_id.clone();
-                node.store.call("withdraw_join", move |store| store.withdraw_join(&join_id, &device)).await }?;
+            let request = {
+                let join_id = text(&params, "join_id")?.to_owned();
+                let device = session.device_id.clone();
+                node.store
+                    .call("withdraw_join", move |store| {
+                        store.withdraw_join(&join_id, &device)
+                    })
+                    .await
+            }?;
             node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
             manager_view(node, session).await?;
             let join_id = text(&params, "join_id")?;
-            if { let join_id = join_id.to_owned();
-                node.store.call("holds_join", move |store| store.holds_join(&join_id)).await }? {
+            if {
+                let join_id = join_id.to_owned();
+                node.store
+                    .call("holds_join", move |store| store.holds_join(&join_id))
+                    .await
+            }? {
                 approve_join(node, &session.device_id, &params).await
             } else {
                 node.forward_join_approval(&session.device_id, &params)
@@ -1250,8 +1301,12 @@ async fn dispatch(
                 })
                 .context("recovery key does not own this personal network")?;
             state.check_root(key, now as u64, false)?;
-            let heads = { let network = state.genesis.network_id.clone();
-                node.store.call("heads", move |store| store.heads(&network)).await }?;
+            let heads = {
+                let network = state.genesis.network_id.clone();
+                node.store
+                    .call("heads", move |store| store.heads(&network))
+                    .await
+            }?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1344,9 +1399,16 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
             incoming.recover_at(next, now)?;
         }
         stays(&incoming.project_at(now)?, &node_id)?;
-        { let incoming = incoming.clone(); let capability = text(params, "capability")?.to_owned();
+        {
+            let incoming = incoming.clone();
+            let capability = text(params, "capability")?.to_owned();
             let device = session.device_id.clone();
-            node.store.call("bootstrap_network", move |store| store.bootstrap_network(incoming, &capability, &device)).await }?;
+            node.store
+                .call("bootstrap_network", move |store| {
+                    store.bootstrap_network(incoming, &capability, &device)
+                })
+                .await
+        }?;
         node.install_membership(incoming).await?;
         return Ok(());
     }
@@ -1419,16 +1481,38 @@ pub(crate) async fn approve_join(
 ) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
-        { let join_id = join_id.to_owned(); let admin = admin.to_owned();
-            node.store.call("reject_join", move |store| store.reject_join(&join_id, &admin)).await }?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("reject_join", move |store| {
+                    store.reject_join(&join_id, &admin)
+                })
+                .await
+        }?
     } else if let Some(nonce) = params.get("admin_nonce") {
         let nonce = nonce.as_str().context("admin_nonce must be a string")?;
-        { let join_id = join_id.to_owned(); let admin = admin.to_owned(); let nonce = nonce.to_owned();
-            node.store.call("approve_nonce", move |store| store.approve_nonce(&join_id, &admin, &nonce)).await }?
+        {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            let nonce = nonce.to_owned();
+            node.store
+                .call("approve_nonce", move |store| {
+                    store.approve_nonce(&join_id, &admin, &nonce)
+                })
+                .await
+        }?
     } else {
         let event: GovernanceEvent = from_field(params, "event")?;
-        let (request, state) = { let join_id = join_id.to_owned(); let admin = admin.to_owned();
-            node.store.call("approve_grant", move |store| store.approve_grant(&join_id, &admin, event)).await }?;
+        let (request, state) = {
+            let join_id = join_id.to_owned();
+            let admin = admin.to_owned();
+            node.store
+                .call("approve_grant", move |store| {
+                    store.approve_grant(&join_id, &admin, event)
+                })
+                .await
+        }?;
         node.install_membership(state.clone()).await?;
         request
     };
@@ -1671,7 +1755,14 @@ fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
     }
     if matches!(
         input["method"].as_str(),
-        Some("message" | "presence" | "notifications" | "ack" | "workspace_command_receipt" | "signed_receipt")
+        Some(
+            "message"
+                | "presence"
+                | "notifications"
+                | "ack"
+                | "workspace_command_receipt"
+                | "signed_receipt"
+        )
     ) {
         input
             .as_object_mut()
@@ -1862,8 +1953,14 @@ async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Resul
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
     );
-    { let capability = text(params, "capability")?.to_owned();
-        node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
+    {
+        let capability = text(params, "capability")?.to_owned();
+        node.store
+            .call("verify_bootstrap_capability", move |store| {
+                store.verify_bootstrap_capability(&capability)
+            })
+            .await
+    }?;
     let ticket = parse_join_link(text(params, "link")?)?;
     let link = JoinLink::open(node, &ticket).await?;
     let reply = link
@@ -1921,8 +2018,14 @@ pub(crate) async fn start_node_join(
         "this Node already belongs to a personal network"
     );
     if let JoinOwner::Page(capability) = &owner {
-        { let capability = capability.clone();
-            node.store.call("verify_bootstrap_capability", move |store| store.verify_bootstrap_capability(&capability)).await }?;
+        {
+            let capability = capability.clone();
+            node.store
+                .call("verify_bootstrap_capability", move |store| {
+                    store.verify_bootstrap_capability(&capability)
+                })
+                .await
+        }?;
     }
     let mut slot = node
         .node_join
@@ -2674,7 +2777,12 @@ mod tests {
             signature: String::new(),
         };
         record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
-        target.store.call("fixture_invite", move |store| store.register_invite(&record, &record.issuer)).await?;
+        target
+            .store
+            .call("fixture_invite", move |store| {
+                store.register_invite(&record, &record.issuer)
+            })
+            .await?;
         let target_net = Arc::new(
             Net::bind(
                 &target.identity.secret_key_hex,

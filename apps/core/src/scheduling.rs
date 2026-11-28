@@ -398,8 +398,6 @@ pub struct RuntimeSelection {
     pub reasoning_effort: Option<String>,
 }
 
-
-
 /// Safe submitted configuration and execution evidence. Native identifiers and credentials stay local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnRuntime {
@@ -817,4 +815,4 @@ mod lane_tests {
     }
 }
 
-pub use vibeface_protocol::workspace::{TurnExecution};
+pub use vibeface_protocol::workspace::TurnExecution;

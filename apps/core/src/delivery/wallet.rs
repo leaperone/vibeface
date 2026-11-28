@@ -328,8 +328,10 @@ impl super::Delivery {
             .wallet
             .lock()
             .map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?;
-        if matches!(command, WalletCommand::Create { .. } | WalletCommand::Unlock { .. })
-            && wallet.is_deferred()
+        if matches!(
+            command,
+            WalletCommand::Create { .. } | WalletCommand::Unlock { .. }
+        ) && wallet.is_deferred()
         {
             *wallet = Wallet::open(self.data_dir.join("delivery-wallet.json"))?;
         }

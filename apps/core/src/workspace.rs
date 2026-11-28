@@ -1,10 +1,15 @@
 //! Personal workspace commands and projections share the signed event log.
-pub use vibeface_protocol::workspace::{InputTarget, InputIntent, InputRoute, InputRequest, WorkspaceInput, TaskAction, AssignmentState, InputControl, QueuedInput, WorkspaceCommand, Channel, TaskState, WorkspaceTask, AssignmentSubmission, Assignment, WorkspaceSpeaker, WorkspaceCoverage, WorkspaceState, WorkspaceCommandReceipt};
 use crate::{
     model::{DeviceId, EventHash, ScopeId},
     scheduling::SessionScope,
 };
 use serde::{Deserialize, Serialize};
+pub use vibeface_protocol::workspace::{
+    Assignment, AssignmentState, AssignmentSubmission, Channel, InputControl, InputIntent,
+    InputRequest, InputRoute, InputTarget, QueuedInput, TaskAction, TaskState, WorkspaceCommand,
+    WorkspaceCommandReceipt, WorkspaceCoverage, WorkspaceInput, WorkspaceSpeaker, WorkspaceState,
+    WorkspaceTask,
+};
 
 pub const WORKSPACE_SCOPE: &str = "workspace";
 pub const MAX_AUTOMATIC_ASSIGNMENTS: usize = 8;

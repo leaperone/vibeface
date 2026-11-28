@@ -845,31 +845,49 @@ impl Runtime {
         let threads = self.triage.threads.clone();
         let requests = self.triage.requests.clone();
         let actor_network = network.clone();
-        let (result, claimed) = self.store.call("triage.queue_event", move |store| {
-            if own_turn(store, &event)? {
-                return Ok((json!({"status":"own","event_id":event.event_id}), None));
-            }
-            if store.session_muted(&actor_network, &event.node, &event.session_id)? {
-                return Ok((json!({"status":"muted","event_id":event.event_id}), None));
-            }
-            let (scope, claimed) = match owner(store, &actor_network, &event)? {
-                Some(scope) => (Some(scope), None),
-                None => Self::claim_session(store, &identity, &roots, &threads, &actor_network, &event)?,
-            };
-            let Some(scope) = scope else {
-                return Ok((json!({"status":"foreign","event_id":event.event_id}), None));
-            };
-            if let Some(id) = &event.request_id {
-                let epoch = store.conversation(&actor_network, &scope)?
-                    .map(|conversation| conversation.owner_epoch);
-                if let Some(request) = lock(&requests).get_mut(id) {
-                    request.owner_epoch = epoch;
+        let (result, claimed) = self
+            .store
+            .call("triage.queue_event", move |store| {
+                if own_turn(store, &event)? {
+                    return Ok((json!({"status":"own","event_id":event.event_id}), None));
                 }
-            }
-            let event_id = event.event_id.clone();
-            let status = if store.queue_triage_event(event, now_ms())? { "accepted" } else { "duplicate" };
-            Ok((json!({"status":status,"event_id":event_id}), claimed.map(|hash| (scope, hash))))
-        }).await?;
+                if store.session_muted(&actor_network, &event.node, &event.session_id)? {
+                    return Ok((json!({"status":"muted","event_id":event.event_id}), None));
+                }
+                let (scope, claimed) = match owner(store, &actor_network, &event)? {
+                    Some(scope) => (Some(scope), None),
+                    None => Self::claim_session(
+                        store,
+                        &identity,
+                        &roots,
+                        &threads,
+                        &actor_network,
+                        &event,
+                    )?,
+                };
+                let Some(scope) = scope else {
+                    return Ok((json!({"status":"foreign","event_id":event.event_id}), None));
+                };
+                if let Some(id) = &event.request_id {
+                    let epoch = store
+                        .conversation(&actor_network, &scope)?
+                        .map(|conversation| conversation.owner_epoch);
+                    if let Some(request) = lock(&requests).get_mut(id) {
+                        request.owner_epoch = epoch;
+                    }
+                }
+                let event_id = event.event_id.clone();
+                let status = if store.queue_triage_event(event, now_ms())? {
+                    "accepted"
+                } else {
+                    "duplicate"
+                };
+                Ok((
+                    json!({"status":status,"event_id":event_id}),
+                    claimed.map(|hash| (scope, hash)),
+                ))
+            })
+            .await?;
         if let Some((scope, hash)) = claimed {
             self.publish_changed(&network, &scope, Changed::Event(&hash));
         }
@@ -997,9 +1015,12 @@ impl Runtime {
             && let Some(thread) = &handed.thread_id
         {
             let thread = thread.clone();
-            cwd = self.store.call("triage.work_cwd_on_thread", move |store| {
-                store.work_cwd_on_thread(&thread)
-            }).await
+            cwd = self
+                .store
+                .call("triage.work_cwd_on_thread", move |store| {
+                    store.work_cwd_on_thread(&thread)
+                })
+                .await
                 .ok()
                 .flatten()
                 .unwrap_or_default();
@@ -1025,9 +1046,12 @@ impl Runtime {
             Ok(result) if result["status"] == "duplicate" => {
                 let event_id = result["event_id"].as_str().unwrap_or_default().to_owned();
                 let actor_request_id = request_id.clone();
-                let attached = self.store.call("triage.attach_request", move |store| {
-                    store.attach_triage_request(&event_id, &actor_request_id)
-                }).await;
+                let attached = self
+                    .store
+                    .call("triage.attach_request", move |store| {
+                        store.attach_triage_request(&event_id, &actor_request_id)
+                    })
+                    .await;
                 if let Err(error) = &attached {
                     tracing::warn!(event = "request.unrouted", %error, request = %request_id,
                         "App Server request could not rejoin its pending event");
@@ -1174,9 +1198,11 @@ impl Runtime {
         };
         let request_id = request_id.to_owned();
         let answered = by != "fallback";
-        self.store.call("triage.finish_request", move |store| {
-            store.finish_triage_request(&request_id, answered)
-        }).await?;
+        self.store
+            .call("triage.finish_request", move |store| {
+                store.finish_triage_request(&request_id, answered)
+            })
+            .await?;
         Ok(outcome)
     }
 
@@ -1190,10 +1216,14 @@ impl Runtime {
             if let (Some(question), None) = (&request.question_id, request.answer_by_ms) {
                 let network = self.network_id().await?;
                 let question = question.to_owned();
-                let answered = self.store.call("triage.expire_question", move |store| {
-                    Ok(store.question(&network, &question)?
-                        .is_some_and(|question| !question["answer"].is_null()))
-                }).await?;
+                let answered = self
+                    .store
+                    .call("triage.expire_question", move |store| {
+                        Ok(store
+                            .question(&network, &question)?
+                            .is_some_and(|question| !question["answer"].is_null()))
+                    })
+                    .await?;
                 if answered
                     && let Some(held) = lock(&self.triage.requests).get_mut(&request.request_id)
                 {
@@ -1219,34 +1249,36 @@ impl Runtime {
             let queued = {
                 let network = network.clone();
                 let question = question.to_owned();
-                self.store.call("triage.queue_live_answer", move |store| {
-                    let Some(question_body) = store.question(&network, &question)? else {
-                        return Ok(false);
-                    };
-                    if question_body["answer"].is_null() {
-                        return Ok(false);
-                    }
-                    let scope = question_body["conversation_id"]
-                        .as_str()
-                        .context("question has no conversation")?;
-                    if store
-                        .held_answer_receipt(
+                self.store
+                    .call("triage.queue_live_answer", move |store| {
+                        let Some(question_body) = store.question(&network, &question)? else {
+                            return Ok(false);
+                        };
+                        if question_body["answer"].is_null() {
+                            return Ok(false);
+                        }
+                        let scope = question_body["conversation_id"]
+                            .as_str()
+                            .context("question has no conversation")?;
+                        if store
+                            .held_answer_receipt(
+                                &network,
+                                scope,
+                                &crate::store::questions::answer_id(&question),
+                            )?
+                            .is_some()
+                        {
+                            return Ok(false);
+                        }
+                        store.queue_answer_control(
                             &network,
-                            scope,
-                        &crate::store::questions::answer_id(&question),
-                        )?
-                        .is_some()
-                    {
-                        return Ok(false);
-                    }
-                    store.queue_answer_control(
-                        &network,
-                        &question,
-                        &binding,
-                        AnswerAuthority::Signed,
-                        now_ms(),
-                    )
-                }).await
+                            &question,
+                            &binding,
+                            AnswerAuthority::Signed,
+                            now_ms(),
+                        )
+                    })
+                    .await
             };
             match queued {
                 Ok(true) => self.triage.wake.notify_one(),
@@ -1271,46 +1303,51 @@ impl Runtime {
         let network = network.to_owned();
         let conversation = conversation.to_owned();
         let message_id = message_id.to_owned();
-        let receipt = self.store.call("triage.accept_answer_delivery", move |store| {
-            let Some(message) = store.message(&network, &conversation, &message_id)? else {
-                return Ok(None);
-            };
-            let Some(question_id) = &message.answers else {
-                return Ok(None);
-            };
-            let question = store
-            .question(&network, question_id)?
-                .context("answer question is missing")?;
-            let Some(request_id) = question["about"]["request_id"].as_str() else {
-                return Ok(None);
-            };
-            ensure!(
-                question["about"]["node"] == node,
-                "this Node does not hold the answer's request"
-            );
-            if let Some(receipt) = store.held_answer_receipt(&network, &conversation, &message_id)? {
-                return Ok(Some(receipt));
-            }
-            let request = lock(&requests)
-                .get(request_id)
-                .cloned()
-                .context("the original request is no longer waiting on this Node")?;
-            ensure!(
-                request.question_id.as_deref() == Some(question_id),
-                "the held request belongs to another question"
-            );
-            store.queue_answer_control(
-                &network,
-                question_id,
-                &request.answer_binding(&node),
-                AnswerAuthority::Signed,
-                now_ms(),
-            )?;
-            let receipt = store
-            .held_answer_receipt(&network, &conversation, &message_id)?
-                .context("answer control receipt was not saved")?;
-            Ok(Some(receipt))
-        }).await?;
+        let receipt = self
+            .store
+            .call("triage.accept_answer_delivery", move |store| {
+                let Some(message) = store.message(&network, &conversation, &message_id)? else {
+                    return Ok(None);
+                };
+                let Some(question_id) = &message.answers else {
+                    return Ok(None);
+                };
+                let question = store
+                    .question(&network, question_id)?
+                    .context("answer question is missing")?;
+                let Some(request_id) = question["about"]["request_id"].as_str() else {
+                    return Ok(None);
+                };
+                ensure!(
+                    question["about"]["node"] == node,
+                    "this Node does not hold the answer's request"
+                );
+                if let Some(receipt) =
+                    store.held_answer_receipt(&network, &conversation, &message_id)?
+                {
+                    return Ok(Some(receipt));
+                }
+                let request = lock(&requests)
+                    .get(request_id)
+                    .cloned()
+                    .context("the original request is no longer waiting on this Node")?;
+                ensure!(
+                    request.question_id.as_deref() == Some(question_id),
+                    "the held request belongs to another question"
+                );
+                store.queue_answer_control(
+                    &network,
+                    question_id,
+                    &request.answer_binding(&node),
+                    AnswerAuthority::Signed,
+                    now_ms(),
+                )?;
+                let receipt = store
+                    .held_answer_receipt(&network, &conversation, &message_id)?
+                    .context("answer control receipt was not saved")?;
+                Ok(Some(receipt))
+            })
+            .await?;
         if receipt.is_some() {
             self.triage.wake.notify_one();
         }
@@ -1335,9 +1372,11 @@ impl Runtime {
             let boot = self.boot.clone();
             let attempt = attempt.to_owned();
             let control = control.clone();
-            self.store.call("triage.validate_answer_claim", move |store| {
-                store.validate_answer_control_claim(&boot, &attempt, &control)
-            }).await?;
+            self.store
+                .call("triage.validate_answer_claim", move |store| {
+                    store.validate_answer_control_claim(&boot, &attempt, &control)
+                })
+                .await?;
         }
         let request = lock(&self.triage.requests)
             .get(&control.request.request_id)
@@ -1362,7 +1401,10 @@ impl Runtime {
                 == request.permission_epoch,
             "the request's captured permissions were revoked"
         );
-        fn active_group(store: &crate::store::Store, control: &HeldAnswerControl) -> Result<Vec<crate::work::WorkRecord>> {
+        fn active_group(
+            store: &crate::store::Store,
+            control: &HeldAnswerControl,
+        ) -> Result<Vec<crate::work::WorkRecord>> {
             let request = &control.request;
             let mut active: Vec<_> = store
                 .work_records_on_thread(&request.session_id)?
@@ -1421,7 +1463,11 @@ impl Runtime {
         }
         let active = {
             let control = control.clone();
-            self.store.call("triage.answer_active_group", move |store| active_group(store, &control)).await?
+            self.store
+                .call("triage.answer_active_group", move |store| {
+                    active_group(store, &control)
+                })
+                .await?
         };
         let work_ids: Vec<_> = active.iter().map(|record| record.work_id.clone()).collect();
         let work_id = &work_ids[0];
@@ -1429,40 +1475,42 @@ impl Runtime {
         let parent = {
             let control = control.clone();
             let work_id = work_id.clone();
-            self.store.call("triage.answer_parent", move |store| {
-                let work = store
-                .work(&control.network, &work_id)?
-                    .context("the request's work is missing")?;
-                if let Some(parent) = &work.parent {
-                    let parent = store
-                        .work_record(parent)?
-                        .context("the request's parent task is missing")?;
-                    ensure!(
-                        parent.kind == crate::model::WorkKind::Task && !parent.state.finished(),
-                        "the request's parent task is no longer active"
-                    );
-                    let job = store
-                        .scheduler_job(
-                            &parent.conversation,
-                            &crate::scheduling::task_trigger(&parent.work_id),
-                        )?
-                        .context("the request's parent task job is missing")?;
-                    let attempt = job
-                        .state
-                        .attempt()
-                        .context("the request's parent task attempt is missing")?
-                        .id
-                        .clone();
-                    let provider = job
-                        .runtime
-                        .as_ref()
-                        .context("the request's parent task runtime is missing")?
-                        .provider;
-                    Ok(Some((parent.work_id, attempt, provider)))
-                } else {
-                    Ok(None)
-                }
-            }).await?
+            self.store
+                .call("triage.answer_parent", move |store| {
+                    let work = store
+                        .work(&control.network, &work_id)?
+                        .context("the request's work is missing")?;
+                    if let Some(parent) = &work.parent {
+                        let parent = store
+                            .work_record(parent)?
+                            .context("the request's parent task is missing")?;
+                        ensure!(
+                            parent.kind == crate::model::WorkKind::Task && !parent.state.finished(),
+                            "the request's parent task is no longer active"
+                        );
+                        let job = store
+                            .scheduler_job(
+                                &parent.conversation,
+                                &crate::scheduling::task_trigger(&parent.work_id),
+                            )?
+                            .context("the request's parent task job is missing")?;
+                        let attempt = job
+                            .state
+                            .attempt()
+                            .context("the request's parent task attempt is missing")?
+                            .id
+                            .clone();
+                        let provider = job
+                            .runtime
+                            .as_ref()
+                            .context("the request's parent task runtime is missing")?
+                            .provider;
+                        Ok(Some((parent.work_id, attempt, provider)))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .await?
         };
         // Parent first, then stable Work order, matching cancellation's lock order.
         if let Some((_, attempt, provider)) = &parent {
@@ -1474,13 +1522,15 @@ impl Runtime {
         let cwd = {
             let control = control.clone();
             let work_id = work_id.clone();
-            self.store.call("triage.answer_cwd", move |store| {
-                let work = store
-                .work(&control.network, &work_id)?
-                    .context("the request's work is missing")?;
-                Self::validate_work_assignment_roots(store, &control.network, &work.trigger)?;
-                Ok(work.cwd)
-            }).await?
+            self.store
+                .call("triage.answer_cwd", move |store| {
+                    let work = store
+                        .work(&control.network, &work_id)?
+                        .context("the request's work is missing")?;
+                    Self::validate_work_assignment_roots(store, &control.network, &work.trigger)?;
+                    Ok(work.cwd)
+                })
+                .await?
         };
         let actual_cwd = self
             .work_native_directory(request.provider, Some(&request.session_id), &cwd)
@@ -1494,98 +1544,116 @@ impl Runtime {
         } else {
             None
         };
-        let allowed = self.providers().switches.execution.contains(&request.provider);
-        let permission_epoch = self.local_permission_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let allowed = self
+            .providers()
+            .switches
+            .execution
+            .contains(&request.provider);
+        let permission_epoch = self
+            .local_permission_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
         let actor_control = control.clone();
-        self.store.call("triage.answer_permission", move |store| {
-            let control = &actor_control;
-            let request = &control.request;
-            store.authorize_node(&control.network, &request.node)?;
-            let active = active_group(store, control)?;
-            ensure!(
-                active
-                    .iter()
-                    .map(|record| &record.work_id)
-                    .eq(work_ids.iter()),
-                "the request's active works changed before delivery"
-            );
-            if let Some(execution) = &execution {
+        self.store
+            .call("triage.answer_permission", move |store| {
+                let control = &actor_control;
+                let request = &control.request;
+                store.authorize_node(&control.network, &request.node)?;
+                let active = active_group(store, control)?;
                 ensure!(
-                    (request.turn_id.is_empty() || request.turn_id == execution.turn_id)
-                        && work_ids.iter().any(|id| execution.work_ids.contains(id)),
-                    "the request does not identify the shared native turn"
+                    active
+                        .iter()
+                        .map(|record| &record.work_id)
+                        .eq(work_ids.iter()),
+                    "the request's active works changed before delivery"
                 );
-            }
-            let stops = store.stop_requests()?;
-            for record in &active {
-                let work_id = &record.work_id;
-                ensure!(
-                    record.kind == crate::model::WorkKind::Agent(request.provider)
-                        && !stops.iter().any(|stop| &stop.work_id == work_id)
-                        && !store.peer_cancelled(&control.network, &record.conversation, work_id)?,
-                    "the request's work was stopped or changed provider"
-                );
-                ensure!(
-                    store.work_native_write_allowed(&control.network, work_id)?,
-                    "the request's work has no current authority for native submission"
-                );
-                if let Some(handle) = record.state.handle() {
+                if let Some(execution) = &execution {
                     ensure!(
-                        (request.turn_id.is_empty() || handle.turn_id == request.turn_id)
-                            && execution
-                                .as_ref()
-                                .is_none_or(|execution| handle.thread_id == execution.thread_id
+                        (request.turn_id.is_empty() || request.turn_id == execution.turn_id)
+                            && work_ids.iter().any(|id| execution.work_ids.contains(id)),
+                        "the request does not identify the shared native turn"
+                    );
+                }
+                let stops = store.stop_requests()?;
+                for record in &active {
+                    let work_id = &record.work_id;
+                    ensure!(
+                        record.kind == crate::model::WorkKind::Agent(request.provider)
+                            && !stops.iter().any(|stop| &stop.work_id == work_id)
+                            && !store.peer_cancelled(
+                                &control.network,
+                                &record.conversation,
+                                work_id
+                            )?,
+                        "the request's work was stopped or changed provider"
+                    );
+                    ensure!(
+                        store.work_native_write_allowed(&control.network, work_id)?,
+                        "the request's work has no current authority for native submission"
+                    );
+                    if let Some(handle) = record.state.handle() {
+                        ensure!(
+                            (request.turn_id.is_empty() || handle.turn_id == request.turn_id)
+                                && execution.as_ref().is_none_or(|execution| handle.thread_id
+                                    == execution.thread_id
                                     && handle.turn_id == execution.turn_id),
-                        "the request belongs to another work turn"
-                    );
-                } else if let Some(execution) = &execution {
+                            "the request belongs to another work turn"
+                        );
+                    } else if let Some(execution) = &execution {
+                        ensure!(
+                            store
+                                .work_native_execution(&control.network, work_id)?
+                                .is_some_and(|reserved| reserved.thread_id == execution.thread_id
+                                    && reserved.turn_id == execution.turn_id),
+                            "the request's work has no shared native turn permit"
+                        );
+                    }
+                    let work = store
+                        .work(&control.network, work_id)?
+                        .context("the request's work is missing")?;
                     ensure!(
-                        store
-                            .work_native_execution(&control.network, work_id)?
-                            .is_some_and(|reserved| reserved.thread_id == execution.thread_id
-                                && reserved.turn_id == execution.turn_id),
-                        "the request's work has no shared native turn permit"
+                        work.target_node == request.node
+                            && work.outcome.is_none()
+                            && work.parent.as_ref() == parent.as_ref().map(|(id, _, _)| id)
+                            && allowed
+                            && permission_epoch == request.permission_epoch,
+                        "the request's execution permission was revoked"
                     );
-                }
-                let work = store
-                    .work(&control.network, work_id)?
-                    .context("the request's work is missing")?;
-                ensure!(
-                    work.target_node == request.node
-                        && work.outcome.is_none()
-                        && work.parent.as_ref() == parent.as_ref().map(|(id, _, _)| id)
-                    && allowed
-                    && permission_epoch == request.permission_epoch,
-                    "the request's execution permission was revoked"
-                );
-                Self::validate_work_assignment_roots(store, &control.network, &work.trigger)?;
-                ensure!(
-                    (work.cwd.is_empty() || PathBuf::from(&work.cwd).canonicalize()? == actual_cwd)
-                        && store.work_native_directory_matches_reservation(
-                            &control.network,
-                            &work,
-                            actual_cwd
-                                .to_str()
-                                .context("native work directory is not UTF-8")?
-                        )?,
-                    "the request's native directory differs from the reserved work"
-                );
-                if parent.is_none() {
-                    let owner = store
-                        .conversation(&control.network, &record.conversation)?
-                        .context("work conversation missing")?;
+                    Self::validate_work_assignment_roots(store, &control.network, &work.trigger)?;
                     ensure!(
-                        owner.owner.as_deref() == Some(work.dispatcher.as_str())
-                            && request.owner_epoch == Some(owner.owner_epoch),
-                        "the request's work owner is no longer valid"
+                        (work.cwd.is_empty()
+                            || PathBuf::from(&work.cwd).canonicalize()? == actual_cwd)
+                            && store.work_native_directory_matches_reservation(
+                                &control.network,
+                                &work,
+                                actual_cwd
+                                    .to_str()
+                                    .context("native work directory is not UTF-8")?
+                            )?,
+                        "the request's native directory differs from the reserved work"
                     );
+                    if parent.is_none() {
+                        let owner = store
+                            .conversation(&control.network, &record.conversation)?
+                            .context("work conversation missing")?;
+                        ensure!(
+                            owner.owner.as_deref() == Some(work.dispatcher.as_str())
+                                && request.owner_epoch == Some(owner.owner_epoch),
+                            "the request's work owner is no longer valid"
+                        );
+                    }
                 }
-            }
-            Ok(())
-        }).await?;
+                Ok(())
+            })
+            .await?;
         ensure!(
-            self.local_permission_epoch.load(std::sync::atomic::Ordering::Acquire) == request.permission_epoch
-            && self.providers().switches.execution.contains(&request.provider),
+            self.local_permission_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == request.permission_epoch
+                && self
+                    .providers()
+                    .switches
+                    .execution
+                    .contains(&request.provider),
             "the request's execution permission was revoked"
         );
         Ok(leases)
@@ -1625,9 +1693,12 @@ impl Runtime {
         let held: HashSet<String> = lock(&self.triage.requests).keys().cloned().collect();
         let identity = self.identity.clone();
         let actor_network = network.clone();
-        let closed = self.store.call("triage.close_lost_questions", move |store| {
-            store.close_lost_questions(&identity, &actor_network, &held, now_ms())
-        }).await?;
+        let closed = self
+            .store
+            .call("triage.close_lost_questions", move |store| {
+                store.close_lost_questions(&identity, &actor_network, &held, now_ms())
+            })
+            .await?;
         for (scope, event) in closed {
             tracing::info!(
                 event = "question.closed",
@@ -1783,7 +1854,9 @@ impl Runtime {
     }
 
     async fn pending_events(&self) -> Result<Vec<AgentEvent>> {
-        self.store.call("triage.pending_events", |store| store.triage_events(None)).await
+        self.store
+            .call("triage.pending_events", |store| store.triage_events(None))
+            .await
     }
 
     fn capture_answer_manager(&self) -> Result<Option<ManagerConfig>> {
@@ -1853,14 +1926,16 @@ impl Runtime {
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
         let record = |thread: String| async move {
-            self.store.call("triage.record_coordination_thread", move |store| {
-                store.connection.execute(
-                    "INSERT INTO coordination_threads(thread_id) VALUES(?)
+            self.store
+                .call("triage.record_coordination_thread", move |store| {
+                    store.connection.execute(
+                        "INSERT INTO coordination_threads(thread_id) VALUES(?)
                      ON CONFLICT(thread_id) DO NOTHING",
-                    [thread],
-                )?;
-                Ok(())
-            }).await?;
+                        [thread],
+                    )?;
+                    Ok(())
+                })
+                .await?;
             Ok(())
         };
         manager::run_manager(&config, &prompt, None, record, cancel, |_| async { Ok(()) })
@@ -1872,7 +1947,12 @@ impl Runtime {
     /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`.
     async fn wake_agent(&self) -> Result<()> {
         self.queue_live_answers().await?;
-        let answering = self.store.call("triage.pending_answer_controls", |store| store.has_pending_answer_controls()).await?;
+        let answering = self
+            .store
+            .call("triage.pending_answer_controls", |store| {
+                store.has_pending_answer_controls()
+            })
+            .await?;
         if !answering && let Some(manager) = self.manager() {
             self.refresh_provider_login(manager.provider).await?;
         }
@@ -1888,9 +1968,11 @@ impl Runtime {
             let network = network.clone();
             let boot = self.boot.clone();
             let limit = self.config.daily_decision_limit;
-            self.store.call("triage.admit", move |store| {
-                store.admit_triage(&network, &boot, BATCH, limit, now_ms())
-            }).await?
+            self.store
+                .call("triage.admit", move |store| {
+                    store.admit_triage(&network, &boot, BATCH, limit, now_ms())
+                })
+                .await?
         };
         let attempt = match admission {
             TriageAdmission::Empty => return Ok(()),
@@ -1927,10 +2009,13 @@ impl Runtime {
         if let Some(control) = attempt.answer() {
             let result = self.run_answer_control(attempt.id(), control).await;
             let _mutations = self.triage.mutations.lock().await;
-            return self.store.call("triage.finish_answer_control", move |store| {
-                store.finish_triage(attempt, &result)?;
-                Ok(result)
-            }).await?;
+            return self
+                .store
+                .call("triage.finish_answer_control", move |store| {
+                    store.finish_triage(attempt, &result)?;
+                    Ok(result)
+                })
+                .await?;
         }
         let fresh = attempt.events();
         for event in fresh {
@@ -1944,36 +2029,40 @@ impl Runtime {
             let network = network.clone();
             let events = fresh.to_vec();
             let roots = self.settings_snapshot().roots;
-            let (offered, bots) = self.store.call("triage.prepare_offer", move |store| {
-                let mut offered = Vec::new();
-                let mut bots = Vec::new();
-                let mut seen = HashSet::new();
-                for event in &events {
-                    let owner = owner(store, &network, event)?;
-                    let bot = match &owner {
-                        Some(scope) => store.bot_for_conversation(&network, scope)?,
-                        None => None,
-                    };
-                    let name = match (&owner, &bot) {
-                        (_, Some(bot)) => Some(bot.name.clone()),
-                        (Some(scope), None) => {
-                            store.conversation(&network, scope)?.map(|c| c.title)
+            let (offered, bots) = self
+                .store
+                .call("triage.prepare_offer", move |store| {
+                    let mut offered = Vec::new();
+                    let mut bots = Vec::new();
+                    let mut seen = HashSet::new();
+                    for event in &events {
+                        let owner = owner(store, &network, event)?;
+                        let bot = match &owner {
+                            Some(scope) => store.bot_for_conversation(&network, scope)?,
+                            None => None,
+                        };
+                        let name = match (&owner, &bot) {
+                            (_, Some(bot)) => Some(bot.name.clone()),
+                            (Some(scope), None) => {
+                                store.conversation(&network, scope)?.map(|c| c.title)
+                            }
+                            (None, None) => None,
+                        };
+                        if let Some(bot) = bot
+                            && seen.insert(bot.conversation_id.clone())
+                        {
+                            let notes = store.memories(&network, &bot.conversation_id)?;
+                            bots.push(bot_context(&bot, &notes));
                         }
-                        (None, None) => None,
-                    };
-                    if let Some(bot) = bot
-                        && seen.insert(bot.conversation_id.clone())
-                    {
-                        let notes = store.memories(&network, &bot.conversation_id)?;
-                        bots.push(bot_context(&bot, &notes));
-                    }
-                    offered.push((
+                        offered.push((
                             shared_event(event, &roots),
-                        json!({"conversation_id":owner,"name":name}),
-                    ));
-                }
-                Ok((offered, bots))
-            }).await.map_err(manager::ManagerError::not_started)?;
+                            json!({"conversation_id":owner,"name":name}),
+                        ));
+                    }
+                    Ok((offered, bots))
+                })
+                .await
+                .map_err(manager::ManagerError::not_started)?;
             self.coordination_turn(Some(attempt.id()), |cli| {
                 triage::wake_prompt(
                     &offered,
@@ -1992,17 +2081,23 @@ impl Runtime {
         } else {
             turn
         };
-        self.store.call("triage.finish", move |store| {
-            store.finish_triage(attempt, &turn)?;
-            Ok(turn)
-        }).await?
+        self.store
+            .call("triage.finish", move |store| {
+                store.finish_triage(attempt, &turn)?;
+                Ok(turn)
+            })
+            .await?
     }
 
     async fn run_answer_control(&self, attempt: &str, control: &HeldAnswerControl) -> Result<()> {
         let request = self.validate_live_answer_control(attempt, control).await?;
         let (question, answer) = {
             let control = control.clone();
-            self.store.call("triage.answer_control_input", move |store| store.answer_control_input(&control)).await?
+            self.store
+                .call("triage.answer_control_input", move |store| {
+                    store.answer_control_input(&control)
+                })
+                .await?
         };
         if let Some(result) = crate::store::triage::approval_answer_result(
             &question,
@@ -2064,17 +2159,21 @@ impl Runtime {
     }
 
     pub(super) async fn triage_status(&self) -> Result<Value> {
-        let network = self.store.read("triage.status_network", |store| store.network()).await?.unwrap_or_default();
+        let network = self
+            .store
+            .read("triage.status_network", |store| store.network())
+            .await?
+            .unwrap_or_default();
         let active = lock(&self.triage.active).clone();
-        Ok(serde_json::to_value(
-                {
+        Ok(serde_json::to_value({
             let boot = self.boot.clone();
             let limit = self.config.daily_decision_limit;
-            self.store.read("triage.status", move |store| {
-                store.triage_status(&network, &boot, active.as_deref(), limit, now_ms())
-            }).await?
-                },
-        )?)
+            self.store
+                .read("triage.status", move |store| {
+                    store.triage_status(&network, &boot, active.as_deref(), limit, now_ms())
+                })
+                .await?
+        })?)
     }
 
     pub(super) async fn respond_unclaimed_request(
@@ -2087,7 +2186,9 @@ impl Runtime {
             return Ok(done.clone());
         }
         ensure!(
-            self.store.call("triage.unclaimed_events", |store| store.triage_events(None)).await?
+            self.store
+                .call("triage.unclaimed_events", |store| store.triage_events(None))
+                .await?
                 .iter()
                 .any(|event| event.request_id.as_deref() == Some(request_id)),
             "request is not available to this triage attempt"
@@ -2132,8 +2233,12 @@ impl Runtime {
             Some(id) => {
                 let id = id.to_owned();
                 let boot = self.boot.clone();
-                self.store.call("triage.answer_control_attempt", move |store| store.answer_control_attempt(&boot, &id)).await?
-            },
+                self.store
+                    .call("triage.answer_control_attempt", move |store| {
+                        store.answer_control_attempt(&boot, &id)
+                    })
+                    .await?
+            }
             None => None,
         };
         if let Some(control) = answer_control {
@@ -2165,7 +2270,11 @@ impl Runtime {
             let result = input.get("result").context("result is required")?;
             let (question, answer) = {
                 let control = control.clone();
-                self.store.call("triage.answer_control_input", move |store| store.answer_control_input(&control)).await?
+                self.store
+                    .call("triage.answer_control_input", move |store| {
+                        store.answer_control_input(&control)
+                    })
+                    .await?
             };
             validate_answer_result(&control.request.response, &question, &answer.text, result)?;
             let by = format!("answer:{}", control.answer_hash);
@@ -2209,9 +2318,15 @@ impl Runtime {
                 ensure!(current, "triage attempt is no longer active");
                 let events = {
                     let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-                    self.store.call("triage.claim_events", move |store| {
-                        store.triage_events(context.as_ref().map(|(boot, id)| (boot.as_str(), id.as_str())))
-                    }).await?
+                    self.store
+                        .call("triage.claim_events", move |store| {
+                            store.triage_events(
+                                context
+                                    .as_ref()
+                                    .map(|(boot, id)| (boot.as_str(), id.as_str())),
+                            )
+                        })
+                        .await?
                 };
                 requests.retain(|request| {
                     events
@@ -2236,13 +2351,19 @@ impl Runtime {
             );
             ensure!(
                 {
-                let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-                self.store.call("triage.claim_events", move |store| {
-                    store.triage_events(context.as_ref().map(|(boot, id)| (boot.as_str(), id.as_str())))
-                }).await?
+                    let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
+                    self.store
+                        .call("triage.claim_events", move |store| {
+                            store.triage_events(
+                                context
+                                    .as_ref()
+                                    .map(|(boot, id)| (boot.as_str(), id.as_str())),
+                            )
+                        })
+                        .await?
                 }
-                    .iter()
-                    .any(|event| event.request_id.as_deref() == Some(request_id)),
+                .iter()
+                .any(|event| event.request_id.as_deref() == Some(request_id)),
                 "request is not available to this triage attempt"
             );
             return self
@@ -2254,16 +2375,23 @@ impl Runtime {
             ensure!(current, "triage attempt is no longer active");
             let boot = self.boot.clone();
             let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-            return self.store.call("triage.events", move |store| {
-                let events: Vec<_> = store
-                .triage_events(context.as_ref().map(|(boot, id)| (boot.as_str(), id.as_str())))?
-                    .into_iter()
-                    .filter(|event| event.ts_ms >= since)
-                    .collect();
-                let unknown = store
-                .unknown_triage_events(active.as_deref().map(|id| (boot.as_str(), id)))?;
-                Ok(json!({"events":events,"unknown_events":unknown}))
-            }).await;
+            return self
+                .store
+                .call("triage.events", move |store| {
+                    let events: Vec<_> = store
+                        .triage_events(
+                            context
+                                .as_ref()
+                                .map(|(boot, id)| (boot.as_str(), id.as_str())),
+                        )?
+                        .into_iter()
+                        .filter(|event| event.ts_ms >= since)
+                        .collect();
+                    let unknown = store
+                        .unknown_triage_events(active.as_deref().map(|id| (boot.as_str(), id)))?;
+                    Ok(json!({"events":events,"unknown_events":unknown}))
+                })
+                .await;
         }
         let event_id = super::id(&input, "event_id")?;
         ensure!(
@@ -2272,16 +2400,19 @@ impl Runtime {
         );
         {
             let event_id = event_id.clone();
-            let handled: Option<String> = self.store.call("triage.handled_result", move |store| {
-                Ok(store
+            let handled: Option<String> = self
+                .store
+                .call("triage.handled_result", move |store| {
+                    Ok(store
                         .connection
                         .query_row(
                             "SELECT result FROM triage_handled WHERE event_id=?",
                             [&event_id],
                             |r| r.get(0),
                         )
-                    .optional()?)
-            }).await?;
+                        .optional()?)
+                })
+                .await?;
             if let Some(handled) = handled {
                 return Ok(serde_json::from_str(&handled)?);
             }
@@ -2289,13 +2420,19 @@ impl Runtime {
         ensure!(current, "triage attempt is no longer active");
         let event = {
             let context = context.map(|(boot, id)| (boot.to_owned(), id.to_owned()));
-            self.store.call("triage.claim_events", move |store| {
-                store.triage_events(context.as_ref().map(|(boot, id)| (boot.as_str(), id.as_str())))
-            }).await?
+            self.store
+                .call("triage.claim_events", move |store| {
+                    store.triage_events(
+                        context
+                            .as_ref()
+                            .map(|(boot, id)| (boot.as_str(), id.as_str())),
+                    )
+                })
+                .await?
         }
-            .into_iter()
-            .find(|event| event.event_id == event_id)
-            .context("no pending event with this ID")?;
+        .into_iter()
+        .find(|event| event.event_id == event_id)
+        .context("no pending event with this ID")?;
         let result = match action {
             "dismiss" => json!({"event_id":event_id,"dismissed":true}),
             "raise" => {
@@ -2376,15 +2513,17 @@ impl Runtime {
             }
             _ => bail!("unknown triage action"),
         };
-        self.store.call("triage.handle_event", move |store| {
-            store.connection.execute(
-                "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
+        self.store
+            .call("triage.handle_event", move |store| {
+                store.connection.execute(
+                    "INSERT INTO triage_handled(event_id,ts_ms,result) VALUES(?,?,?)
                  ON CONFLICT(event_id) DO UPDATE SET ts_ms=excluded.ts_ms,result=excluded.result",
-                params![event_id, now_ms(), result.to_string()],
-            )?;
-            dequeue(&store.connection, &event)?;
-            Ok(result)
-        }).await
+                    params![event_id, now_ms(), result.to_string()],
+                )?;
+                dequeue(&store.connection, &event)?;
+                Ok(result)
+            })
+            .await
     }
 
     /// Asks in the chat of the bot that owns the event's session, the primary bot's when its
@@ -2402,56 +2541,62 @@ impl Runtime {
         let requests = self.triage.requests.clone();
         let actor_network = network.to_owned();
         let actor_event = event.clone();
-        let (asked, hash, owner, claimed) = self.store.call("triage.raise", move |store| {
-            let network = actor_network.as_str();
-            let event = &actor_event;
-            let (owner, claimed) = match owner(store, network, event)? {
-                Some(owner) => (owner, None),
-                None => {
-                    let (owner, claimed) = Self::claim_session(store, &identity, &roots, &threads, network, event)?;
-                    (owner.context("no bot owns this session")?, claimed)
-                }
-            };
-            if event.node == identity.device_id()?
-                && let EventBody::QuestionAsked { target, about, .. } = &mut question
-            {
-                let native_turn = if matches!(&event.source, triage::Source::AppServer)
-                    && event.request_id.is_some()
-                {
-                    event.request_id.as_deref().and_then(|id| {
-                        lock(&requests)
-                            .get(id)
-                            .filter(|request| {
-                                request.request_id == id
-                                    && about.request_id.as_deref() == Some(id)
-                                    && request.provider == event.agent
-                                    && request.session_id == event.session_id
-                                    && !request.session_turn.is_empty()
-                                    && matches!(&request.reply, Reply::AppServer { .. })
-                            })
-                            .map(|request| request.session_turn.clone())
-                    })
-                } else {
-                    Some(event.turn_id.clone())
-                };
-                *target = if let Some(native_turn) = native_turn {
-                    match store.native_input_target(
-                        network,
-                        &owner,
-                        &event.session_id,
-                        &native_turn,
-                    )? {
-                        Some(target) => Some(target),
-                        None => store.attributed_session_input_target(network, &owner, about)?,
+        let (asked, hash, owner, claimed) = self
+            .store
+            .call("triage.raise", move |store| {
+                let network = actor_network.as_str();
+                let event = &actor_event;
+                let (owner, claimed) = match owner(store, network, event)? {
+                    Some(owner) => (owner, None),
+                    None => {
+                        let (owner, claimed) = Self::claim_session(
+                            store, &identity, &roots, &threads, network, event,
+                        )?;
+                        (owner.context("no bot owns this session")?, claimed)
                     }
-                } else {
-                    None
                 };
-            }
-            let (asked, written) =
-            store.ask(&identity, network, &owner, question, now_ms())?;
-            Ok((asked, written.map(|event| event.hash), owner, claimed))
-        }).await?;
+                if event.node == identity.device_id()?
+                    && let EventBody::QuestionAsked { target, about, .. } = &mut question
+                {
+                    let native_turn = if matches!(&event.source, triage::Source::AppServer)
+                        && event.request_id.is_some()
+                    {
+                        event.request_id.as_deref().and_then(|id| {
+                            lock(&requests)
+                                .get(id)
+                                .filter(|request| {
+                                    request.request_id == id
+                                        && about.request_id.as_deref() == Some(id)
+                                        && request.provider == event.agent
+                                        && request.session_id == event.session_id
+                                        && !request.session_turn.is_empty()
+                                        && matches!(&request.reply, Reply::AppServer { .. })
+                                })
+                                .map(|request| request.session_turn.clone())
+                        })
+                    } else {
+                        Some(event.turn_id.clone())
+                    };
+                    *target = if let Some(native_turn) = native_turn {
+                        match store.native_input_target(
+                            network,
+                            &owner,
+                            &event.session_id,
+                            &native_turn,
+                        )? {
+                            Some(target) => Some(target),
+                            None => {
+                                store.attributed_session_input_target(network, &owner, about)?
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                }
+                let (asked, written) = store.ask(&identity, network, &owner, question, now_ms())?;
+                Ok((asked, written.map(|event| event.hash), owner, claimed))
+            })
+            .await?;
         if let Some(hash) = claimed {
             self.publish_changed(network, &owner, Changed::Event(&hash));
         }
@@ -2559,20 +2704,22 @@ impl Runtime {
     /// One outbox entry per event ID, however often it is queued.
     async fn queue_webhook(&self, event_id: &str, body: &Value) -> Result<()> {
         let entry = OutboxEntry::new(event_id, body.to_string(), now_ms());
-        self.store.call("triage.queue_webhook", move |store| {
-            store.connection.execute(
-                "INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms)
+        self.store
+            .call("triage.queue_webhook", move |store| {
+                store.connection.execute(
+                    "INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms)
                  VALUES(?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING",
-                params![
-                    entry.event_id,
-                    entry.body,
-                    name(entry.state)?,
-                    entry.attempts,
-                    entry.next_ms,
-                ],
-            )?;
-            Ok(())
-        }).await?;
+                    params![
+                        entry.event_id,
+                        entry.body,
+                        name(entry.state)?,
+                        entry.attempts,
+                        entry.next_ms,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await?;
         self.triage.outbox.notify_one();
         Ok(())
     }
@@ -2605,9 +2752,19 @@ impl Runtime {
             let session = session.to_owned();
             let seen = seen.to_owned();
             let target = target.map(str::to_owned);
-            self.store.call("triage.hand_over_session", move |store| {
-                store.hand_over_session(&identity, &network, &from, &session, &seen, target.as_deref(), now_ms())
-            }).await?
+            self.store
+                .call("triage.hand_over_session", move |store| {
+                    store.hand_over_session(
+                        &identity,
+                        &network,
+                        &from,
+                        &session,
+                        &seen,
+                        target.as_deref(),
+                        now_ms(),
+                    )
+                })
+                .await?
         };
         let owner = target.unwrap_or(&before);
         if let Some(event) = &event {
@@ -2643,7 +2800,12 @@ impl Runtime {
         let Some(secret) = self.webhook_secret()? else {
             return Ok(());
         };
-        let entries = self.store.call("triage.due_webhooks", |store| outbox_from(&store.connection, now_ms())).await?;
+        let entries = self
+            .store
+            .call("triage.due_webhooks", |store| {
+                outbox_from(&store.connection, now_ms())
+            })
+            .await?;
         for mut entry in entries {
             let (status, error) = post_webhook(&url, &secret, &entry.event_id, &entry.body).await;
             entry.record(status, now_ms());
@@ -2655,18 +2817,20 @@ impl Runtime {
                     "webhook delivery dead-lettered"
                 );
             }
-            self.store.call("triage.record_webhook", move |store| {
-                store.connection.execute(
-                    "UPDATE triage_outbox SET state=?,attempts=?,next_ms=? WHERE event_id=?",
-                    params![
-                        name(entry.state)?,
-                        entry.attempts,
-                        entry.next_ms,
-                        entry.event_id
-                    ],
-                )?;
-                Ok(())
-            }).await?;
+            self.store
+                .call("triage.record_webhook", move |store| {
+                    store.connection.execute(
+                        "UPDATE triage_outbox SET state=?,attempts=?,next_ms=? WHERE event_id=?",
+                        params![
+                            name(entry.state)?,
+                            entry.attempts,
+                            entry.next_ms,
+                            entry.event_id
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await?;
         }
         Ok(())
     }
@@ -2714,14 +2878,18 @@ impl Runtime {
             let rollout = crate::crypto::digest(path.to_string_lossy().as_bytes());
             let mark: Option<usize> = {
                 let rollout = rollout.clone();
-                self.store.call("triage.scan_mark", move |store| {
-                    Ok(store.connection.query_row(
+                self.store
+                    .call("triage.scan_mark", move |store| {
+                        Ok(store
+                            .connection
+                            .query_row(
                                 "SELECT scanned_to FROM triage_scans WHERE rollout=?",
                                 [&rollout],
                                 |r| r.get(0),
                             )
-                        .optional()?)
-                }).await?
+                            .optional()?)
+                    })
+                    .await?
             };
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -2737,14 +2905,16 @@ impl Runtime {
                     tracing::debug!(%error, "scanned turn was not triaged");
                 }
             }
-            self.store.call("triage.record_scan", move |store| {
-                store.connection.execute(
-                    "INSERT INTO triage_scans(rollout,scanned_to) VALUES(?,?)
+            self.store
+                .call("triage.record_scan", move |store| {
+                    store.connection.execute(
+                        "INSERT INTO triage_scans(rollout,scanned_to) VALUES(?,?)
                      ON CONFLICT(rollout) DO UPDATE SET scanned_to=excluded.scanned_to",
-                    params![rollout, end],
-                )?;
-                Ok(())
-            }).await?;
+                        params![rollout, end],
+                    )?;
+                    Ok(())
+                })
+                .await?;
         }
         Ok(())
     }
@@ -2756,19 +2926,22 @@ impl Runtime {
             .into_iter()
             .map(|t| json!({"token_id":t.token_id,"label":t.label,"created_ms":t.created_ms}))
             .collect();
-        let outbox = self.store.read("triage.outbox_summary", |store| {
-            let mut outbox = json!({"pending":0,"delivered":0,"dead":0});
-            let mut statement = store
-                .connection
-                .prepare("SELECT state,COUNT(*) FROM triage_outbox GROUP BY state")?;
-            let rows =
-                statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?;
-            for row in rows {
-                let (state, count) = row?;
-                outbox[state] = json!(count);
-            }
-            Ok(outbox)
-        }).await?;
+        let outbox = self
+            .store
+            .read("triage.outbox_summary", |store| {
+                let mut outbox = json!({"pending":0,"delivered":0,"dead":0});
+                let mut statement = store
+                    .connection
+                    .prepare("SELECT state,COUNT(*) FROM triage_outbox GROUP BY state")?;
+                let rows = statement
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?;
+                for row in rows {
+                    let (state, count) = row?;
+                    outbox[state] = json!(count);
+                }
+                Ok(outbox)
+            })
+            .await?;
         Ok(json!({
             "default_outlet":config.default_outlet, "projects":config.projects,
             "webhook_url":config.webhook_url, "scan_codex_sessions":config.scan_codex_sessions,
@@ -2890,7 +3063,12 @@ impl Runtime {
 
     pub(super) async fn questions(&self, access: &Access) -> Result<Value> {
         let network = access.network_id.clone();
-        let questions = self.store.read("triage.questions", move |store| store.unanswered_questions(&network)).await?;
+        let questions = self
+            .store
+            .read("triage.questions", move |store| {
+                store.unanswered_questions(&network)
+            })
+            .await?;
         Ok(json!({"questions":questions}))
     }
 
@@ -2935,9 +3113,13 @@ impl Runtime {
         let question_body = {
             let network = network.to_owned();
             let question = question.to_owned();
-            self.store.call("triage.answer_question", move |store| store.question(&network, &question)).await?
+            self.store
+                .call("triage.answer_question", move |store| {
+                    store.question(&network, &question)
+                })
+                .await?
         }
-            .context("no such question")?;
+        .context("no such question")?;
         let binding = lock(&self.triage.requests)
             .values()
             .find(|request| request.question_id.as_deref() == Some(question))
@@ -2955,10 +3137,19 @@ impl Runtime {
             let network = network.to_owned();
             let question = question.to_owned();
             let text = text.to_owned();
-            self.store.call("triage.accept_answer", move |store| {
-                store.accept_answer_with_control(&identity, &network, &question, &text,
-                    attestation, now_ms(), binding.as_ref().map(|request| (request, authority)))
-            }).await?
+            self.store
+                .call("triage.accept_answer", move |store| {
+                    store.accept_answer_with_control(
+                        &identity,
+                        &network,
+                        &question,
+                        &text,
+                        attestation,
+                        now_ms(),
+                        binding.as_ref().map(|request| (request, authority)),
+                    )
+                })
+                .await?
         };
         if answered.already_answered {
             return Ok(("already_answered", answered.message, None));
@@ -2996,7 +3187,11 @@ impl Runtime {
         if !self.config.forwarding.any {
             let network = self.network_id().await?;
             let device_id = input.device_id.clone();
-            self.store.call("triage.authorize_decision_target", move |store| store.authorize_node(&network, &device_id)).await?;
+            self.store
+                .call("triage.authorize_decision_target", move |store| {
+                    store.authorize_node(&network, &device_id)
+                })
+                .await?;
         }
         self.net()?
             .request(
@@ -3020,9 +3215,13 @@ impl Runtime {
         let question = {
             let network = network.clone();
             let question_id = input.question_id.clone();
-            self.store.call("triage.local_decision_question", move |store| store.question(&network, &question_id)).await?
+            self.store
+                .call("triage.local_decision_question", move |store| {
+                    store.question(&network, &question_id)
+                })
+                .await?
         }
-            .context("no such question")?;
+        .context("no such question")?;
         let text = match (input.choice, input.text) {
             (Some(index), None) => question["choices"][index]["label"]
                 .as_str()
@@ -3305,23 +3504,25 @@ pub(super) mod tests {
         let scope = scope.to_owned();
         let name = name.to_owned();
         let threads: Vec<String> = threads.iter().map(|thread| (*thread).to_owned()).collect();
-        node.store.call("triage.test.instructed_bot", move |store| {
-            let scope = scope.as_str();
-            let name = name.as_str();
-            store.create_conversation(&identity, &network, scope, name, owner, now_ms())?;
-            store.append_event(&identity, &network, scope, bot, vec![], now_ms())?;
-            for thread in &threads {
-                let progress = EventBody::WorkProgress {
-                    work_id: format!("w-{thread}"),
-                    phase: crate::model::WorkPhase::Running,
-                    summary: String::new(),
-                    thread_id: Some(thread.clone()),
-                    turn_id: None,
-                };
-                store.append_event(&identity, &network, scope, progress, vec![], now_ms())?;
-            }
-            Ok(())
-        }).await
+        node.store
+            .call("triage.test.instructed_bot", move |store| {
+                let scope = scope.as_str();
+                let name = name.as_str();
+                store.create_conversation(&identity, &network, scope, name, owner, now_ms())?;
+                store.append_event(&identity, &network, scope, bot, vec![], now_ms())?;
+                for thread in &threads {
+                    let progress = EventBody::WorkProgress {
+                        work_id: format!("w-{thread}"),
+                        phase: crate::model::WorkPhase::Running,
+                        summary: String::new(),
+                        thread_id: Some(thread.clone()),
+                        turn_id: None,
+                    };
+                    store.append_event(&identity, &network, scope, progress, vec![], now_ms())?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     async fn main_input_fact(
@@ -3335,38 +3536,40 @@ pub(super) mod tests {
         let admin = admin.clone();
         let scope = scope.to_owned();
         let id = id.to_owned();
-        node.store.call("triage.test.main_input_fact", move |store| {
-            let scope = scope.as_str();
-            let id = id.as_str();
-            let bot = store
-                .bot_for_conversation(&network, scope)?
-                .context("input Bot")?;
-            let target = crate::workspace::InputTarget::BotMain { bot_id: bot.bot_id };
-            let trigger = crate::scheduling::message_trigger(id);
-            if store.message(&network, scope, id)?.is_none() {
-                let posted = admin.attest(
-                    &network,
-                    scope,
-                    EventBody::InputPosted {
-                        message_id: id.into(),
-                        target: target.clone(),
-                        intent: crate::workspace::InputIntent::Continue,
-                        sequence: store.messages(&network, scope)?.len() as u64 + 1,
-                        expected_revision: None,
-                        text: id.into(),
-                        attachments: vec![],
-                        report_results: Some(true),
-                        attestation: None,
-                    },
-                )?;
-                store.append_event(&identity, &network, scope, posted, vec![], now_ms())?;
-            }
-            ensure!(
-                store.trigger_input_target(&network, scope, &trigger)? == Some(target),
-                "fixture input has no verified Main target"
-            );
-            Ok(trigger)
-        }).await
+        node.store
+            .call("triage.test.main_input_fact", move |store| {
+                let scope = scope.as_str();
+                let id = id.as_str();
+                let bot = store
+                    .bot_for_conversation(&network, scope)?
+                    .context("input Bot")?;
+                let target = crate::workspace::InputTarget::BotMain { bot_id: bot.bot_id };
+                let trigger = crate::scheduling::message_trigger(id);
+                if store.message(&network, scope, id)?.is_none() {
+                    let posted = admin.attest(
+                        &network,
+                        scope,
+                        EventBody::InputPosted {
+                            message_id: id.into(),
+                            target: target.clone(),
+                            intent: crate::workspace::InputIntent::Continue,
+                            sequence: store.messages(&network, scope)?.len() as u64 + 1,
+                            expected_revision: None,
+                            text: id.into(),
+                            attachments: vec![],
+                            report_results: Some(true),
+                            attestation: None,
+                        },
+                    )?;
+                    store.append_event(&identity, &network, scope, posted, vec![], now_ms())?;
+                }
+                ensure!(
+                    store.trigger_input_target(&network, scope, &trigger)? == Some(target),
+                    "fixture input has no verified Main target"
+                );
+                Ok(trigger)
+            })
+            .await
     }
 
     async fn complete_tracked_work(
@@ -3418,21 +3621,23 @@ pub(super) mod tests {
             let identity = (node.identity).to_owned();
             let network = (network).to_owned();
             let spec = crate::work::WorkSpec {
-                    work_id: work_id.clone(),
-                    trigger,
-                    call_ref: work_id.clone(),
-                    title: "external work".into(),
-                    thread: Some(thread.into()),
-                    ..provider_work(
-                        Provider::Codex,
-                        &local,
-                        &node.data_dir.canonicalize()?,
-                        "external work",
-                    )
+                work_id: work_id.clone(),
+                trigger,
+                call_ref: work_id.clone(),
+                title: "external work".into(),
+                thread: Some(thread.into()),
+                ..provider_work(
+                    Provider::Codex,
+                    &local,
+                    &node.data_dir.canonicalize()?,
+                    "external work",
+                )
             };
-            node.store.call("triage.test.accept_work_fixture", move |store| {
-                store.accept_work_fixture(&identity, &network, spec, now_ms())
-            }).await
+            node.store
+                .call("triage.test.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         node.signal_work(
             &network,
@@ -3444,28 +3649,32 @@ pub(super) mod tests {
         )
         .await?;
         let thread = thread.to_owned();
-        node.store.call("triage.test.external_work_target", move |store| {
-            let thread = thread.as_str();
-            ensure!(
-                !own_turn(store, &turn(thread, "t1", "/w"))?,
-                "an external work is not a coordination turn"
-            );
-            ensure!(
-                store.native_input_target(&network, "c", thread, "t1")?
-                    == Some(crate::workspace::InputTarget::Work { work_id }),
-                "external session has no verified Work target"
-            );
-            Ok(())
-        }).await
+        node.store
+            .call("triage.test.external_work_target", move |store| {
+                let thread = thread.as_str();
+                ensure!(
+                    !own_turn(store, &turn(thread, "t1", "/w"))?,
+                    "an external work is not a coordination turn"
+                );
+                ensure!(
+                    store.native_input_target(&network, "c", thread, "t1")?
+                        == Some(crate::workspace::InputTarget::Work { work_id }),
+                    "external session has no verified Work target"
+                );
+                Ok(())
+            })
+            .await
     }
 
     async fn unanswered(node: &Runtime) -> Result<Vec<Value>> {
         let network = node.network_id().await?;
         {
             let network = (network).to_owned();
-            node.store.call("triage.test.unanswered_questions", move |store| {
-                store.unanswered_questions(&network)
-            }).await
+            node.store
+                .call("triage.test.unanswered_questions", move |store| {
+                    store.unanswered_questions(&network)
+                })
+                .await
         }
     }
 
@@ -3493,11 +3702,13 @@ pub(super) mod tests {
         let scope = {
             let network = (network).to_owned();
             let question = (question).to_owned();
-            node.store.call("triage.test.question", move |store| {
-                store.question(&network, &question)
-            }).await
+            node.store
+                .call("triage.test.question", move |store| {
+                    store.question(&network, &question)
+                })
+                .await
         }?
-            .context("question")?["conversation_id"]
+        .context("question")?["conversation_id"]
             .as_str()
             .context("question scope")?
             .to_owned();
@@ -3682,16 +3893,20 @@ pub(super) mod tests {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
                 let spec = spec;
-                node.store.call("triage.test.accept_work_fixture", move |store| {
-                    store.accept_work_fixture(&identity, &network, spec, now_ms())
-                }).await
+                node.store
+                    .call("triage.test.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
             }?;
             let stopped = node.interrupt_work(&network, "w-stop").await?;
             assert_eq!(stopped["waiting_for_start"], true);
             let waiting = {
-                node.store.call("triage.test.stop_requests", move |store| {
-                    store.stop_requests()
-                }).await
+                node.store
+                    .call("triage.test.stop_requests", move |store| {
+                        store.stop_requests()
+                    })
+                    .await
             }?;
             assert!(waiting.iter().any(|request| request.work_id == "w-stop"));
 
@@ -3718,9 +3933,11 @@ pub(super) mod tests {
                 json!({"threadId":"t-9","turnId":"u-1"})
             );
             let held = {
-                node.store.call("triage.test.stop_requests", move |store| {
-                    store.stop_requests()
-                }).await
+                node.store
+                    .call("triage.test.stop_requests", move |store| {
+                        store.stop_requests()
+                    })
+                    .await
             }?;
             assert!(
                 held.iter()
@@ -3753,9 +3970,11 @@ pub(super) mod tests {
             let identity = (node.identity).to_owned();
             let network = (network).to_owned();
             let spec = spec;
-            node.store.call("triage.test.accept_work_fixture", move |store| {
-                store.accept_work_fixture(&identity, &network, spec, now_ms())
-            }).await
+            node.store
+                .call("triage.test.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         let epoch = node.codex.epoch();
         let turn = crate::work::Signal::TurnStarted {
@@ -3792,22 +4011,26 @@ pub(super) mod tests {
     async fn state(node: &Runtime, work_id: &str) -> Result<crate::work::WorkState> {
         Ok({
             let work_id = (work_id).to_owned();
-            node.store.call("triage.test.work_record", move |store| {
-                store.work_record(&work_id)
-            }).await
-            }?
-            .context("work")?
-            .state)
+            node.store
+                .call("triage.test.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
+        }?
+        .context("work")?
+        .state)
     }
 
     async fn held_stop(node: &Runtime, work_id: &str) -> Result<Option<crate::work::StopRequest>> {
         Ok({
-            node.store.call("triage.test.stop_requests", move |store| {
-                store.stop_requests()
-            }).await
-            }?
-            .into_iter()
-            .find(|request| request.work_id == work_id))
+            node.store
+                .call("triage.test.stop_requests", move |store| {
+                    store.stop_requests()
+                })
+                .await
+        }?
+        .into_iter()
+        .find(|request| request.work_id == work_id))
     }
 
     /// A `turn/start` stuck past the send window is not written off as never run: the work is
@@ -3845,29 +4068,33 @@ pub(super) mod tests {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
                 let spec = spec;
-                node.store.call("triage.test.accept_work_fixture", move |store| {
-                    store.accept_work_fixture(&identity, &network, spec, now_ms() - window)
-                }).await
+                node.store
+                    .call("triage.test.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms() - window)
+                    })
+                    .await
             }?;
             {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
                 let signal = crate::work::Signal::ThreadCreated("t-late".into());
-                node.store.call("triage.test.apply_work_signal", move |store| {
-                    store.apply_work_signal(&identity, &network, "w-late", signal, now_ms())
-                }).await
+                node.store
+                    .call("triage.test.apply_work_signal", move |store| {
+                        store.apply_work_signal(&identity, &network, "w-late", signal, now_ms())
+                    })
+                    .await
             }?;
             node.reconcile_works(&network).await?;
             let outcome = async || -> Result<(Option<WorkOutcome>, WorkStatus)> {
                 let work = {
                     let network = (network).to_owned();
-                    node.store.call("triage.test.works", move |store| {
-                        store.works(&network, "c")
-                    }).await
+                    node.store
+                        .call("triage.test.works", move |store| store.works(&network, "c"))
+                        .await
                 }?
-                    .into_iter()
-                    .find(|work| work.work_id == "w-late")
-                    .context("work")?;
+                .into_iter()
+                .find(|work| work.work_id == "w-late")
+                .context("work")?;
                 Ok((work.outcome, work.state))
             };
             assert_eq!(
@@ -3917,12 +4144,14 @@ pub(super) mod tests {
             );
             assert!(
                 {
-                let trigger = (crate::scheduling::work_trigger("w-late")).to_owned();
-                node.store.call("triage.test.scheduler_job", move |store| {
-                    store.scheduler_job("c", &trigger)
-                }).await
+                    let trigger = (crate::scheduling::work_trigger("w-late")).to_owned();
+                    node.store
+                        .call("triage.test.scheduler_job", move |store| {
+                            store.scheduler_job("c", &trigger)
+                        })
+                        .await
                 }?
-                    .is_some(),
+                .is_some(),
                 "and reports back"
             );
             Ok::<_, anyhow::Error>(())
@@ -4034,9 +4263,11 @@ pub(super) mod tests {
             late.deadline_ms = now_ms() - 1;
             {
                 let request = (late).to_owned();
-                node.store.call("triage.test.save_stop_request", move |store| {
-                    store.save_stop_request(&request)
-                }).await
+                node.store
+                    .call("triage.test.save_stop_request", move |store| {
+                        store.save_stop_request(&request)
+                    })
+                    .await
             }?;
             node.reconcile_works(&network).await?;
             assert_eq!(methods(&mut requests), ["thread/read", "turn/interrupt"]);
@@ -4103,9 +4334,11 @@ pub(super) mod tests {
             };
             {
                 let request = (stop).to_owned();
-                a.store.call("triage.test.save_stop_request", move |store| {
-                    store.save_stop_request(&request)
-                }).await
+                a.store
+                    .call("triage.test.save_stop_request", move |store| {
+                        store.save_stop_request(&request)
+                    })
+                    .await
             }?;
             a.deliver_work_requests(&network).await?;
             assert!(
@@ -4169,19 +4402,21 @@ pub(super) mod tests {
             a.sync_peer(&network, &target).await?;
             assert!(
                 {
-                let network = (network).to_owned();
-                a.store.call("triage.test.works", move |store| {
-                    store.works(&network, "c")
-                }).await
+                    let network = (network).to_owned();
+                    a.store
+                        .call("triage.test.works", move |store| store.works(&network, "c"))
+                        .await
                 }?
-                    .iter()
-                    .any(|work| work.work_id == "w-far" && work.outcome.is_some())
+                .iter()
+                .any(|work| work.work_id == "w-far" && work.outcome.is_some())
             );
             {
                 let request = (stop).to_owned();
-                a.store.call("triage.test.save_stop_request", move |store| {
-                    store.save_stop_request(&request)
-                }).await
+                a.store
+                    .call("triage.test.save_stop_request", move |store| {
+                        store.save_stop_request(&request)
+                    })
+                    .await
             }?;
             a.stop_retries.lock().unwrap().clear();
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -4230,9 +4465,11 @@ pub(super) mod tests {
             let deadline = lock(&node.triage.requests)[&request_id].answer_by_ms;
             {
                 let request = (request_id).to_owned();
-                node.store.call("triage.test.finish_triage_request", move |store| {
-                    store.finish_triage_request(&request, false)
-                }).await
+                node.store
+                    .call("triage.test.finish_triage_request", move |store| {
+                        store.finish_triage_request(&request, false)
+                    })
+                    .await
             }?;
             node.on_codex_request(&handed).await;
             assert_eq!(
@@ -4810,11 +5047,13 @@ pub(super) mod tests {
                     let card = {
                         let network = (network).to_owned();
                         let question = (question_id).to_owned();
-                        node.store.call("triage.test.question", move |store| {
-                            store.question(&network, &question)
-                        }).await
+                        node.store
+                            .call("triage.test.question", move |store| {
+                                store.question(&network, &question)
+                            })
+                            .await
                     }?
-                        .context("hook question")?;
+                    .context("hook question")?;
                     assert_eq!(
                         card["target"],
                         json!({"kind":"work","work_id":"native-source-work"}),
@@ -4824,11 +5063,13 @@ pub(super) mod tests {
                     let card = {
                         let network = (network).to_owned();
                         let question = (question_id).to_owned();
-                        node.store.call("triage.test.question", move |store| {
-                            store.question(&network, &question)
-                        }).await
+                        node.store
+                            .call("triage.test.question", move |store| {
+                                store.question(&network, &question)
+                            })
+                            .await
                     }?
-                        .context("unscoped question")?;
+                    .context("unscoped question")?;
                     assert!(
                         card["target"].is_null(),
                         "{case}: mismatched evidence cannot borrow a Work or Main target"
@@ -4880,9 +5121,11 @@ pub(super) mod tests {
 
             assert_eq!(answer(&node, &question, "拒绝").await?, "answered");
             let jobs = {
-                node.store.call("triage.test.scheduler_jobs", move |store| {
-                    store.scheduler_jobs("c")
-                }).await
+                node.store
+                    .call("triage.test.scheduler_jobs", move |store| {
+                        store.scheduler_jobs("c")
+                    })
+                    .await
             }?;
             assert!(
                 jobs.is_empty(),
@@ -5711,9 +5954,11 @@ pub(super) mod tests {
             let network = node.network_id().await?;
             let chat = {
                 let network = (network).to_owned();
-                node.store.call("triage.test.conversation_questions", move |store| {
-                    store.conversation_questions(&network, "c")
-                }).await
+                node.store
+                    .call("triage.test.conversation_questions", move |store| {
+                        store.conversation_questions(&network, "c")
+                    })
+                    .await
             }?;
             assert_eq!(
                 (chat[0]["question_id"].clone(), chat[0]["closed"].clone()),
@@ -5784,9 +6029,18 @@ pub(super) mod tests {
     async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
         let network = node.network_id().await?;
         let scope = scope.to_owned();
-        let context = node.store.call("triage.test.attributions", move |store| {
-            crate::store::context_after(&store.connection, &network, &scope, None, &VersionVector::new())
-        }).await?;
+        let context = node
+            .store
+            .call("triage.test.attributions", move |store| {
+                crate::store::context_after(
+                    &store.connection,
+                    &network,
+                    &scope,
+                    None,
+                    &VersionVector::new(),
+                )
+            })
+            .await?;
         Ok(context
             .events
             .iter()
@@ -5801,9 +6055,11 @@ pub(super) mod tests {
             let network = (network).to_owned();
             let node = (local).to_owned();
             let session = (session).to_owned();
-            node.store.call("triage.test.session_owner", move |store| {
-                store.session_owner(&network, &node, &session)
-            }).await
+            node.store
+                .call("triage.test.session_owner", move |store| {
+                    store.session_owner(&network, &node, &session)
+                })
+                .await
         }
     }
 
@@ -5811,19 +6067,20 @@ pub(super) mod tests {
     async fn version_of(node: &Runtime, session: &str) -> Result<String> {
         let network = node.network_id().await?;
         let session = session.to_owned();
-        node.store.call("triage.test.session_version", move |store| {
-
-            for scope in ["c", "d", "e"] {
-                if let Some(row) = store
-                    .attributed_sessions(&network, scope)?
-                    .into_iter()
-                    .find(|row| row["session_id"] == session)
-                {
-                    return Ok(row["version"].as_str().context("version")?.to_owned());
+        node.store
+            .call("triage.test.session_version", move |store| {
+                for scope in ["c", "d", "e"] {
+                    if let Some(row) = store
+                        .attributed_sessions(&network, scope)?
+                        .into_iter()
+                        .find(|row| row["session_id"] == session)
+                    {
+                        return Ok(row["version"].as_str().context("version")?.to_owned());
+                    }
                 }
-            }
-            Ok(String::new())
-        }).await
+                Ok(String::new())
+            })
+            .await
     }
 
     #[tokio::test]
@@ -5970,11 +6227,13 @@ pub(super) mod tests {
             let network = (network).to_owned();
             let conversation = (scope).to_owned();
             let attestation = signed;
-            node.store.call("triage.test.delete_bot", move |store| {
-                store.delete_bot(&identity, &network, &conversation, attestation, now_ms())
-            }).await
+            node.store
+                .call("triage.test.delete_bot", move |store| {
+                    store.delete_bot(&identity, &network, &conversation, attestation, now_ms())
+                })
+                .await
         }?
-            .context("deleted")?;
+        .context("deleted")?;
         Ok(written.hash)
     }
 
@@ -6130,9 +6389,11 @@ pub(super) mod tests {
                     let identity = (node.identity).to_owned();
                     let network = (network).to_owned();
                     let spec = spec(work_id, conversation);
-                    node.store.call("triage.test.accept_work_fixture", move |store| {
-                        store.accept_work_fixture(&identity, &network, spec, now_ms())
-                    }).await
+                    node.store
+                        .call("triage.test.accept_work_fixture", move |store| {
+                            store.accept_work_fixture(&identity, &network, spec, now_ms())
+                        })
+                        .await
                 }?;
             }
             let hash = delete_bot(&node, &admin, "d").await?;
@@ -6141,9 +6402,11 @@ pub(super) mod tests {
                 let identity = (node.identity).to_owned();
                 let network = (network).to_owned();
                 let spec = spec("w-late", "d");
-                node.store.call("triage.test.accept_work_fixture", move |store| {
-                    store.accept_work_fixture(&identity, &network, spec, now_ms())
-                }).await
+                node.store
+                    .call("triage.test.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
             };
             assert!(
                 late.is_err(),
@@ -6155,9 +6418,11 @@ pub(super) mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let held = loop {
                 let held = {
-                    node.store.call("triage.test.stop_requests", move |store| {
-                        store.stop_requests()
-                    }).await
+                    node.store
+                        .call("triage.test.stop_requests", move |store| {
+                            store.stop_requests()
+                        })
+                        .await
                 }?;
                 if stopping(&held, "w-d") || tokio::time::Instant::now() > deadline {
                     break held;
@@ -6346,9 +6611,11 @@ pub(super) mod tests {
             let conversation = (scope).to_owned();
             let trigger = (trigger).to_owned();
             let attempt_id = (attempt).to_owned();
-            node.store.call("triage.test.mark_started", move |store| {
-                store.mark_started(&conversation, &trigger, &attempt_id)
-            }).await
+            node.store
+                .call("triage.test.mark_started", move |store| {
+                    store.mark_started(&conversation, &trigger, &attempt_id)
+                })
+                .await
         }?;
         Ok((trigger, attempt))
     }
@@ -6367,45 +6634,47 @@ pub(super) mod tests {
         let id = id.to_owned();
         let boot = boot.to_owned();
         let generation = node.provider_generation(Provider::Codex, &node.providers())?;
-        node.store.call("triage.test.claim_reply", move |store| {
-            let scope = scope.as_str();
-            let id = id.as_str();
-            let boot = boot.as_str();
-            let sequence = match store.workspace_input(&network, id)? {
-                Some(existing) => existing.input.route.sequence,
-                None => store.messages(&network, scope)?.len() as u64 + 1,
-            };
-            store.post_input_fixture(
-                &identity,
-                &network,
-                signed_main_input(&admin, &network, scope, id, id, vec![], sequence)?,
-                now_ms(),
-            )?;
-            let claimed = store
-            .claim_next_fixture(&identity, &network, scope, boot, "cfg")?
-                .context("job")?;
-            let trigger = claimed.job.trigger.clone();
-            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-            store.record_turn_runtime(
-                scope,
-                &trigger,
-                &attempt,
-                &crate::scheduling::TurnRuntime {
-                    provider: Provider::Codex,
-                    model: Some("fixture".into()),
-                    reasoning_effort: None,
-                generation,
-                    session_generation: claimed.session_generation,
-                    delivery_id: attempt.clone(),
-                    stage: vibeface_bridge::failure::ProviderStage::Validate,
-                    execution: crate::scheduling::TurnExecution::NotStarted,
-                    attempted_at_ms: now_ms(),
-                    switched_from: None,
-                    switch_reason: None,
-                },
-            )?;
-            Ok((trigger, attempt))
-        }).await
+        node.store
+            .call("triage.test.claim_reply", move |store| {
+                let scope = scope.as_str();
+                let id = id.as_str();
+                let boot = boot.as_str();
+                let sequence = match store.workspace_input(&network, id)? {
+                    Some(existing) => existing.input.route.sequence,
+                    None => store.messages(&network, scope)?.len() as u64 + 1,
+                };
+                store.post_input_fixture(
+                    &identity,
+                    &network,
+                    signed_main_input(&admin, &network, scope, id, id, vec![], sequence)?,
+                    now_ms(),
+                )?;
+                let claimed = store
+                    .claim_next_fixture(&identity, &network, scope, boot, "cfg")?
+                    .context("job")?;
+                let trigger = claimed.job.trigger.clone();
+                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                store.record_turn_runtime(
+                    scope,
+                    &trigger,
+                    &attempt,
+                    &crate::scheduling::TurnRuntime {
+                        provider: Provider::Codex,
+                        model: Some("fixture".into()),
+                        reasoning_effort: None,
+                        generation,
+                        session_generation: claimed.session_generation,
+                        delivery_id: attempt.clone(),
+                        stage: vibeface_bridge::failure::ProviderStage::Validate,
+                        execution: crate::scheduling::TurnExecution::NotStarted,
+                        attempted_at_ms: now_ms(),
+                        switched_from: None,
+                        switch_reason: None,
+                    },
+                )?;
+                Ok((trigger, attempt))
+            })
+            .await
     }
 
     #[tokio::test]
@@ -6433,41 +6702,44 @@ pub(super) mod tests {
                 }
                 let identity = node.identity.clone();
                 let network = network.clone();
-                node.store.call("triage.test.record_lost_manager", move |store| {
-
-                    store.record_manager_turn(
-                        &attempt,
-                        server,
-                        "thread",
-                        Some("turn"),
-                        &Default::default(),
-                    )?;
-                    let interrupted = crate::scheduling::JobOutcome::Interrupted {
-                        failure: vibeface_bridge::failure::ExecFailure::new(
-                            vibeface_bridge::failure::FailureKind::Lost,
-                            "lost",
-                        ),
-                        process_unconfirmed: true,
-                    };
-                    store.finish_job(
-                        &identity,
-                        &network,
-                        scope,
-                        &trigger,
-                        &attempt,
-                        interrupted,
-                        "",
-                        now_ms(),
-                    )?;
-                    Ok(())
-                }).await?
+                node.store
+                    .call("triage.test.record_lost_manager", move |store| {
+                        store.record_manager_turn(
+                            &attempt,
+                            server,
+                            "thread",
+                            Some("turn"),
+                            &Default::default(),
+                        )?;
+                        let interrupted = crate::scheduling::JobOutcome::Interrupted {
+                            failure: vibeface_bridge::failure::ExecFailure::new(
+                                vibeface_bridge::failure::FailureKind::Lost,
+                                "lost",
+                            ),
+                            process_unconfirmed: true,
+                        };
+                        store.finish_job(
+                            &identity,
+                            &network,
+                            scope,
+                            &trigger,
+                            &attempt,
+                            interrupted,
+                            "",
+                            now_ms(),
+                        )?;
+                        Ok(())
+                    })
+                    .await?
             }
             node.reconcile_checks(&network).await?;
             node.reconcile_checks(&network).await?;
             let left = {
-                node.store.call("triage.test.pending_checks", move |store| {
-                    store.pending_checks()
-                }).await
+                node.store
+                    .call("triage.test.pending_checks", move |store| {
+                        store.pending_checks()
+                    })
+                    .await
             }?;
             let servers: Vec<_> = left
                 .iter()
@@ -6484,25 +6756,26 @@ pub(super) mod tests {
                 "the original foreign attempt stays pending"
             );
             let network = network.clone();
-            node.store.call("triage.test.foreign_reconciliation", move |store| {
-
-                let foreign = store
-                    .scheduler_job("c", "message:c-m1")?
-                    .context("foreign job")?;
-                assert!(matches!(
-                    foreign.state,
-                    crate::scheduling::JobState::Reconciling { .. }
-                ));
-                assert!(store.message(&network, "c", &foreign.message_id)?.is_none());
-                assert!(matches!(
-                    store
-                        .scheduler_job("d", "message:d-m1")?
-                        .context("local job")?
-                        .state,
-                    crate::scheduling::JobState::Completed { .. }
-                ));
-                Ok(())
-            }).await?;
+            node.store
+                .call("triage.test.foreign_reconciliation", move |store| {
+                    let foreign = store
+                        .scheduler_job("c", "message:c-m1")?
+                        .context("foreign job")?;
+                    assert!(matches!(
+                        foreign.state,
+                        crate::scheduling::JobState::Reconciling { .. }
+                    ));
+                    assert!(store.message(&network, "c", &foreign.message_id)?.is_none());
+                    assert!(matches!(
+                        store
+                            .scheduler_job("d", "message:d-m1")?
+                            .context("local job")?
+                            .state,
+                        crate::scheduling::JobState::Completed { .. }
+                    ));
+                    Ok(())
+                })
+                .await?;
             let sent: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
             assert_eq!(
                 sent.iter()
@@ -6547,10 +6820,13 @@ pub(super) mod tests {
                 let dispatch = (Dispatch {
                     spec: spec.clone(),
                     state: DispatchState::Pending,
-                }).to_owned();
-                node.store.call("triage.test.save_dispatch", move |store| {
-                    store.save_dispatch(&dispatch)
-                }).await
+                })
+                .to_owned();
+                node.store
+                    .call("triage.test.save_dispatch", move |store| {
+                        store.save_dispatch(&dispatch)
+                    })
+                    .await
             }?;
             let access = test_access(network, false, Some("c".into()));
             let all = node.tool(access.clone(), "work_status", json!({})).await?;
@@ -6577,9 +6853,18 @@ pub(super) mod tests {
             {
                 let trigger = (trigger).to_owned();
                 let attempt_id = (attempt).to_owned();
-                node.store.call("triage.test.save_scheduler_native_id", move |store| {
-                    store.save_scheduler_native_id("c", &trigger, &attempt_id, "bot-thread", "token", false)
-                }).await
+                node.store
+                    .call("triage.test.save_scheduler_native_id", move |store| {
+                        store.save_scheduler_native_id(
+                            "c",
+                            &trigger,
+                            &attempt_id,
+                            "bot-thread",
+                            "token",
+                            false,
+                        )
+                    })
+                    .await
             }?;
             let event = node
                 .ingest_agent_event(turn("bot-thread", "t1", "/w"))
@@ -6836,11 +7121,14 @@ pub(super) mod tests {
                 let work_id = crate::work::WorkSpec::id("c", &trigger, call_ref);
                 assert!(
                     {
-                    let work_id = (work_id).to_owned();
-                    node.store.call("triage.test.work_record", move |store| {
-                        store.work_record(&work_id)
-                    }).await
-                    }?.is_none(),
+                        let work_id = (work_id).to_owned();
+                        node.store
+                            .call("triage.test.work_record", move |store| {
+                                store.work_record(&work_id)
+                            })
+                            .await
+                    }?
+                    .is_none(),
                     "{call_ref} left no work behind"
                 );
             }
@@ -7109,9 +7397,18 @@ pub(super) mod tests {
                     let network_id = (network).to_owned();
                     let body = body;
                     let blobs = vec![];
-                    node.store.call("triage.test.append_event", move |store| {
-                        store.append_event(&identity, &network_id, "c", body, blobs, now_ms() + index as i64)
-                    }).await
+                    node.store
+                        .call("triage.test.append_event", move |store| {
+                            store.append_event(
+                                &identity,
+                                &network_id,
+                                "c",
+                                body,
+                                blobs,
+                                now_ms() + index as i64,
+                            )
+                        })
+                        .await
                 }?;
             }
             let mut requests = coordination_app_server(&node).await?;
@@ -7850,60 +8147,63 @@ pub(super) mod tests {
             let network = node.network_id().await?;
             let boot = node.boot.clone();
             let actor_network = network.clone();
-            let encoded = node.store.call("triage.test.private_claim_roundtrip", move |store| {
-                let network = actor_network;
-                let pending = store.triage_events(None)?;
-                let raw: String =
+            let encoded = node
+                .store
+                .call("triage.test.private_claim_roundtrip", move |store| {
+                    let network = actor_network;
+                    let pending = store.triage_events(None)?;
+                    let raw: String = store.connection.query_row(
+                        "SELECT event FROM triage_queue",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert!(
+                        serde_json::from_str::<AgentEvent>(&raw).is_ok(),
+                        "Pending is the ordinary final-domain event shape"
+                    );
+                    let TriageAdmission::Claimed(attempt) =
+                        store.admit_triage(&network, &boot, 1, 100, now_ms())?
+                    else {
+                        bail!("codec claim");
+                    };
+                    assert_eq!(
+                        store.triage_events(Some((&boot, attempt.id())))?,
+                        pending,
+                        "InFlight preserves the event exactly"
+                    );
+                    let encoded: String = store.connection.query_row(
+                        "SELECT event FROM triage_queue",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let mut invalid: Value = serde_json::from_str(&encoded)?;
+                    invalid["_triage"]["unexpected"] = json!(true);
                     store
                         .connection
-                        .query_row("SELECT event FROM triage_queue", [], |row| row.get(0))?;
-                assert!(
-                    serde_json::from_str::<AgentEvent>(&raw).is_ok(),
-                    "Pending is the ordinary final-domain event shape"
-                );
-                let TriageAdmission::Claimed(attempt) =
-                store.admit_triage(&network, &boot, 1, 100, now_ms())?
-                else {
-                    bail!("codec claim");
-                };
-                assert_eq!(
-                    store.triage_events(Some((&boot, attempt.id())))?,
-                    pending,
-                    "InFlight preserves the event exactly"
-                );
-                let encoded: String =
+                        .execute("UPDATE triage_queue SET event=?", [invalid.to_string()])?;
+                    assert!(
+                        store.triage_events(Some((&boot, attempt.id()))).is_err(),
+                        "an active private claim is parsed strictly"
+                    );
                     store
                         .connection
-                        .query_row("SELECT event FROM triage_queue", [], |row| row.get(0))?;
-                let mut invalid: Value = serde_json::from_str(&encoded)?;
-                invalid["_triage"]["unexpected"] = json!(true);
-                store
-                    .connection
-                    .execute("UPDATE triage_queue SET event=?", [invalid.to_string()])?;
-                assert!(
-                    store
-                    .triage_events(Some((&boot, attempt.id())))
-                        .is_err(),
-                    "an active private claim is parsed strictly"
-                );
-                store
-                    .connection
-                    .execute("UPDATE triage_queue SET event=?", [&encoded])?;
-                let unknown = Err(anyhow::anyhow!("unknown"));
-                store.finish_triage(attempt, &unknown)?;
-                assert_eq!(
-                    store.unknown_triage_events(None)?,
-                    pending,
-                    "Unknown preserves the event exactly"
-                );
-                assert!(store.triage_events(None)?.is_empty());
-                store.connection.execute(
-                    "UPDATE triage_seen SET ts_ms=?",
-                    [now_ms() - SEEN_TTL_MS - 1],
-                )?;
+                        .execute("UPDATE triage_queue SET event=?", [&encoded])?;
+                    let unknown = Err(anyhow::anyhow!("unknown"));
+                    store.finish_triage(attempt, &unknown)?;
+                    assert_eq!(
+                        store.unknown_triage_events(None)?,
+                        pending,
+                        "Unknown preserves the event exactly"
+                    );
+                    assert!(store.triage_events(None)?.is_empty());
+                    store.connection.execute(
+                        "UPDATE triage_seen SET ts_ms=?",
+                        [now_ms() - SEEN_TTL_MS - 1],
+                    )?;
 
-                Ok(encoded)
-            }).await?;
+                    Ok(encoded)
+                })
+                .await?;
             lock(&node.triage.config).scan_codex_sessions = false;
             node.scan_sources().await?;
             assert_eq!(
@@ -7923,48 +8223,54 @@ pub(super) mod tests {
             assert!(!status.to_string().contains("codec"));
             {
                 let encoded = encoded.clone();
-                node.store.call("triage.test.historical_unknown_rows", move |store| {
-
-                    for index in 0..128 {
-                        let mut historical: Value = serde_json::from_str(&encoded)?;
-                        historical["_triage"]["state"] = json!("unknown");
-                        historical["event_id"] = json!(format!("historical-{index}"));
-                        historical["historical_only"] = json!(true);
-                        store.connection.execute(
-                            "INSERT INTO triage_queue(ts_ms,event_id,event) VALUES(?,?,?)",
-                            params![index, format!("historical-{index}"), historical.to_string()],
-                        )?;
-                    }
-                    Ok(())
-                }).await?
+                node.store
+                    .call("triage.test.historical_unknown_rows", move |store| {
+                        for index in 0..128 {
+                            let mut historical: Value = serde_json::from_str(&encoded)?;
+                            historical["_triage"]["state"] = json!("unknown");
+                            historical["event_id"] = json!(format!("historical-{index}"));
+                            historical["historical_only"] = json!(true);
+                            store.connection.execute(
+                                "INSERT INTO triage_queue(ts_ms,event_id,event) VALUES(?,?,?)",
+                                params![
+                                    index,
+                                    format!("historical-{index}"),
+                                    historical.to_string()
+                                ],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .await?
             }
             node.ingest_agent_event(turn("new-pending", "turn", "/tmp"))
                 .await?;
             let boot = node.boot.clone();
-            node.store.call("triage.test.claim_around_history", move |store| {
-
-                assert_eq!(
-                    store.triage_events(None)?.len(),
-                    1,
-                    "Unknown bodies are not decoded by the activity query"
-                );
-                assert_eq!(
-                    store
-                    .triage_status(&network, &boot, None, 100, now_ms())?
-                        .unknown_events,
-                    129
-                );
-                let TriageAdmission::Claimed(pending) =
-                store.admit_triage(&network, &boot, 1, 100, now_ms())?
-                else {
-                    bail!("the new event must be admitted despite historical Unknown bodies")
-                };
-                assert_eq!(pending.events().len(), 1);
-                assert_eq!(pending.events()[0].session_id, "new-pending");
-                store.finish_triage(pending, &Ok(()))?;
-                assert!(store.triage_events(None)?.is_empty());
-                Ok::<_, anyhow::Error>(())
-            }).await
+            node.store
+                .call("triage.test.claim_around_history", move |store| {
+                    assert_eq!(
+                        store.triage_events(None)?.len(),
+                        1,
+                        "Unknown bodies are not decoded by the activity query"
+                    );
+                    assert_eq!(
+                        store
+                            .triage_status(&network, &boot, None, 100, now_ms())?
+                            .unknown_events,
+                        129
+                    );
+                    let TriageAdmission::Claimed(pending) =
+                        store.admit_triage(&network, &boot, 1, 100, now_ms())?
+                    else {
+                        bail!("the new event must be admitted despite historical Unknown bodies")
+                    };
+                    assert_eq!(pending.events().len(), 1);
+                    assert_eq!(pending.events()[0].session_id, "new-pending");
+                    store.finish_triage(pending, &Ok(()))?;
+                    assert!(store.triage_events(None)?.is_empty());
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
         })
         .await
     }
@@ -8037,11 +8343,12 @@ pub(super) mod tests {
             assert_eq!(duplicate?, json!({"offset":1024 * 1024,"complete":false}));
             let (part, target) = {
                 let hash = hash.clone();
-                node.store.call("triage.test.partial_blob_paths", move |store| {
-
-                    assert_eq!(store.committed_offset(&hash)?, 1024 * 1024);
-                    Ok((store.partial_blob_file(&hash)?, store.blob_file(&hash)?))
-                }).await?
+                node.store
+                    .call("triage.test.partial_blob_paths", move |store| {
+                        assert_eq!(store.committed_offset(&hash)?, 1024 * 1024);
+                        Ok((store.partial_blob_file(&hash)?, store.blob_file(&hash)?))
+                    })
+                    .await?
             };
             {
                 use std::io::Write as _;
@@ -8071,14 +8378,15 @@ pub(super) mod tests {
                 let network = network.clone();
                 let boot = node.boot.clone();
                 let content_len = content.len();
-                node.store.call("triage.test.blob_store_available", move |store| {
-
-                    ensure!(
-                        store.committed_offset(&hash)? == content_len as u64,
-                        "the hash barrier follows the durable offset"
-                    );
-                    store.triage_status(&network, &boot, None, 100, now_ms())
-                }).await
+                node.store
+                    .call("triage.test.blob_store_available", move |store| {
+                        ensure!(
+                            store.committed_offset(&hash)? == content_len as u64,
+                            "the hash barrier follows the durable offset"
+                        );
+                        store.triage_status(&network, &boot, None, 100, now_ms())
+                    })
+                    .await
             })
             .await;
             let downloader = node.clone();
@@ -8115,12 +8423,17 @@ pub(super) mod tests {
             );
             assert_eq!(std::fs::read(&target)?, content);
             assert!(!part.exists());
-            assert_eq!({
-                let hash = (hash).to_owned();
-                node.store.call("triage.test.committed_offset", move |store| {
-                    store.committed_offset(&hash)
-                }).await
-                }?, 0);
+            assert_eq!(
+                {
+                    let hash = (hash).to_owned();
+                    node.store
+                        .call("triage.test.committed_offset", move |store| {
+                            store.committed_offset(&hash)
+                        })
+                        .await
+                }?,
+                0
+            );
             let bad_hash = crate::crypto::digest(b"good");
             let failed = node
                 .upload_attachment(
@@ -8131,13 +8444,14 @@ pub(super) mod tests {
                 .await;
             assert!(failed.is_err());
 
-            node.store.call("triage.test.bad_blob_absent", move |store| {
-
-                assert_eq!(store.committed_offset(&bad_hash)?, 0);
-                assert!(!store.partial_blob_file(&bad_hash)?.exists());
-                assert!(!store.blob_file(&bad_hash)?.exists());
-                Ok::<_, anyhow::Error>(())
-            }).await
+            node.store
+                .call("triage.test.bad_blob_absent", move |store| {
+                    assert_eq!(store.committed_offset(&bad_hash)?, 0);
+                    assert!(!store.partial_blob_file(&bad_hash)?.exists());
+                    assert!(!store.blob_file(&bad_hash)?.exists());
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
         })
         .await
     }
@@ -8415,11 +8729,13 @@ pub(super) mod tests {
             let expected = {
                 let network_id = (network).to_owned();
                 let device_id = (stranger).to_owned();
-                node.store.call("triage.test.authorize_node", move |store| {
-                    store.authorize_node(&network_id, &device_id)
-                }).await
+                node.store
+                    .call("triage.test.authorize_node", move |store| {
+                        store.authorize_node(&network_id, &device_id)
+                    })
+                    .await
             }
-                .unwrap_err();
+            .unwrap_err();
             assert_eq!(refused.to_string(), expected.to_string());
             let removed = LocalIdentity::generate();
             let removed_id = removed.device_id()?;
@@ -8445,11 +8761,13 @@ pub(super) mod tests {
             let expected = {
                 let network_id = (network).to_owned();
                 let device_id = (removed_id).to_owned();
-                node.store.call("triage.test.authorize_node", move |store| {
-                    store.authorize_node(&network_id, &device_id)
-                }).await
+                node.store
+                    .call("triage.test.authorize_node", move |store| {
+                        store.authorize_node(&network_id, &device_id)
+                    })
+                    .await
             }
-                .unwrap_err();
+            .unwrap_err();
             assert_eq!(
                 refused.to_string(),
                 expected.to_string(),
@@ -8535,9 +8853,12 @@ pub(super) mod tests {
             let network = t.network_id().await?;
             let expected = {
                 let public_id = public_id.clone();
-                t.store.call("triage.test.authorize_forward_target", move |store| {
-                    store.authorize_node(&network, &public_id)
-                }).await.unwrap_err()
+                t.store
+                    .call("triage.test.authorize_forward_target", move |store| {
+                        store.authorize_node(&network, &public_id)
+                    })
+                    .await
+                    .unwrap_err()
             };
             assert_eq!(refused.to_string(), expected.to_string());
             // The public node dials the target without a membership check; the target alone
@@ -8804,12 +9125,14 @@ pub(super) mod tests {
             let network = (network).to_owned();
             let request = request.clone();
             let proposed = ResolvedModel {
-                    provider,
-                    model: model.map(str::to_owned),
+                provider,
+                model: model.map(str::to_owned),
             };
-            node.store.call("triage.test.accept_work", move |store| {
-                store.accept_work(&identity, &network, request, proposed, now_ms())
-            }).await
+            node.store
+                .call("triage.test.accept_work", move |store| {
+                    store.accept_work(&identity, &network, request, proposed, now_ms())
+                })
+                .await
         }?;
         Ok(request)
     }
@@ -9264,11 +9587,13 @@ pub(super) mod tests {
                 .await?;
                 let initial = {
                     let trigger = (crate::scheduling::task_trigger(&request.work_id)).to_owned();
-                    node.store.call("triage.test.scheduler_job", move |store| {
-                        store.scheduler_job("c", &trigger)
-                    }).await
+                    node.store
+                        .call("triage.test.scheduler_job", move |store| {
+                            store.scheduler_job("c", &trigger)
+                        })
+                        .await
                 }?
-                    .context("claimed")?;
+                .context("claimed")?;
                 assert_eq!(
                     initial
                         .runtime
@@ -9303,21 +9628,27 @@ pub(super) mod tests {
                 .await?;
                 assert!(node.agent_tokens.lock().await.is_empty());
                 assert!(node.manager_controls.lock().await.is_empty());
-                assert!({
-                    node.store.call("triage.test.pending_checks", move |store| {
-                        store.pending_checks()
-                    }).await
-                    }?.is_empty());
+                assert!(
+                    {
+                        node.store
+                            .call("triage.test.pending_checks", move |store| {
+                                store.pending_checks()
+                            })
+                            .await
+                    }?
+                    .is_empty()
+                );
                 assert!(pi_fixture_log(&dir)?.is_empty());
                 let active: Option<String> = {
-
-                    node.store.call("triage.test.sql", move |store| {
-                        Ok(store.connection.query_row(
+                    node.store
+                        .call("triage.test.sql", move |store| {
+                            Ok(store.connection.query_row(
                                 "SELECT active FROM scheduler_sessions WHERE conversation_id='c'",
                                 [],
                                 |row| row.get(0),
                             )?)
-                    }).await
+                        })
+                        .await
                 }?;
                 assert_eq!(active, None);
                 Ok::<_, anyhow::Error>(())
@@ -9355,26 +9686,29 @@ pub(super) mod tests {
             let trigger = crate::scheduling::task_trigger(&request.work_id);
             let job = {
                 let trigger = (trigger).to_owned();
-                node.store.call("triage.test.scheduler_job", move |store| {
-                    store.scheduler_job("c", &trigger)
-                }).await
+                node.store
+                    .call("triage.test.scheduler_job", move |store| {
+                        store.scheduler_job("c", &trigger)
+                    })
+                    .await
             }?
-                .context("claim")?;
+            .context("claim")?;
             let attempt = job.state.attempt().context("attempt")?.id.clone();
             let before_registration = {
                 let trigger = trigger.clone();
                 let attempt = attempt.clone();
-                node.store.call("triage.test.before_registration", move |store| {
-
-                    store.mark_started("c", &trigger, &attempt)?;
-                    store.update_turn_runtime(
-                        "c",
-                        &trigger,
-                        &attempt,
-                        vibeface_bridge::failure::ProviderStage::TurnStart,
-                        crate::scheduling::TurnExecution::Unknown,
-                    )
-                }).await?
+                node.store
+                    .call("triage.test.before_registration", move |store| {
+                        store.mark_started("c", &trigger, &attempt)?;
+                        store.update_turn_runtime(
+                            "c",
+                            &trigger,
+                            &attempt,
+                            vibeface_bridge::failure::ProviderStage::TurnStart,
+                            crate::scheduling::TurnExecution::Unknown,
+                        )
+                    })
+                    .await?
             };
             resume.notify_one();
             tokio::time::timeout(Duration::from_secs(10), running)
@@ -9394,11 +9728,13 @@ pub(super) mod tests {
             );
             let job = {
                 let trigger = (trigger).to_owned();
-                node.store.call("triage.test.scheduler_job", move |store| {
-                    store.scheduler_job("c", &trigger)
-                }).await
+                node.store
+                    .call("triage.test.scheduler_job", move |store| {
+                        store.scheduler_job("c", &trigger)
+                    })
+                    .await
             }?
-                .context("job")?;
+            .context("job")?;
             assert!(matches!(
                 job.state,
                 crate::scheduling::JobState::Reconciling { .. }
@@ -9411,11 +9747,17 @@ pub(super) mod tests {
             assert!(node.agent_tokens.lock().await.is_empty());
             assert!(node.manager_controls.lock().await.is_empty());
             assert!(pi_fixture_log(&dir)?.is_empty());
-            assert_eq!({
-                node.store.call("triage.test.pending_checks", move |store| {
-                    store.pending_checks()
-                }).await
-                }?.len(), 1);
+            assert_eq!(
+                {
+                    node.store
+                        .call("triage.test.pending_checks", move |store| {
+                            store.pending_checks()
+                        })
+                        .await
+                }?
+                .len(),
+                1
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -9473,9 +9815,11 @@ pub(super) mod tests {
                             vec![],
                             1,
                         )?;
-                        node.store.call("triage.test.post_input_fixture", move |store| {
-                            store.post_input_fixture(&identity, &network, body, now_ms())
-                        }).await
+                        node.store
+                            .call("triage.test.post_input_fixture", move |store| {
+                                store.post_input_fixture(&identity, &network, body, now_ms())
+                            })
+                            .await
                     }?;
                     "message:human".into()
                 } else {
@@ -9501,11 +9845,13 @@ pub(super) mod tests {
                 .context("turn")?;
                 let job = {
                     let trigger = (trigger).to_owned();
-                    node.store.call("triage.test.scheduler_job", move |store| {
-                        store.scheduler_job("c", &trigger)
-                    }).await
+                    node.store
+                        .call("triage.test.scheduler_job", move |store| {
+                            store.scheduler_job("c", &trigger)
+                        })
+                        .await
                 }?
-                    .context("job")?;
+                .context("job")?;
                 let runtime = job.runtime.as_ref().context("runtime")?;
                 assert_eq!(runtime.provider, Provider::Pi);
                 assert_eq!(

@@ -1488,16 +1488,24 @@ thread_local! {
     static AUTHORIZATION_ANCESTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
-pub(crate) fn projection_ancestor_walks() -> usize { PROJECTION_ANCESTORS.with(std::cell::Cell::get) }
+pub(crate) fn projection_ancestor_walks() -> usize {
+    PROJECTION_ANCESTORS.with(std::cell::Cell::get)
+}
 #[cfg(test)]
 pub(crate) fn reset_projection_ancestor_walks() {
     PROJECTION_ANCESTORS.with(|count| count.set(0));
     AUTHORIZATION_ANCESTORS.with(|count| count.set(0));
 }
 #[cfg(test)]
-pub(crate) fn authorization_ancestor_walks() -> usize { AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get) }
+pub(crate) fn authorization_ancestor_walks() -> usize {
+    AUTHORIZATION_ANCESTORS.with(std::cell::Cell::get)
+}
 
-fn projection_basis(connection: &Connection, network: &str, event: &Event) -> Result<VersionVector> {
+fn projection_basis(
+    connection: &Connection,
+    network: &str,
+    event: &Event,
+) -> Result<VersionVector> {
     let needs_basis = matches!(&event.body, EventBody::WorkspaceCommanded { .. });
     #[cfg(test)]
     let needs_basis = needs_basis || log::test_metrics::legacy();
@@ -1507,13 +1515,13 @@ fn projection_basis(connection: &Connection, network: &str, event: &Event) -> Re
     #[cfg(test)]
     PROJECTION_ANCESTORS.with(|count| count.set(count.get() + 1));
     Ok(ancestors(connection, network, event)?.values().fold(
-            VersionVector::new(),
-            |mut vector, event| {
-                let seq = vector.entry(event.author.clone()).or_default();
-                *seq = (*seq).max(event.seq);
-                vector
-            },
-        ))
+        VersionVector::new(),
+        |mut vector, event| {
+            let seq = vector.entry(event.author.clone()).or_default();
+            *seq = (*seq).max(event.seq);
+            vector
+        },
+    ))
 }
 pub(crate) fn apply_projection(
     connection: &Connection,

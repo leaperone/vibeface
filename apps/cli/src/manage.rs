@@ -14,10 +14,7 @@ use std::{
     time::Duration,
 };
 use vibeface_client::{self as client, ClientKey, Enrollment, Entry, Progress};
-use vibeface_control::{
-    ControlRequest,
-    maintenance,
-};
+use vibeface_control::{ControlRequest, maintenance};
 
 #[derive(Args)]
 pub struct NodeDir {

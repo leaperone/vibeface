@@ -353,7 +353,6 @@ impl WorkspaceCommand {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnExecution {
@@ -392,13 +391,12 @@ impl Attachment {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn all_six_input_targets_and_cas_controls_preserve_the_wire_shape() {
-        let targets=[
+        let targets = [
             serde_json::json!({"kind":"bot_main","bot_id":"b"}),
             serde_json::json!({"kind":"task","task_id":"t"}),
             serde_json::json!({"kind":"work","work_id":"w"}),
@@ -407,12 +405,17 @@ mod tests {
             serde_json::json!({"kind":"channel_task","channel_id":"c","task_id":"t","bot_id":"b"}),
         ];
         for value in targets {
-            let target:InputTarget=serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(serde_json::to_value(target).unwrap(),value);
+            let target: InputTarget = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(target).unwrap(), value);
         }
-        let value=serde_json::json!({"kind":"control_input","message_id":"m","expected_event":"original","action":{"kind":"move","before_message_id":"next"}});
-        let command:WorkspaceCommand=serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(command).unwrap(),value);
-        assert!(serde_json::from_value::<InputTarget>(serde_json::json!({"kind":"task","task_id":"t","extra":1})).is_err());
+        let value = serde_json::json!({"kind":"control_input","message_id":"m","expected_event":"original","action":{"kind":"move","before_message_id":"next"}});
+        let command: WorkspaceCommand = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(command).unwrap(), value);
+        assert!(
+            serde_json::from_value::<InputTarget>(
+                serde_json::json!({"kind":"task","task_id":"t","extra":1})
+            )
+            .is_err()
+        );
     }
 }

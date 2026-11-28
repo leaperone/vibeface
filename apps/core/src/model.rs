@@ -14,12 +14,9 @@ pub const WIRE_VERSION: u32 = 1;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
-
-
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 
 /// A file the user attached to a message. The name belongs to the message, not the content.
-
 
 /// A file name as the web signs it: no path separators or control characters, at most
 /// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
@@ -401,7 +398,6 @@ fn is_zero(value: &u8) -> bool {
 }
 
 /// What the user's web client does to a schedule; it never creates or edits one.
-
 
 /// The user's own signed message that started the turn a write stands on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1489,4 +1485,4 @@ pub enum IngestStatus {
     Rejected(String),
 }
 
-pub use vibeface_protocol::workspace::{BlobRef, Attachment, ScheduleAction};
+pub use vibeface_protocol::workspace::{Attachment, BlobRef, ScheduleAction};

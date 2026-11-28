@@ -128,15 +128,26 @@ impl Runtime {
             .as_str()
             .context("native execution has no turn ID")?;
         vibeface_protocol::validate_id(turn_id).map_err(anyhow::Error::msg)?;
-        let ids: Vec<String> = turn["items"].as_array().context("native execution query returned no items")?
-            .iter().filter(|item| item["type"] == "userMessage")
-            .filter_map(|item| item["clientId"].as_str().map(str::to_owned)).collect();
+        let ids: Vec<String> = turn["items"]
+            .as_array()
+            .context("native execution query returned no items")?
+            .iter()
+            .filter(|item| item["type"] == "userMessage")
+            .filter_map(|item| item["clientId"].as_str().map(str::to_owned))
+            .collect();
         let call_network = network.to_owned();
-        let mut work_ids = self.store.call("work_input.native_work_ids", move |store| {
-            ids.into_iter().filter_map(|id| match store.work(&call_network, &id) {
-                Ok(Some(_)) => Some(Ok(id)), Ok(None) => None, Err(error) => Some(Err(error)),
-            }).collect::<Result<Vec<_>>>()
-        }).await?;
+        let mut work_ids = self
+            .store
+            .call("work_input.native_work_ids", move |store| {
+                ids.into_iter()
+                    .filter_map(|id| match store.work(&call_network, &id) {
+                        Ok(Some(_)) => Some(Ok(id)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await?;
         work_ids.sort();
         work_ids.dedup();
         Ok(Some(crate::work::NativeExecution {
@@ -161,8 +172,12 @@ impl Runtime {
         let permission_epoch = self
             .local_permission_epoch
             .load(std::sync::atomic::Ordering::Acquire);
-        let call_network = network.to_owned(); let call_work = work.clone(); let call_thread = thread.map(str::to_owned);
-        let call_local = local.clone(); let write_state = self.write_state.clone(); let providers = self.providers.clone();
+        let call_network = network.to_owned();
+        let call_work = work.clone();
+        let call_thread = thread.map(str::to_owned);
+        let call_local = local.clone();
+        let write_state = self.write_state.clone();
+        let providers = self.providers.clone();
         let request = self.store.call("work_input.start_admission", move |store| {
         let network = call_network.as_str(); let work = &call_work; let local = call_local;
         let thread = call_thread.as_deref();
@@ -263,43 +278,56 @@ impl Runtime {
         } else {
             None
         };
-        let call_network = network.to_owned(); let call_work = work.clone();
-        let write_state = self.write_state.clone(); let providers = self.providers.clone(); let epoch = self.local_permission_epoch.clone();
-        self.store.call("work_input.reserve_submission", move |store| {
-        let network = call_network.as_str(); let work = &call_work;
-        ensure!(*write_state.borrow() == WriteState::Writable, "Node execution authority is unavailable");
-        store.authorize_node(network, &local)?;
-        ensure!(
-            epoch.load(std::sync::atomic::Ordering::Acquire)
-                == permission_epoch,
-            "work permissions changed before native submission"
-        );
-        ensure!(
-            store
-                .accepted_work(network, &request)?
-                .is_some_and(|admitted| admitted.spec == *work),
-            "accepted work changed before native submission"
-        );
-        if let WorkKind::Agent(provider) = work.kind {
-            ensure!(
-                providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).switches.execution.contains(&provider),
-                "work execution permission was revoked"
-            );
-        }
-        Self::validate_work_assignment_roots(store, network, &work.trigger)?;
-        ensure!(
-            store.reserve_work_native_submission(
-                network,
-                work,
-                actual_cwd
-                    .to_str()
-                    .context("native work directory is not UTF-8")?,
-                execution.as_ref(),
-            )?,
-            "work native submission was already reserved; query the original work"
-        );
-        Ok(())
-        }).await?;
+        let call_network = network.to_owned();
+        let call_work = work.clone();
+        let write_state = self.write_state.clone();
+        let providers = self.providers.clone();
+        let epoch = self.local_permission_epoch.clone();
+        self.store
+            .call("work_input.reserve_submission", move |store| {
+                let network = call_network.as_str();
+                let work = &call_work;
+                ensure!(
+                    *write_state.borrow() == WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                store.authorize_node(network, &local)?;
+                ensure!(
+                    epoch.load(std::sync::atomic::Ordering::Acquire) == permission_epoch,
+                    "work permissions changed before native submission"
+                );
+                ensure!(
+                    store
+                        .accepted_work(network, &request)?
+                        .is_some_and(|admitted| admitted.spec == *work),
+                    "accepted work changed before native submission"
+                );
+                if let WorkKind::Agent(provider) = work.kind {
+                    ensure!(
+                        providers
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .switches
+                            .execution
+                            .contains(&provider),
+                        "work execution permission was revoked"
+                    );
+                }
+                Self::validate_work_assignment_roots(store, network, &work.trigger)?;
+                ensure!(
+                    store.reserve_work_native_submission(
+                        network,
+                        work,
+                        actual_cwd
+                            .to_str()
+                            .context("native work directory is not UTF-8")?,
+                        execution.as_ref(),
+                    )?,
+                    "work native submission was already reserved; query the original work"
+                );
+                Ok(())
+            })
+            .await?;
         Ok(guard)
     }
 
@@ -328,48 +356,69 @@ impl Runtime {
                     .contains(&work.resolved.provider),
             "work execution permission was revoked"
         );
-        let call_network = network.to_owned(); let call_work = work.clone(); let call_local = local.clone();
+        let call_network = network.to_owned();
+        let call_work = work.clone();
+        let call_local = local.clone();
         let write_state = self.write_state.clone();
-        self.store.call("work_input.first_input_authority", move |store| {
-            let network = call_network.as_str(); let work = &call_work; let local = call_local;
-            ensure!(*write_state.borrow() == WriteState::Writable, "Node execution authority is unavailable");
-            store.authorize_node(network, &local)?;
-            ensure!(
-                store.work_native_authority_allowed(network, &work.work_id)?
-                    && store.work_native_submission_reserved(&work.work_id)?,
-                "work no longer permits its first native input"
-            );
-            Self::validate_work_assignment_roots(store, network, &work.trigger)?;
-            Ok(())
-        }).await?;
+        self.store
+            .call("work_input.first_input_authority", move |store| {
+                let network = call_network.as_str();
+                let work = &call_work;
+                let local = call_local;
+                ensure!(
+                    *write_state.borrow() == WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                store.authorize_node(network, &local)?;
+                ensure!(
+                    store.work_native_authority_allowed(network, &work.work_id)?
+                        && store.work_native_submission_reserved(&work.work_id)?,
+                    "work no longer permits its first native input"
+                );
+                Self::validate_work_assignment_roots(store, network, &work.trigger)?;
+                Ok(())
+            })
+            .await?;
         let actual_cwd = self
             .work_native_directory(work.resolved.provider, Some(actual_session), &work.cwd)
             .await?;
-        let call_network = network.to_owned(); let call_work = work.clone(); let actual_session = actual_session.to_owned();
-        let write_state = self.write_state.clone(); let providers = self.providers.clone(); let epoch = self.local_permission_epoch.clone();
-        self.store.call("work_input.begin_first_input", move |store| {
-        let network = call_network.as_str(); let work = &call_work;
-        ensure!(*write_state.borrow() == WriteState::Writable, "Node execution authority is unavailable");
-        store.authorize_node(network, &local)?;
-        ensure!(
-            providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).switches
-                .execution
-                .contains(&work.resolved.provider)
-                && epoch.load(std::sync::atomic::Ordering::Acquire)
-                    == permission_epoch,
-            "work permissions changed before native input"
-        );
-        Self::validate_work_assignment_roots(store, network, &work.trigger)?;
-        store.begin_reserved_work_native_input(
-            network,
-            work,
-            &actual_session,
-            actual_cwd
-                .to_str()
-                .context("native work directory is not UTF-8")?,
-        )?;
-        Ok(())
-        }).await?;
+        let call_network = network.to_owned();
+        let call_work = work.clone();
+        let actual_session = actual_session.to_owned();
+        let write_state = self.write_state.clone();
+        let providers = self.providers.clone();
+        let epoch = self.local_permission_epoch.clone();
+        self.store
+            .call("work_input.begin_first_input", move |store| {
+                let network = call_network.as_str();
+                let work = &call_work;
+                ensure!(
+                    *write_state.borrow() == WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                store.authorize_node(network, &local)?;
+                ensure!(
+                    providers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .switches
+                        .execution
+                        .contains(&work.resolved.provider)
+                        && epoch.load(std::sync::atomic::Ordering::Acquire) == permission_epoch,
+                    "work permissions changed before native input"
+                );
+                Self::validate_work_assignment_roots(store, network, &work.trigger)?;
+                store.begin_reserved_work_native_input(
+                    network,
+                    work,
+                    &actual_session,
+                    actual_cwd
+                        .to_str()
+                        .context("native work directory is not UTF-8")?,
+                )?;
+                Ok(())
+            })
+            .await?;
         Ok(guard)
     }
 
@@ -399,56 +448,80 @@ impl Runtime {
             self.providers().switches.execution.contains(&into.provider),
             "work execution permission was revoked"
         );
-        let call_network = network.to_owned(); let call_conversation = conversation.to_owned(); let call_work = work_id.to_owned();
-        let target = into.clone(); let local = self.identity.device_id()?; let write_state = self.write_state.clone();
-        let work = self.store.call("work_input.steer_authority", move |store| {
-        let network = call_network.as_str(); let conversation = call_conversation.as_str(); let work_id = call_work.as_str();
-        let into = &target;
-        ensure!(*write_state.borrow() == WriteState::Writable, "Node execution authority is unavailable");
-        store.authorize_node(network, &local)?;
-        ensure!(
-            store
-                .raw_work_steer_target(network, &local, conversation, work_id)?
-                .as_ref()
-                == Some(into),
-            "work input target is no longer active"
-        );
-        let work = store.work(network, work_id)?.context("work not found")?;
-        Self::validate_work_assignment_roots(store, network, &work.trigger)?;
-        Ok(work)
-        }).await?;
+        let call_network = network.to_owned();
+        let call_conversation = conversation.to_owned();
+        let call_work = work_id.to_owned();
+        let target = into.clone();
+        let local = self.identity.device_id()?;
+        let write_state = self.write_state.clone();
+        let work = self
+            .store
+            .call("work_input.steer_authority", move |store| {
+                let network = call_network.as_str();
+                let conversation = call_conversation.as_str();
+                let work_id = call_work.as_str();
+                let into = &target;
+                ensure!(
+                    *write_state.borrow() == WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                store.authorize_node(network, &local)?;
+                ensure!(
+                    store
+                        .raw_work_steer_target(network, &local, conversation, work_id)?
+                        .as_ref()
+                        == Some(into),
+                    "work input target is no longer active"
+                );
+                let work = store.work(network, work_id)?.context("work not found")?;
+                Self::validate_work_assignment_roots(store, network, &work.trigger)?;
+                Ok(work)
+            })
+            .await?;
         let actual_cwd = self
             .work_native_directory(work.resolved.provider, Some(&into.thread_id), &work.cwd)
             .await?;
-        let call_network = network.to_owned(); let call_conversation = conversation.to_owned(); let call_work = work_id.to_owned();
-        let target = into.clone(); let local = self.identity.device_id()?; let write_state = self.write_state.clone(); let providers = self.providers.clone();
-        self.store.call("work_input.steer_admission", move |store| {
-        let network = call_network.as_str(); let conversation = call_conversation.as_str(); let work_id = call_work.as_str();
-        let into = &target;
-        ensure!(*write_state.borrow() == WriteState::Writable, "Node execution authority is unavailable");
-        Self::validate_work_assignment_roots(store, network, &work.trigger)?;
-        ensure!(
-            providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).switches.execution.contains(&into.provider)
-                && store
-                    .raw_work_steer_target(
-                        network,
-                        &local,
-                        conversation,
-                        work_id
-                    )?
-                    .as_ref()
-                    == Some(into)
-                && store.work_native_resources_available(
-                    network,
-                    work_id,
-                    actual_cwd
-                        .to_str()
-                        .context("native work directory is not UTF-8")?,
-                )?,
-            "work input permission changed before native submission"
-        );
-        Ok(())
-        }).await?;
+        let call_network = network.to_owned();
+        let call_conversation = conversation.to_owned();
+        let call_work = work_id.to_owned();
+        let target = into.clone();
+        let local = self.identity.device_id()?;
+        let write_state = self.write_state.clone();
+        let providers = self.providers.clone();
+        self.store
+            .call("work_input.steer_admission", move |store| {
+                let network = call_network.as_str();
+                let conversation = call_conversation.as_str();
+                let work_id = call_work.as_str();
+                let into = &target;
+                ensure!(
+                    *write_state.borrow() == WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                Self::validate_work_assignment_roots(store, network, &work.trigger)?;
+                ensure!(
+                    providers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .switches
+                        .execution
+                        .contains(&into.provider)
+                        && store
+                            .raw_work_steer_target(network, &local, conversation, work_id)?
+                            .as_ref()
+                            == Some(into)
+                        && store.work_native_resources_available(
+                            network,
+                            work_id,
+                            actual_cwd
+                                .to_str()
+                                .context("native work directory is not UTF-8")?,
+                        )?,
+                    "work input permission changed before native submission"
+                );
+                Ok(())
+            })
+            .await?;
         Ok(guard)
     }
 }

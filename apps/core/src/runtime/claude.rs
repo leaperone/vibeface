@@ -1327,7 +1327,11 @@ where
             line = process.lines.next_line() => line,
         };
         if let Err(failure) = &line {
-            break Err(error(ManagerFailure::Unknown, native, own(&format!("Claude Code output transport: {failure}"))));
+            break Err(error(
+                ManagerFailure::Unknown,
+                native,
+                own(&format!("Claude Code output transport: {failure}")),
+            ));
         }
         let Ok(Some(line)) = line else {
             if let Some(ending) = ending.take() {
@@ -1392,7 +1396,12 @@ where
                 reported_start = true;
             }
             if let Some(update) = turn.apply(frame)
-                && let Err(e) = transport::deliver(progress(manager::redact(update, &secrets)), &mut cancel, deadline).await
+                && let Err(e) = transport::deliver(
+                    progress(manager::redact(update, &secrets)),
+                    &mut cancel,
+                    deadline,
+                )
+                .await
             {
                 break 'turn Err(error(ManagerFailure::Unknown, native, own(&e.to_string())));
             }
@@ -1623,7 +1632,8 @@ async fn follow(
         };
         let Ok(Some(line)) = line else {
             missing_input_results = line.is_err()
-                || (ending.is_some() && !node.claude.processes.drained(process.tree.token(), results));
+                || (ending.is_some()
+                    && !node.claude.processes.drained(process.tree.token(), results));
             if let Err(error) = &line {
                 tracing::warn!(%error, "Claude Code output transport stopped; reconcile native session");
             }
@@ -1645,7 +1655,11 @@ async fn follow(
                 && let Ok(target_node) = node.identity.device_id()
                 && let Ok(Some(record)) = {
                     let work_id = work_id.to_owned();
-                    node.store.call("claude.work_record", move |store| store.work_record(&work_id)).await
+                    node.store
+                        .call("claude.work_record", move |store| {
+                            store.work_record(&work_id)
+                        })
+                        .await
                 }
             {
                 let sequence = node.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3349,52 +3363,51 @@ time.sleep(0.05)
             },
         )?;
         let (identity, admin, network, conversation_id, message_id) = (
-            node.identity.clone(), admin.clone(), network.to_owned(), conversation_id.to_owned(), message_id.to_owned(),
+            node.identity.clone(),
+            admin.clone(),
+            network.to_owned(),
+            conversation_id.to_owned(),
+            message_id.to_owned(),
         );
-        node.store.call("claude.conversation_fixture", move |store| {
-            store.create_conversation(
-                &identity,
-                &network,
-                &conversation_id,
-                "bot",
-                owner,
-                now_ms(),
-            )?;
-            store.append_event(
-                &identity,
-                &network,
-                &conversation_id,
-                bot,
-                vec![],
-                now_ms(),
-            )?;
-            let input = admin.attest(
-                &network,
-                &conversation_id,
-                EventBody::InputPosted {
-                    message_id: message_id.clone(),
-                    target: crate::workspace::InputTarget::BotMain {
-                        bot_id: conversation_id.clone(),
+        node.store
+            .call("claude.conversation_fixture", move |store| {
+                store.create_conversation(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    "bot",
+                    owner,
+                    now_ms(),
+                )?;
+                store.append_event(&identity, &network, &conversation_id, bot, vec![], now_ms())?;
+                let input = admin.attest(
+                    &network,
+                    &conversation_id,
+                    EventBody::InputPosted {
+                        message_id: message_id.clone(),
+                        target: crate::workspace::InputTarget::BotMain {
+                            bot_id: conversation_id.clone(),
+                        },
+                        intent: crate::workspace::InputIntent::Continue,
+                        sequence: 1,
+                        expected_revision: None,
+                        text: "Run the provider fixture work".into(),
+                        attachments: vec![],
+                        report_results: Some(true),
+                        attestation: None,
                     },
-                    intent: crate::workspace::InputIntent::Continue,
-                    sequence: 1,
-                    expected_revision: None,
-                    text: "Run the provider fixture work".into(),
-                    attachments: vec![],
-                    report_results: Some(true),
-                    attestation: None,
-                },
-            )?;
-            store.append_event(
-                &identity,
-                &network,
-                &conversation_id,
-                input,
-                vec![],
-                now_ms(),
-            )?;
-            Ok(())
-        }).await
+                )?;
+                store.append_event(
+                    &identity,
+                    &network,
+                    &conversation_id,
+                    input,
+                    vec![],
+                    now_ms(),
+                )?;
+                Ok(())
+            })
+            .await
     }
 
     fn spec(node: &Runtime, place: &Place, call_ref: &str, prompt: &str) -> Result<WorkSpec> {
@@ -3413,7 +3426,11 @@ time.sleep(0.05)
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("claude.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         let claude = node.executor(Provider::Claude)?;
         node.start_work(claude, network, spec, None, &json!({}))
@@ -3423,9 +3440,13 @@ time.sleep(0.05)
     async fn record(node: &Runtime, work_id: &str) -> Result<WorkRecord> {
         {
             let work_id = work_id.to_owned();
-            node.store.call("claude.work_record", move |store| store.work_record(&work_id)).await
+            node.store
+                .call("claude.work_record", move |store| {
+                    store.work_record(&work_id)
+                })
+                .await
         }?
-            .context("the work is recorded")
+        .context("the work is recorded")
     }
 
     async fn until(
@@ -3504,11 +3525,18 @@ time.sleep(0.05)
         let (release, held) = std::sync::mpsc::channel();
         let (held_node, held_work) = (node.clone(), work.work_id.clone());
         let gate = tokio::spawn(async move {
-            held_node.store.call("claude.hold_fixture_completion", move |store| {
-                let _ = entered.send(());
-                held.recv().context("release fixture completion")?;
-                Ok(!store.work_record(&held_work)?.context("work")?.state.finished())
-            }).await
+            held_node
+                .store
+                .call("claude.hold_fixture_completion", move |store| {
+                    let _ = entered.send(());
+                    held.recv().context("release fixture completion")?;
+                    Ok(!store
+                        .work_record(&held_work)?
+                        .context("work")?
+                        .state
+                        .finished())
+                })
+                .await
         });
         waiting.await?;
         assert!(!matches!(
@@ -3631,7 +3659,11 @@ time.sleep(0.05)
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("claude.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         let session = derived(SESSION_SEED, &spec.work_id);
         let journaled = node
@@ -3677,7 +3709,11 @@ time.sleep(0.05)
                 let identity = node.identity.to_owned();
                 let network = network.to_owned();
                 let spec = spec.clone();
-                node.store.call("claude.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+                node.store
+                    .call("claude.accept_work_fixture", move |store| {
+                        store.accept_work_fixture(&identity, &network, spec, now_ms())
+                    })
+                    .await
             }?;
             specs.push(spec);
         }
@@ -3776,7 +3812,11 @@ time.sleep(0.05)
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("claude.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("claude.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         let error = node
             .start_work(&Unstartable, &network, &spec, None, &json!({}))

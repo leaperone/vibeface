@@ -116,16 +116,25 @@ struct DeliverySettings {
 impl DeliverySettings {
     fn load(path: &Path) -> Self {
         let loaded = match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DeliveryConfig::default()),
-            Err(error) => Err(error.into()),
-            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-                Err(anyhow::anyhow!("delivery settings must be a regular private file"))
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(DeliveryConfig::default())
             }
+            Err(error) => Err(error.into()),
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => Err(
+                anyhow::anyhow!("delivery settings must be a regular private file"),
+            ),
             Ok(_) => vibeface_bridge::platform::privatefs::read_private_bounded(
-                path, 64 * 1024, "delivery settings",
-            ).and_then(|bytes| {
+                path,
+                64 * 1024,
+                "delivery settings",
+            )
+            .and_then(|bytes| {
                 serde_json::from_slice::<DeliveryConfig>(&bytes).map_err(|error| {
-                    anyhow::anyhow!("incompatible settings JSON at line {} column {}", error.line(), error.column())
+                    anyhow::anyhow!(
+                        "incompatible settings JSON at line {} column {}",
+                        error.line(),
+                        error.column()
+                    )
                 })
             }),
         };
@@ -134,15 +143,26 @@ impl DeliverySettings {
                 let availability = if !config.enabled {
                     DeliveryAvailability::Disabled
                 } else if let Err(error) = config.validate() {
-                    DeliveryAvailability::Unavailable { reason: format!("delivery settings are invalid: {error}. Preserve delivery-settings.json and repair it locally, then restart the Node") }
+                    DeliveryAvailability::Unavailable {
+                        reason: format!(
+                            "delivery settings are invalid: {error}. Preserve delivery-settings.json and repair it locally, then restart the Node"
+                        ),
+                    }
                 } else {
                     DeliveryAvailability::Ready
                 };
-                Self { config: Some(config), availability }
+                Self {
+                    config: Some(config),
+                    availability,
+                }
             }
             Err(error) => Self {
                 config: None,
-                availability: DeliveryAvailability::Unavailable { reason: format!("delivery settings could not be loaded: {error}. Preserve delivery-settings.json and repair its contents or access locally, then restart the Node") },
+                availability: DeliveryAvailability::Unavailable {
+                    reason: format!(
+                        "delivery settings could not be loaded: {error}. Preserve delivery-settings.json and repair its contents or access locally, then restart the Node"
+                    ),
+                },
             },
         }
     }
@@ -172,10 +192,15 @@ pub struct Delivery {
 }
 impl Delivery {
     pub fn open(dir: &Path, identity: LocalIdentity) -> Result<Self> {
-        identity.device_id().context("invalid Node identity for delivery")?;
+        identity
+            .device_id()
+            .context("invalid Node identity for delivery")?;
         let settings = DeliverySettings::load(&dir.join("delivery-settings.json"));
         let paid = settings.availability == DeliveryAvailability::Ready
-            && settings.config.as_ref().is_some_and(|config| config.paid_enabled);
+            && settings
+                .config
+                .as_ref()
+                .is_some_and(|config| config.paid_enabled);
         let wallet = if paid {
             wallet::Wallet::open(dir.join("delivery-wallet.json"))?
         } else {
@@ -202,13 +227,20 @@ impl Delivery {
         let settings = self.settings.lock().expect("delivery settings");
         let mut config = settings.config.clone().unwrap_or_default();
         // An unavailable capability never authorizes work. The original settings stay on disk.
-        if matches!(settings.availability, DeliveryAvailability::Unavailable { .. }) {
+        if matches!(
+            settings.availability,
+            DeliveryAvailability::Unavailable { .. }
+        ) {
             config.enabled = false;
         }
         config
     }
     pub fn availability(&self) -> DeliveryAvailability {
-        self.settings.lock().expect("delivery settings").availability.clone()
+        self.settings
+            .lock()
+            .expect("delivery settings")
+            .availability
+            .clone()
     }
     fn ensure_available(&self) -> Result<()> {
         if let DeliveryAvailability::Unavailable { reason } = self.availability() {
@@ -479,18 +511,29 @@ impl Delivery {
         }
         drop(wallet);
         let mut store = self.store.lock().expect("delivery store");
-        if config.enabled && let Some(store) = store.as_ref() {
+        if config.enabled
+            && let Some(store) = store.as_ref()
+        {
             store.check_limits(config.storage_limit_bytes, config.max_orders)?;
         }
         crate::config::private_write(
             &self.data_dir.join("delivery-settings.json"),
             &serde_json::to_vec_pretty(&config)?,
         )?;
-        if config.enabled && let Some(store) = store.as_mut() {
+        if config.enabled
+            && let Some(store) = store.as_mut()
+        {
             store.set_limits(config.storage_limit_bytes, config.max_orders);
         }
-        let availability = if config.enabled { DeliveryAvailability::Ready } else { DeliveryAvailability::Disabled };
-        *self.settings.lock().expect("delivery settings") = DeliverySettings { config: Some(config), availability };
+        let availability = if config.enabled {
+            DeliveryAvailability::Ready
+        } else {
+            DeliveryAvailability::Disabled
+        };
+        *self.settings.lock().expect("delivery settings") = DeliverySettings {
+            config: Some(config),
+            availability,
+        };
         drop(store);
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -958,7 +1001,10 @@ mod isolation_tests {
     use vibeface_control::maintenance::{SecretString, WalletCommand};
 
     fn test_dir() -> Result<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("vibeface-delivery-isolation-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-delivery-isolation-{}",
+            uuid::Uuid::new_v4()
+        ));
         crate::config::private_dir(&dir)?;
         Ok(dir)
     }
@@ -970,7 +1016,10 @@ mod isolation_tests {
         let absent = delivery.client_order_receipt("personal-network", "missing-order")?;
         assert_eq!(absent, json!({"order":null,"receipt":null}));
         assert!(!dir.join("delivery").exists());
-        delivery.configure_local(DeliveryConfig { enabled: true, ..Default::default() })?;
+        delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            ..Default::default()
+        })?;
         let mut order = store::tests::paid_order(Role::Sender);
         order.network_id = Some("personal-network".into());
         order.authorized_by = Some("managing-client".into());
@@ -991,8 +1040,15 @@ mod isolation_tests {
         assert_eq!(confirmed["receipt"]["confirmed"], true);
         assert_eq!(confirmed["receipt"]["accepted"], true);
         assert_eq!(confirmed["order"]["order_id"], id);
-        assert_eq!(confirmed["receipt"]["node_id"], delivery.identity.device_id()?);
-        assert!(delivery.client_order_receipt("another-network", &id).is_err());
+        assert_eq!(
+            confirmed["receipt"]["node_id"],
+            delivery.identity.device_id()?
+        );
+        assert!(
+            delivery
+                .client_order_receipt("another-network", &id)
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path)?, before);
         assert!(!dir.join("delivery-wallet.json").exists());
         drop(delivery);
@@ -1024,7 +1080,9 @@ mod isolation_tests {
         let dir = test_dir()?;
         let path = dir.join("delivery-settings.json");
         let bytes = serde_json::to_vec(&DeliveryConfig {
-            enabled: false, paid_enabled: true, max_orders: 0,
+            enabled: false,
+            paid_enabled: true,
+            max_orders: 0,
             delivery_fee_per_window: "obsolete-value".into(),
             ..Default::default()
         })?;
@@ -1043,7 +1101,8 @@ mod isolation_tests {
     }
 
     #[tokio::test]
-    async fn broken_optional_settings_preserve_originals_and_refuse_spending_and_reset() -> Result<()> {
+    async fn broken_optional_settings_preserve_originals_and_refuse_spending_and_reset()
+    -> Result<()> {
         for bytes in [
             b"{broken experimental settings".to_vec(),
             br#"{"enabled":true,"paid_enabled":true}"#.to_vec(),
@@ -1058,15 +1117,30 @@ mod isolation_tests {
             crate::config::private_write(&recovery, recovery_bytes)?;
             let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
             delivery.attach(Weak::new())?;
-            assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+            assert!(matches!(
+                delivery.availability(),
+                DeliveryAvailability::Unavailable { .. }
+            ));
             assert_eq!(delivery.status()?["availability"]["state"], "unavailable");
             assert!(!delivery.config().enabled);
-            let error = delivery.configure_local(DeliveryConfig::default()).unwrap_err();
+            let error = delivery
+                .configure_local(DeliveryConfig::default())
+                .unwrap_err();
             assert!(error.to_string().contains("repair"));
-            assert!(delivery.authorize_spend("synthetic/approval").await.is_err());
-            assert!(delivery.local_wallet(WalletCommand::Create {
-                passphrase: SecretString::new("synthetic test passphrase".into()),
-            }).await.is_err());
+            assert!(
+                delivery
+                    .authorize_spend("synthetic/approval")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                delivery
+                    .local_wallet(WalletCommand::Create {
+                        passphrase: SecretString::new("synthetic test passphrase".into()),
+                    })
+                    .await
+                    .is_err()
+            );
             assert_eq!(std::fs::read(&path)?, bytes);
             assert_eq!(std::fs::read(&recovery)?, recovery_bytes);
             assert!(!dir.join("delivery-wallet.json").exists());
@@ -1103,7 +1177,10 @@ mod isolation_tests {
             let wrong = Delivery::open(&dir, LocalIdentity::generate())?;
             let error = wrong.status().unwrap_err().to_string();
             assert!(error.contains("belongs to another Node"), "{error}");
-            assert_eq!(wrong.with_store(|store| store.value(&label))?.unwrap(), original);
+            assert_eq!(
+                wrong.with_store(|store| store.value(&label))?.unwrap(),
+                original
+            );
             drop(wrong);
             std::fs::remove_dir_all(dir)?;
         }
@@ -1116,7 +1193,12 @@ mod isolation_tests {
         let bytes = b"synthetic broken settings";
         let path = dir.join("delivery-settings.json");
         crate::config::private_write(&path, bytes)?;
-        let result = Delivery::open(&dir, LocalIdentity { secret_key_hex: "invalid synthetic key".into() });
+        let result = Delivery::open(
+            &dir,
+            LocalIdentity {
+                secret_key_hex: "invalid synthetic key".into(),
+            },
+        );
         let error = match result {
             Ok(_) => panic!("invalid identity must be refused"),
             Err(error) => error,
@@ -1135,7 +1217,10 @@ mod isolation_tests {
         let target = dir.join("missing-original-settings.json");
         std::os::unix::fs::symlink(&target, &path)?;
         let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
-        assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+        assert!(matches!(
+            delivery.availability(),
+            DeliveryAvailability::Unavailable { .. }
+        ));
         assert!(delivery.configure_local(DeliveryConfig::default()).is_err());
         assert_eq!(std::fs::read_link(&path)?, target);
         assert!(!target.exists());
@@ -1150,7 +1235,10 @@ mod isolation_tests {
         std::fs::create_dir(&path)?;
         let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
         delivery.attach(Weak::new())?;
-        assert!(matches!(delivery.availability(), DeliveryAvailability::Unavailable { .. }));
+        assert!(matches!(
+            delivery.availability(),
+            DeliveryAvailability::Unavailable { .. }
+        ));
         assert!(delivery.configure_local(DeliveryConfig::default()).is_err());
         assert!(path.is_dir());
         std::fs::remove_dir_all(dir)?;
@@ -1165,16 +1253,29 @@ mod isolation_tests {
         crate::config::private_write(&path, bytes)?;
         let delivery = Delivery::open(&dir, LocalIdentity::generate())?;
         delivery.attach(Weak::new())?;
-        delivery.configure_local(DeliveryConfig { enabled: true, ..Default::default() })?;
-        assert!(delivery.wallet.lock().unwrap().is_deferred());
         delivery.configure_local(DeliveryConfig {
-            enabled: true, paid_enabled: true, chain: Some(chain::tests::config()),
+            enabled: true,
             ..Default::default()
         })?;
-        assert!(matches!(delivery.local_wallet(WalletCommand::Status).await?, wallet::WalletStatus::Unavailable { .. }));
-        assert!(delivery.local_wallet(WalletCommand::Create {
-            passphrase: SecretString::new("synthetic test passphrase".into()),
-        }).await.is_err());
+        assert!(delivery.wallet.lock().unwrap().is_deferred());
+        delivery.configure_local(DeliveryConfig {
+            enabled: true,
+            paid_enabled: true,
+            chain: Some(chain::tests::config()),
+            ..Default::default()
+        })?;
+        assert!(matches!(
+            delivery.local_wallet(WalletCommand::Status).await?,
+            wallet::WalletStatus::Unavailable { .. }
+        ));
+        assert!(
+            delivery
+                .local_wallet(WalletCommand::Create {
+                    passphrase: SecretString::new("synthetic test passphrase".into()),
+                })
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path)?, bytes);
         delivery.shutdown().await;
         std::fs::remove_dir_all(dir)?;

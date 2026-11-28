@@ -16,10 +16,14 @@ impl Runtime {
         let epoch = args["epoch"].as_u64().context("epoch is required")?;
         let current = {
             let (network, scope, owner) = (network.to_owned(), scope.to_owned(), owner.clone());
-            self.store.call("followup.current", move |store| {
-                store.authorize_node(&network, &owner)?;
-                store.conversation(&network, &scope)?.context("conversation not found")
-            }).await?
+            self.store
+                .call("followup.current", move |store| {
+                    store.authorize_node(&network, &owner)?;
+                    store
+                        .conversation(&network, &scope)?
+                        .context("conversation not found")
+                })
+                .await?
         };
         ensure!(
             epoch == current.owner_epoch + 1,

@@ -20,8 +20,8 @@ use vibeface_bridge::agent::{self, AgentResult};
 use vibeface_bridge::failure::ProviderStage;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 use vibeface_bridge::platform::tree;
-use vibeface_bridge::turn::TurnStatus;
 use vibeface_bridge::transport;
+use vibeface_bridge::turn::TurnStatus;
 
 /// Process groups of the running pi processes, with the program each one runs.
 const PIDFILE: &str = "pi.pid";
@@ -143,10 +143,15 @@ struct Rpc {
     next: AtomicU64,
 }
 
-struct PendingReply<'a> { rpc: &'a Rpc, id: String }
+struct PendingReply<'a> {
+    rpc: &'a Rpc,
+    id: String,
+}
 impl Drop for PendingReply<'_> {
     fn drop(&mut self) {
-        if let Some(waiting) = lock(&self.rpc.waiting).as_mut() { waiting.remove(&self.id); }
+        if let Some(waiting) = lock(&self.rpc.waiting).as_mut() {
+            waiting.remove(&self.id);
+        }
     }
 }
 
@@ -225,7 +230,13 @@ fn report_bytes(report: &Report) -> usize {
             Signal::StartRejected(error) => error.detail.capacity(),
             Signal::Progress { summary, .. } => summary.capacity(),
             Signal::Text(text) => text.capacity(),
-            Signal::TurnCompleted { turn_id, text, error, .. } => turn_id.capacity()
+            Signal::TurnCompleted {
+                turn_id,
+                text,
+                error,
+                ..
+            } => turn_id
+                .capacity()
                 .saturating_add(text.capacity())
                 .saturating_add(error.as_ref().map_or(0, |error| error.detail.capacity())),
             _ => usize::MAX,
@@ -439,17 +450,25 @@ impl Rpc {
         };
         let (sender, answer) = oneshot::channel();
         match lock(&self.waiting).as_mut() {
-            Some(waiting) if waiting.len() < transport::QUEUE_ITEMS => waiting.insert(id.clone(), sender),
+            Some(waiting) if waiting.len() < transport::QUEUE_ITEMS => {
+                waiting.insert(id.clone(), sender)
+            }
             Some(_) => return Reply::Refused("pi has too many pending commands".into()),
             None => return Reply::Unsent,
         };
         let _pending = PendingReply { rpc: self, id };
-        let written = tokio::time::timeout(within, async { match prompt {
-            Some(prompt) => self.write_prompt(&command.value, prompt).await,
-            None if self.write(&command.value).await => Ok(()),
-            None => Err(Reply::Unsent),
-        }}).await.unwrap_or(Err(Reply::Lost));
-        if let Err(reply) = written { return reply; }
+        let written = tokio::time::timeout(within, async {
+            match prompt {
+                Some(prompt) => self.write_prompt(&command.value, prompt).await,
+                None if self.write(&command.value).await => Ok(()),
+                None => Err(Reply::Unsent),
+            }
+        })
+        .await
+        .unwrap_or(Err(Reply::Lost));
+        if let Err(reply) = written {
+            return reply;
+        }
         let answer = tokio::time::timeout(within, answer).await;
         match answer {
             Ok(Ok(response)) if response.value["success"] == true => {
@@ -496,7 +515,9 @@ impl Rpc {
     /// One JSON line on pi's input; false when pi no longer reads it.
     async fn write(&self, line: &Value) -> bool {
         let mut stdin = self.stdin.lock().await;
-        let Ok(mut bytes) = transport::json(line, transport::FRAME_BYTES) else { return false; };
+        let Ok(mut bytes) = transport::json(line, transport::FRAME_BYTES) else {
+            return false;
+        };
         bytes.push(b'\n');
         match stdin.as_mut() {
             Some(pipe) => pipe.write_all(&bytes).await.is_ok() && pipe.flush().await.is_ok(),
@@ -512,7 +533,8 @@ async fn read_output(
     rpc: Arc<Rpc>,
     events: transport::JsonSender,
 ) {
-    let mut lines = transport::Lines::new(tokio::io::BufReader::new(stdout), transport::FRAME_BYTES);
+    let mut lines =
+        transport::Lines::new(tokio::io::BufReader::new(stdout), transport::FRAME_BYTES);
     let result = async {
         while let Some(line) = lines.next_line().await? {
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -532,7 +554,8 @@ async fn read_output(
             }
         }
         std::io::Result::Ok(())
-    }.await;
+    }
+    .await;
     if let Err(error) = result {
         tracing::warn!(%error, "pi output transport stopped; reconcile native session");
         events.fail(error);
@@ -597,7 +620,8 @@ impl Process {
             commands: transport::JsonBudget::new(transport::QUEUE_BYTES),
             next: AtomicU64::new(1),
         });
-        let (sender, events) = transport::json_channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES);
+        let (sender, events) =
+            transport::json_channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES);
         let output = tokio::spawn(read_output(stdout, rpc.clone(), sender));
         let stderr = tokio::spawn(async move {
             let (mut tail, mut buffer) = (Vec::new(), [0; 4096]);
@@ -749,7 +773,9 @@ impl Process {
                 Ok(None) | Err(_) => {
                     return Begin::Unknown(ExecFailure::new(
                         FailureKind::Lost,
-                        self.events.failure().unwrap_or_else(|| "pi stopped before the turn started".into()),
+                        self.events
+                            .failure()
+                            .unwrap_or_else(|| "pi stopped before the turn started".into()),
                     ));
                 }
             }
@@ -1247,12 +1273,23 @@ impl Pi {
                         break Err(error(
                             ManagerFailure::Unknown,
                             native,
-                            ExecFailure::new(FailureKind::Lost, process.events.failure().unwrap_or_else(|| "pi exited during the turn".into())),
+                            ExecFailure::new(
+                                FailureKind::Lost,
+                                process
+                                    .events
+                                    .failure()
+                                    .unwrap_or_else(|| "pi exited during the turn".into()),
+                            ),
                         ));
                     };
                     let mut shown = Ok(());
                     for update in seen.apply(&event) {
-                        shown = transport::deliver(progress(crate::manager::redact(update, &secrets)), &mut cancel, deadline).await;
+                        shown = transport::deliver(
+                            progress(crate::manager::redact(update, &secrets)),
+                            &mut cancel,
+                            deadline,
+                        )
+                        .await;
                         if shown.is_err() {
                             break;
                         }
@@ -1327,7 +1364,8 @@ impl Pi {
                 let tail = process.end().await;
                 return send(Report::Signal(Signal::StartRejected(with_tail(
                     failure, &tail,
-                )))).await;
+                ))))
+                .await;
             }
             Begin::Unknown(_) => {
                 process.end().await;
@@ -1352,7 +1390,8 @@ impl Pi {
         send(Report::Signal(Signal::TurnStarted {
             turn_id: turn.clone(),
             epoch: 0,
-        })).await;
+        }))
+        .await;
         let mut seen = Seen::default();
         let settled = 'events: loop {
             let event = tokio::select! {
@@ -1402,7 +1441,9 @@ impl Pi {
                         _ = agent::wait_for_cancel(&mut cancel) => false,
                         result = report.send(signal) => result.is_ok(),
                     };
-                    if !delivered { break 'events false; }
+                    if !delivered {
+                        break 'events false;
+                    }
                 }
             }
             if event["type"] == "agent_settled" {
@@ -1420,7 +1461,8 @@ impl Pi {
             status,
             text: seen.text(),
             error,
-        })).await;
+        }))
+        .await;
     }
 }
 
@@ -1598,7 +1640,8 @@ impl Executor for Pi {
                 args: launch_args,
                 guide: None,
             };
-            let (sender, mut reports) = transport::channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES, report_bytes);
+            let (sender, mut reports) =
+                transport::channel(transport::QUEUE_ITEMS, transport::QUEUE_BYTES, report_bytes);
             let (stop, cancel) = watch::channel(false);
             {
                 let mut preparing = lock(&self.preparing);
@@ -1842,7 +1885,10 @@ mod transport_tests {
     async fn response_bypasses_progress_and_terminal_remains_ordered() {
         let rpc = rpc();
         let (reply, answer) = oneshot::channel();
-        lock(&rpc.waiting).as_mut().unwrap().insert("vf-1".into(), reply);
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("vf-1".into(), reply);
         let (sender, mut events) = transport::json_channel(2, 4096);
         let input = concat!(
             "{\"type\":\"message_update\"}\n",
@@ -1862,7 +1908,10 @@ mod transport_tests {
     async fn progress_pressure_closes_intake_and_releases_response_waiter() {
         let rpc = rpc();
         let (reply, answer) = oneshot::channel();
-        lock(&rpc.waiting).as_mut().unwrap().insert("vf-1".into(), reply);
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("vf-1".into(), reply);
         let (sender, mut events) = transport::json_channel(1, 4096);
         let input = concat!(
             "{\"type\":\"message_update\"}\n",
@@ -1870,9 +1919,16 @@ mod transport_tests {
             "{\"type\":\"response\",\"id\":\"vf-1\",\"success\":true}\n",
             "{\"type\":\"agent_settled\"}\n",
         );
-        tokio::time::timeout(Duration::from_secs(1), read_output(input.as_bytes(), rpc.clone(), sender))
-            .await.unwrap();
-        assert!(answer.await.is_err(), "RPC must become unknown, never hang behind progress");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            read_output(input.as_bytes(), rpc.clone(), sender),
+        )
+        .await
+        .unwrap();
+        assert!(
+            answer.await.is_err(),
+            "RPC must become unknown, never hang behind progress"
+        );
         assert_eq!(events.recv().await.unwrap()["type"], "message_update");
         assert!(events.recv().await.is_none());
         assert!(events.failure().unwrap().contains("queue"));
@@ -1883,8 +1939,14 @@ mod transport_tests {
     async fn cancelling_a_pending_rpc_releases_its_waiter_entry() {
         let rpc = rpc();
         let (reply, answer) = oneshot::channel();
-        lock(&rpc.waiting).as_mut().unwrap().insert("cancelled".into(), reply);
-        let pending = PendingReply { rpc: &rpc, id: "cancelled".into() };
+        lock(&rpc.waiting)
+            .as_mut()
+            .unwrap()
+            .insert("cancelled".into(), reply);
+        let pending = PendingReply {
+            rpc: &rpc,
+            id: "cancelled".into(),
+        };
         drop(pending);
         assert!(answer.await.is_err());
         assert!(lock(&rpc.waiting).as_ref().unwrap().is_empty());
@@ -1893,15 +1955,28 @@ mod transport_tests {
     #[tokio::test]
     async fn report_queue_pressure_keeps_the_terminal_signal() {
         let (sender, mut reports) = transport::channel(1, 4096, report_bytes);
-        sender.try_send(Report::Progress(json!({"type":"text_delta", "text":"hello"}))).unwrap();
+        sender
+            .try_send(Report::Progress(
+                json!({"type":"text_delta", "text":"hello"}),
+            ))
+            .unwrap();
         let terminal = sender.send(Report::Signal(Signal::TurnCompleted {
-            turn_id: "turn".into(), status: TurnStatus::Completed, text: "done".into(), error: None,
+            turn_id: "turn".into(),
+            status: TurnStatus::Completed,
+            text: "done".into(),
+            error: None,
         }));
         tokio::pin!(terminal);
-        assert!(tokio::time::timeout(Duration::from_millis(5), &mut terminal).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut terminal)
+                .await
+                .is_err()
+        );
         assert!(matches!(reports.recv().await, Some(Report::Progress(_))));
         terminal.await.unwrap();
-        assert!(matches!(reports.recv().await, Some(Report::Signal(Signal::TurnCompleted { text, .. })) if text == "done"));
+        assert!(
+            matches!(reports.recv().await, Some(Report::Signal(Signal::TurnCompleted { text, .. })) if text == "done")
+        );
     }
 }
 
@@ -2186,7 +2261,11 @@ mod tests {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("pi.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         let pi = node.pi.clone();
         let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
@@ -2225,7 +2304,10 @@ mod tests {
     async fn work(node: &Runtime, done: impl Fn(&WorkState) -> bool) -> Result<WorkRecord> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let record = node.store.call("pi.work_record", move |store| store.work_record("w-1")).await?;
+            let record = node
+                .store
+                .call("pi.work_record", move |store| store.work_record("w-1"))
+                .await?;
             let record = record.context("work")?;
             if done(&record.state) || Instant::now() > deadline {
                 return Ok(record);
@@ -2703,7 +2785,10 @@ mod tests {
         gate_state(&node, &dir)?;
         dispatch(&node, &network, &dir).await?;
         let pid = state_waiting(&dir).await?;
-        let preparing = node.store.call("pi.work_record", move |store| store.work_record("w-1")).await?
+        let preparing = node
+            .store
+            .call("pi.work_record", move |store| store.work_record("w-1"))
+            .await?
             .context("work")?;
         assert!(preparing.state.handle().is_none());
         tokio::time::timeout(Duration::from_secs(2), node.stop_work(&network, "c", "w-1"))
@@ -2722,7 +2807,12 @@ mod tests {
         std::fs::write(dir.join("state-release"), "")?;
         assert!(prompts(&dir).is_empty());
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
-        assert!(node.store.call("pi.stop_requests", move |store| store.stop_requests()).await?.is_empty());
+        assert!(
+            node.store
+                .call("pi.stop_requests", move |store| store.stop_requests())
+                .await?
+                .is_empty()
+        );
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2853,11 +2943,13 @@ mod tests {
         work(&node, WorkState::finished).await?;
         let session = ({
             let network = network.to_owned();
-            node.store.call("pi.works", move |store| store.works(&network, "c")).await
+            node.store
+                .call("pi.works", move |store| store.works(&network, "c"))
+                .await
         }?)
-            .into_iter()
-            .find_map(|work| work.thread_id)
-            .context("a session")?;
+        .into_iter()
+        .find_map(|work| work.thread_id)
+        .context("a session")?;
         assert_eq!(node.pi.native_directory(&session).await?, dir);
         assert!(node.pi.native_directory("missing-session").await.is_err());
         let file = node.pi.pointer(&session)?.context("pointer")?.file;
@@ -2872,7 +2964,11 @@ mod tests {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let moved = moved.clone();
-            node.store.call("pi.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, moved, now_ms())).await
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, moved, now_ms())
+                })
+                .await
         }?;
         let refused = node.start_work(pi.as_ref(), &network, &moved, Some(&session), &Value::Null);
         let refused = refused
@@ -2894,12 +2990,20 @@ mod tests {
             let identity = node.identity.to_owned();
             let network = network.to_owned();
             let spec = spec.clone();
-            node.store.call("pi.accept_work_fixture", move |store| store.accept_work_fixture(&identity, &network, spec, now_ms())).await
+            node.store
+                .call("pi.accept_work_fixture", move |store| {
+                    store.accept_work_fixture(&identity, &network, spec, now_ms())
+                })
+                .await
         }?;
         (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {
-            let record = node.store.call("pi.work_record", move |store| store.work_record("w-2")).await?.context("w-2")?;
+            let record = node
+                .store
+                .call("pi.work_record", move |store| store.work_record("w-2"))
+                .await?
+                .context("w-2")?;
             if record.state.finished() || Instant::now() > deadline {
                 break record;
             }
@@ -2963,7 +3067,10 @@ mod tests {
         node.stop_work(&network, "c", "w-1").await?;
         wait_for_abort(&dir).await?;
         assert_eq!(aborts(), 1, "the first native abort reached pi");
-        let first = node.store.call("pi.work_record", move |store| store.work_record("w-1")).await?
+        let first = node
+            .store
+            .call("pi.work_record", move |store| store.work_record("w-1"))
+            .await?
             .context("work")?;
         assert!(matches!(first.state, WorkState::Interrupting { .. }));
         assert_eq!(
@@ -2973,14 +3080,21 @@ mod tests {
                 epoch: 0
             }
         );
-        let mut held = node.store.call("pi.stop_requests", move |store| store.stop_requests()).await?
+        let mut held = node
+            .store
+            .call("pi.stop_requests", move |store| store.stop_requests())
+            .await?
             .into_iter()
             .find(|request| request.work_id == "w-1")
             .context("the unsettled turn keeps its stop request")?;
         held.deadline_ms = now_ms() - 1;
         {
             let held = held.to_owned();
-            node.store.call("pi.save_stop_request", move |store| store.save_stop_request(&held)).await
+            node.store
+                .call("pi.save_stop_request", move |store| {
+                    store.save_stop_request(&held)
+                })
+                .await
         }?;
         node.reconcile_works(&network).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -3002,7 +3116,12 @@ mod tests {
             }
         );
         assert!(ended(&group).await, "settled pi ended its process");
-        assert!(node.store.call("pi.stop_requests", move |store| store.stop_requests()).await?.is_empty());
+        assert!(
+            node.store
+                .call("pi.stop_requests", move |store| store.stop_requests())
+                .await?
+                .is_empty()
+        );
         assert!(!lock(&node.pi.preparing).contains_key("w-1"));
         assert!(
             node.pi
@@ -3269,10 +3388,12 @@ mod tests {
         assert_eq!(
             {
                 let network = network.to_owned();
-                node.store.call("pi.work", move |store| store.work(&network, "w-1")).await
+                node.store
+                    .call("pi.work", move |store| store.work(&network, "w-1"))
+                    .await
             }?
-                .context("work")?
-                .failure,
+            .context("work")?
+            .failure,
             Some(FailureKind::MissingKey)
         );
         std::fs::remove_dir_all(&dir)?;

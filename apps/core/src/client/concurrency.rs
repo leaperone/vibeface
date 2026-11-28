@@ -21,17 +21,33 @@ enum Lane {
 impl Lane {
     fn for_request(request: &Request) -> Self {
         match request.method.as_str() {
-            "provider_probe" | "provider_models" | "test_codex_app_server" | "test_webhook"
-            | "logs" | "diagnostics" => Self::Long,
+            "provider_probe"
+            | "provider_models"
+            | "test_codex_app_server"
+            | "test_webhook"
+            | "logs"
+            | "diagnostics" => Self::Long,
             "info" | "directory" | "write_state" | "node_settings" | "triage_settings"
             | "relay_settings" | "share_link" | "entrances" => Self::Read,
             "rpc" => match request.params["method"].as_str() {
                 Some("interrupt_work" | "cancel_manager") => Self::Control,
                 Some(
-                    "nodes" | "conversations" | "open_works" | "work_detail"
-                    | "workspace_overview" | "workspace_state" | "workspace_history" | "workspace_command_receipt" | "signed_receipt"
-                    | "input_receipt" | "scope_context" | "read_artifact" | "bots"
-                    | "questions" | "memory_state" | "notifications",
+                    "nodes"
+                    | "conversations"
+                    | "open_works"
+                    | "work_detail"
+                    | "workspace_overview"
+                    | "workspace_state"
+                    | "workspace_history"
+                    | "workspace_command_receipt"
+                    | "signed_receipt"
+                    | "input_receipt"
+                    | "scope_context"
+                    | "read_artifact"
+                    | "bots"
+                    | "questions"
+                    | "memory_state"
+                    | "notifications",
                 ) => Self::Read,
                 // Conversation reads replace the observation lease. Unrecognized operations
                 // and writes retain arrival order; they are never retried by this scheduler.
@@ -113,7 +129,10 @@ impl Calls {
     }
 
     fn count(&self, lane: Lane) -> usize {
-        self.active.values().filter(|call| call.lane == lane).count()
+        self.active
+            .values()
+            .filter(|call| call.lane == lane)
+            .count()
     }
 
     pub(super) async fn accept(
@@ -193,13 +212,9 @@ impl Calls {
             let observing = request.method == "rpc" && request.params["method"] == "conversation";
             let result = match denied {
                 Some(error) => Err(error),
-                None => dispatch(
-                    &node,
-                    &mut request_session,
-                    &request.method,
-                    request.params,
-                )
-                .await,
+                None => {
+                    dispatch(&node, &mut request_session, &request.method, request.params).await
+                }
             };
             let effect = match request.method.as_str() {
                 "subscribe" => Some(Effect::Subscribe(request_session.subscribed)),
@@ -225,11 +240,7 @@ impl Calls {
             .context("client request task failed; outcome may be unknown")
     }
 
-    pub(super) async fn check_authority(
-        &self,
-        node: &Runtime,
-        session: &Session,
-    ) -> Result<()> {
+    pub(super) async fn check_authority(&self, node: &Runtime, session: &Session) -> Result<()> {
         if self.active.values().any(|call| call.authority.is_some()) {
             let now = principal(node, session).await?;
             ensure!(
@@ -250,7 +261,10 @@ impl Calls {
     ) -> Result<Response> {
         // Check even if membership/local-access notifications have not won select yet. A
         // completed task must not leak its old result after a revocation raced its completion.
-        let active = self.active.remove(&completed.id).context("unknown client result")?;
+        let active = self
+            .active
+            .remove(&completed.id)
+            .context("unknown client result")?;
         if let Some(was) = active.authority {
             ensure!(
                 principal(node, session).await? == was,

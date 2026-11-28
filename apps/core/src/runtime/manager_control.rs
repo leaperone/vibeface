@@ -44,23 +44,34 @@ impl Runtime {
         let current = self.manager().map(|manager| manager.provider);
         let providers = self.providers();
         let ended = {
-            let identity = self.identity.clone(); let network = network.to_owned(); let conversation = conversation.map(str::to_owned);
-            self.store.call("manager_control.refuse_queued_tasks", move |store| {
-                store.refuse_queued_tasks(
-            &identity,
-            &network,
-            conversation.as_deref(),
-            crate::scheduler::boot_id(),
-            now_ms(),
-            |accepted| match crate::scheduler::task_start_failure(current, accepted.provider) {
-                Some(failure) => Ok(Some((
-                    super::provider_probe::generation_for(&identity, accepted.provider, &providers)?,
-                    failure,
-                ))),
-                None => Ok(None),
-            },
-        )
-            }).await
+            let identity = self.identity.clone();
+            let network = network.to_owned();
+            let conversation = conversation.map(str::to_owned);
+            self.store
+                .call("manager_control.refuse_queued_tasks", move |store| {
+                    store.refuse_queued_tasks(
+                        &identity,
+                        &network,
+                        conversation.as_deref(),
+                        crate::scheduler::boot_id(),
+                        now_ms(),
+                        |accepted| match crate::scheduler::task_start_failure(
+                            current,
+                            accepted.provider,
+                        ) {
+                            Some(failure) => Ok(Some((
+                                super::provider_probe::generation_for(
+                                    &identity,
+                                    accepted.provider,
+                                    &providers,
+                                )?,
+                                failure,
+                            ))),
+                            None => Ok(None),
+                        },
+                    )
+                })
+                .await
         }?;
         for job in &ended {
             self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
@@ -97,9 +108,13 @@ impl Runtime {
         let job = {
             let arg0 = (scope).to_owned();
             let arg1 = (trigger).to_owned();
-            self.store.call("manager_control.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+            self.store
+                .call("manager_control.scheduler_job", move |store| {
+                    store.scheduler_job(&arg0, &arg1)
+                })
+                .await
         }?
-            .context("manager job missing")?;
+        .context("manager job missing")?;
         let attempt = job.state.attempt().context("manager attempt missing")?;
         ensure!(attempt.id == attempt_id, "manager attempt mismatch");
         access.manager = Some(ManagerAccess {
@@ -108,10 +123,13 @@ impl Runtime {
             permission_version: attempt.permission_version,
         });
         {
-            let identity = self.identity.clone(); let access = access.clone();
-            self.store.call("manager_control.check_permission", move |store| {
-                Self::check_manager_permission(store, &identity.device_id()?, &access)
-            }).await?;
+            let identity = self.identity.clone();
+            let access = access.clone();
+            self.store
+                .call("manager_control.check_permission", move |store| {
+                    Self::check_manager_permission(store, &identity.device_id()?, &access)
+                })
+                .await?;
         }
         if job.kind == TriggerKind::AgentTask {
             let runtime = job.runtime.as_ref().context("task runtime missing")?;
@@ -136,7 +154,11 @@ impl Runtime {
                 let arg0 = (scope).to_owned();
                 let arg1 = (trigger).to_owned();
                 let arg2 = (attempt_id).to_owned();
-                self.store.call("manager_control.mark_started", move |store| store.mark_started(&arg0, &arg1, &arg2)).await
+                self.store
+                    .call("manager_control.mark_started", move |store| {
+                        store.mark_started(&arg0, &arg1, &arg2)
+                    })
+                    .await
             }?;
         }
         let (cancel, receiver) = watch::channel(false);
@@ -219,41 +241,50 @@ impl Runtime {
             !active.fenced.load(Ordering::Acquire) && active.provider == provider,
             "management input target is no longer valid"
         );
-        let access = active.access.clone(); let identity = self.identity.clone(); let write_state = self.write_state.clone();
-        self.store.call("manager_control.input_lease", move |store| {
-        ensure!(*write_state.borrow() == super::WriteState::Writable, "Node execution authority is unavailable");
-        let local = identity.device_id()?;
-        Self::check_manager_permission(store, &local, &access)?;
-        let manager = access
-            .manager
-            .as_ref()
-            .context("manager metadata missing")?;
-        let scope = access
-            .conversation_id
-            .as_deref()
-            .context("manager scope missing")?;
-        let job = store
-            .scheduler_job(scope, &manager.trigger)?
-            .context("manager job missing")?;
-        if let Some(assignment) = crate::store::workspace::workspace_assignment_for_job_from(
-            &store.connection,
-            &access.network_id,
-            &local,
-            &job,
-        )? && let Err(error) = Self::validate_assignment_roots(&assignment.resource_roots)
-        {
-            if !job.tool_calls
-                && !job.pending_check
-                && job.runtime.as_ref().is_some_and(|runtime| {
-                    runtime.execution == crate::scheduling::TurnExecution::NotStarted
-                })
-            {
-                return Err(crate::manager::ManagerError::not_started(error));
-            }
-            return Err(error);
-        }
-        Ok(())
-        }).await?;
+        let access = active.access.clone();
+        let identity = self.identity.clone();
+        let write_state = self.write_state.clone();
+        self.store
+            .call("manager_control.input_lease", move |store| {
+                ensure!(
+                    *write_state.borrow() == super::WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                let local = identity.device_id()?;
+                Self::check_manager_permission(store, &local, &access)?;
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("manager metadata missing")?;
+                let scope = access
+                    .conversation_id
+                    .as_deref()
+                    .context("manager scope missing")?;
+                let job = store
+                    .scheduler_job(scope, &manager.trigger)?
+                    .context("manager job missing")?;
+                if let Some(assignment) =
+                    crate::store::workspace::workspace_assignment_for_job_from(
+                        &store.connection,
+                        &access.network_id,
+                        &local,
+                        &job,
+                    )?
+                    && let Err(error) = Self::validate_assignment_roots(&assignment.resource_roots)
+                {
+                    if !job.tool_calls
+                        && !job.pending_check
+                        && job.runtime.as_ref().is_some_and(|runtime| {
+                            runtime.execution == crate::scheduling::TurnExecution::NotStarted
+                        })
+                    {
+                        return Err(crate::manager::ManagerError::not_started(error));
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            })
+            .await?;
         Ok(guard)
     }
 
@@ -276,14 +307,22 @@ impl Runtime {
                 .context("manager metadata missing")?;
             {
                 let arg0 = (active
-                        .access
-                        .conversation_id
-                        .as_deref()
-                        .context("manager scope missing")?).to_owned();
+                    .access
+                    .conversation_id
+                    .as_deref()
+                    .context("manager scope missing")?)
+                .to_owned();
                 let arg1 = (manager.trigger).to_owned();
                 let arg2 = (manager.attempt_id).to_owned();
                 let arg3 = manager.permission_version;
-                self.store.call("manager_control.fence_manager_permission_with_version", move |store| store.fence_manager_permission_with_version(&arg0, &arg1, &arg2, arg3)).await
+                self.store
+                    .call(
+                        "manager_control.fence_manager_permission_with_version",
+                        move |store| {
+                            store.fence_manager_permission_with_version(&arg0, &arg1, &arg2, arg3)
+                        },
+                    )
+                    .await
             }?;
             let _drained = active.admission.clone().write_owned().await;
         }
@@ -329,20 +368,28 @@ impl Runtime {
                 && active.access.manager.as_ref() == Some(manager),
             "management invocation scope mismatch"
         );
-        let access = access.clone(); let manager = manager.clone(); let identity = self.identity.clone(); let write_state = self.write_state.clone();
-        self.store.call("manager_control.tool_lease", move |store| {
-        ensure!(*write_state.borrow() == super::WriteState::Writable, "Node execution authority is unavailable");
-        Self::check_manager_permission(store, &identity.device_id()?, &access)?;
-        store.record_manager_tool_call(
-            access
-                .conversation_id
-                .as_deref()
-                .context("missing manager scope")?,
-            &manager.trigger,
-            &manager.attempt_id,
-        )?;
-        Ok(())
-        }).await?;
+        let access = access.clone();
+        let manager = manager.clone();
+        let identity = self.identity.clone();
+        let write_state = self.write_state.clone();
+        self.store
+            .call("manager_control.tool_lease", move |store| {
+                ensure!(
+                    *write_state.borrow() == super::WriteState::Writable,
+                    "Node execution authority is unavailable"
+                );
+                Self::check_manager_permission(store, &identity.device_id()?, &access)?;
+                store.record_manager_tool_call(
+                    access
+                        .conversation_id
+                        .as_deref()
+                        .context("missing manager scope")?,
+                    &manager.trigger,
+                    &manager.attempt_id,
+                )?;
+                Ok(())
+            })
+            .await?;
         Ok(Some(guard))
     }
 
@@ -382,16 +429,21 @@ impl Runtime {
         let network = &access.network_id;
         let local = self.identity.device_id()?;
         let remote = {
-            let scope = scope.to_owned(); let trigger = trigger.to_owned(); let network = network.clone(); let local = local.clone();
-            self.store.call("manager_control.cancel_route", move |store| {
-            let held = store
-                .scheduler_job(&scope, &trigger)?
-                .is_some_and(|job| !job.state.terminal());
-            let owner = store
-                .conversation(&network, &scope)?
-                .and_then(|conversation| conversation.owner);
-            Ok(owner.filter(|owner| !held && owner != &local))
-                    }).await?
+            let scope = scope.to_owned();
+            let trigger = trigger.to_owned();
+            let network = network.clone();
+            let local = local.clone();
+            self.store
+                .call("manager_control.cancel_route", move |store| {
+                    let held = store
+                        .scheduler_job(&scope, &trigger)?
+                        .is_some_and(|job| !job.state.terminal());
+                    let owner = store
+                        .conversation(&network, &scope)?
+                        .and_then(|conversation| conversation.owner);
+                    Ok(owner.filter(|owner| !held && owner != &local))
+                })
+                .await?
         };
         let Some(owner) = remote else {
             return self
@@ -429,7 +481,11 @@ impl Runtime {
             let arg1 = (network).to_owned();
             let arg2 = (scope).to_owned();
             let arg3 = (trigger).to_owned();
-            self.store.call("manager_control.request_manager_cancel", move |store| store.request_manager_cancel(&arg0, &arg1, &arg2, &arg3)).await
+            self.store
+                .call("manager_control.request_manager_cancel", move |store| {
+                    store.request_manager_cancel(&arg0, &arg1, &arg2, &arg3)
+                })
+                .await
         }?
         else {
             return Ok(None);
@@ -446,7 +502,12 @@ impl Runtime {
     }
 
     pub(super) async fn reconcile_checks(self: &Arc<Self>, network: &str) -> Result<()> {
-        let checks = self.store.call("manager_control.pending_checks", move |store| store.pending_checks()).await?;
+        let checks = self
+            .store
+            .call("manager_control.pending_checks", move |store| {
+                store.pending_checks()
+            })
+            .await?;
         for check in checks {
             let Some((outcome, text)) = self.read_back_reply(&check).await else {
                 continue;
@@ -455,9 +516,13 @@ impl Runtime {
             if {
                 let arg0 = (check.conversation_id).to_owned();
                 let arg1 = (check.trigger).to_owned();
-                self.store.call("manager_control.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+                self.store
+                    .call("manager_control.scheduler_job", move |store| {
+                        store.scheduler_job(&arg0, &arg1)
+                    })
+                    .await
             }?
-                .is_some_and(|job| job.runtime.is_some())
+            .is_some_and(|job| job.runtime.is_some())
             {
                 {
                     let arg0 = (check.conversation_id).to_owned();
@@ -465,7 +530,11 @@ impl Runtime {
                     let arg2 = (check.attempt_id).to_owned();
                     let arg3 = vibeface_bridge::failure::ProviderStage::ReadBack;
                     let arg4 = crate::scheduling::TurnExecution::Started;
-                    self.store.call("manager_control.update_turn_runtime", move |store| store.update_turn_runtime(&arg0, &arg1, &arg2, arg3, arg4)).await
+                    self.store
+                        .call("manager_control.update_turn_runtime", move |store| {
+                            store.update_turn_runtime(&arg0, &arg1, &arg2, arg3, arg4)
+                        })
+                        .await
                 }?;
             }
             {
@@ -476,11 +545,19 @@ impl Runtime {
                 let arg4 = (check.attempt_id).to_owned();
                 let arg5 = outcome;
                 let arg6 = (text).to_owned();
-                self.store.call("manager_control.finish_job", move |store| store.finish_job(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, &arg6, now_ms())).await
+                self.store
+                    .call("manager_control.finish_job", move |store| {
+                        store.finish_job(&arg0, &arg1, &arg2, &arg3, &arg4, arg5, &arg6, now_ms())
+                    })
+                    .await
             }?;
             {
                 let arg0 = (check.attempt_id).to_owned();
-                self.store.call("manager_control.resolve_pending_check", move |store| store.resolve_pending_check(&arg0)).await
+                self.store
+                    .call("manager_control.resolve_pending_check", move |store| {
+                        store.resolve_pending_check(&arg0)
+                    })
+                    .await
             }?;
             self.codex.release_manager(&check.attempt_id);
             if let Some(turn) = &check.codex_turn
@@ -503,9 +580,13 @@ impl Runtime {
         let job = {
             let arg0 = (check.conversation_id).to_owned();
             let arg1 = (check.trigger).to_owned();
-            self.store.call("manager_control.scheduler_job", move |store| store.scheduler_job(&arg0, &arg1)).await
+            self.store
+                .call("manager_control.scheduler_job", move |store| {
+                    store.scheduler_job(&arg0, &arg1)
+                })
+                .await
         }
-            .ok()??;
+        .ok()??;
         let runtime = job.runtime.as_ref()?;
         let probe = match runtime.provider {
             crate::providers::Provider::Codex if turn.server == self.codex.server() => self
@@ -624,7 +705,11 @@ impl Runtime {
             let arg0 = (self.identity).to_owned();
             let arg1 = (network).to_owned();
             let arg2 = (check).to_owned();
-            self.store.call("manager_control.confirm_manager_stopped", move |store| store.confirm_manager_stopped(&arg0, &arg1, &arg2, now_ms())).await
+            self.store
+                .call("manager_control.confirm_manager_stopped", move |store| {
+                    store.confirm_manager_stopped(&arg0, &arg1, &arg2, now_ms())
+                })
+                .await
         }?;
         self.codex.release_manager(&check.attempt_id);
         if let Some(turn) = &check.codex_turn
@@ -656,7 +741,12 @@ impl Runtime {
         if let Some(work_id) = check_id.strip_prefix("work:") {
             return self.settle_work_check(network, scope, work_id, input).await;
         }
-        let check = self.store.call("manager_control.pending_checks", move |store| store.pending_checks()).await?
+        let check = self
+            .store
+            .call("manager_control.pending_checks", move |store| {
+                store.pending_checks()
+            })
+            .await?
             .into_iter()
             .find(|check| check.check_id == check_id && check.conversation_id == scope)
             .context("pending check not found")?;
@@ -672,30 +762,37 @@ impl Runtime {
         work_id: &str,
     ) -> Result<bool> {
         let kind = {
-            let network = network.to_owned(); let conversation = conversation.to_owned(); let work_id = work_id.to_owned(); let identity = self.identity.clone();
-            self.store.call("manager_control.work_vouches", move |store| {
-            if store.pending_checks()?.iter().any(|check| {
-                check.conversation_id == conversation
-                    && check.trigger == crate::scheduling::task_trigger(&work_id)
-            }) {
-                return Ok(None);
-            }
-            let Some(run) = store.work_record_in_scope(
-                &network,
-                &conversation,
-                &work_id,
-                &identity.device_id()?,
-            )?
-            else {
-                return Ok(None);
-            };
-            if matches!(run.state, WorkState::Unverified { .. }) {
-                return Ok(None);
-            }
-            Ok(Some(run.kind))
-                    }).await?
+            let network = network.to_owned();
+            let conversation = conversation.to_owned();
+            let work_id = work_id.to_owned();
+            let identity = self.identity.clone();
+            self.store
+                .call("manager_control.work_vouches", move |store| {
+                    if store.pending_checks()?.iter().any(|check| {
+                        check.conversation_id == conversation
+                            && check.trigger == crate::scheduling::task_trigger(&work_id)
+                    }) {
+                        return Ok(None);
+                    }
+                    let Some(run) = store.work_record_in_scope(
+                        &network,
+                        &conversation,
+                        &work_id,
+                        &identity.device_id()?,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if matches!(run.state, WorkState::Unverified { .. }) {
+                        return Ok(None);
+                    }
+                    Ok(Some(run.kind))
+                })
+                .await?
         };
-        let Some(kind) = kind else { return Ok(false); };
+        let Some(kind) = kind else {
+            return Ok(false);
+        };
         Ok(match kind {
             WorkKind::Agent(provider) if provider.on_app_server() => {
                 self.codex.capability().await["connected"] == true
@@ -743,11 +840,15 @@ impl Runtime {
         let work = {
             let arg0 = (network).to_owned();
             let arg1 = (scope).to_owned();
-            self.store.call("manager_control.works", move |store| store.works(&arg0, &arg1)).await
+            self.store
+                .call("manager_control.works", move |store| {
+                    store.works(&arg0, &arg1)
+                })
+                .await
         }?
-            .into_iter()
-            .find(|work| work.work_id == work_id)
-            .context("work not found in this conversation")?;
+        .into_iter()
+        .find(|work| work.work_id == work_id)
+        .context("work not found in this conversation")?;
         match work.outcome {
             Some(WorkOutcome::Unverified) => {}
             Some(_) => bail!("这个结果已经不需要你确认了"),
@@ -758,7 +859,12 @@ impl Runtime {
         }
         let unvouched = work.outcome.is_none();
         // An agent task's coordination process has its own check here; the work card answers both.
-        let manager = self.store.call("manager_control.pending_checks", move |store| store.pending_checks()).await?
+        let manager = self
+            .store
+            .call("manager_control.pending_checks", move |store| {
+                store.pending_checks()
+            })
+            .await?
             .into_iter()
             .find(|check| check.trigger == crate::scheduling::task_trigger(work_id));
         let receipt = {
@@ -770,7 +876,21 @@ impl Runtime {
             let arg5 = (note).to_owned();
             let arg6 = super::attestation(input)?;
             let arg7 = unvouched;
-            self.store.call("manager_control.settle_work", move |store| store.settle_work(&arg0, &arg1, &arg2, &arg3, arg4, &arg5, arg6, arg7, now_ms())).await
+            self.store
+                .call("manager_control.settle_work", move |store| {
+                    store.settle_work(
+                        &arg0,
+                        &arg1,
+                        &arg2,
+                        &arg3,
+                        arg4,
+                        &arg5,
+                        arg6,
+                        arg7,
+                        now_ms(),
+                    )
+                })
+                .await
         }?;
         if let Some(check) = manager {
             self.close_check(network, &check).await?;
@@ -797,34 +917,49 @@ pub(super) mod tests {
         super::super::triage::tests::bot(node, admin, "c", "fixture", &[]).await?;
         let (trigger, attempt) =
             super::super::triage::tests::start_reply(node, admin, "confirm-stop").await?;
-        let network = node.store.call("manager_control.network", move |store| store.network()).await?.context("network")?;
-        let identity = node.identity.clone(); let server = server.to_owned(); let thread = thread.to_owned();
-        node.store.call("manager_control.pending_fixture", move |store| {
-            let server = server.as_str(); let thread = thread.as_str();
-        store.record_manager_turn(&attempt, server, thread, Some("turn"), &Default::default())?;
-        store.finish_job(
-            &identity,
-            &network,
-            "c",
-            &trigger,
-            &attempt,
-            crate::scheduling::JobOutcome::Interrupted {
-                failure: vibeface_bridge::failure::ExecFailure::new(
-                    vibeface_bridge::failure::FailureKind::Lost,
-                    "fixture lost its turn",
-                ),
-                process_unconfirmed: true,
-            },
-            "",
-            now_ms(),
-        )?;
-        let check = store
-            .pending_checks()?
-            .into_iter()
-            .find(|check| check.attempt_id == attempt)
-            .context("fixture pending check")?;
-        Ok((test_access(network, true, Some("c".into())), check))
-            }).await
+        let network = node
+            .store
+            .call("manager_control.network", move |store| store.network())
+            .await?
+            .context("network")?;
+        let identity = node.identity.clone();
+        let server = server.to_owned();
+        let thread = thread.to_owned();
+        node.store
+            .call("manager_control.pending_fixture", move |store| {
+                let server = server.as_str();
+                let thread = thread.as_str();
+                store.record_manager_turn(
+                    &attempt,
+                    server,
+                    thread,
+                    Some("turn"),
+                    &Default::default(),
+                )?;
+                store.finish_job(
+                    &identity,
+                    &network,
+                    "c",
+                    &trigger,
+                    &attempt,
+                    crate::scheduling::JobOutcome::Interrupted {
+                        failure: vibeface_bridge::failure::ExecFailure::new(
+                            vibeface_bridge::failure::FailureKind::Lost,
+                            "fixture lost its turn",
+                        ),
+                        process_unconfirmed: true,
+                    },
+                    "",
+                    now_ms(),
+                )?;
+                let check = store
+                    .pending_checks()?
+                    .into_iter()
+                    .find(|check| check.attempt_id == attempt)
+                    .context("fixture pending check")?;
+                Ok((test_access(network, true, Some("c".into())), check))
+            })
+            .await
     }
 
     #[tokio::test]

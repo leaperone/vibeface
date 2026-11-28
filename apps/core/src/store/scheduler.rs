@@ -4079,7 +4079,11 @@ impl Store {
     }
 
     /// Scoped overview rows in the same global sequence order as `scheduler_jobs_all`.
-    pub fn scheduler_jobs_for_scopes(&self, scopes: &[String], include_finished: bool) -> Result<Vec<SchedulerJob>> {
+    pub fn scheduler_jobs_for_scopes(
+        &self,
+        scopes: &[String],
+        include_finished: bool,
+    ) -> Result<Vec<SchedulerJob>> {
         let filter = if include_finished {
             "conversation_id IN (SELECT value FROM json_each(?))"
         } else {
@@ -4087,7 +4091,12 @@ impl Store {
                 AND conversation_id IN (SELECT value FROM json_each(?))"
         };
         // The previous all-row scan retained insertion order for equal sequences.
-        query_jobs_ordered(&self.connection, filter, [serde_json::to_string(scopes)?], "sequence,rowid")
+        query_jobs_ordered(
+            &self.connection,
+            filter,
+            [serde_json::to_string(scopes)?],
+            "sequence,rowid",
+        )
     }
 
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
