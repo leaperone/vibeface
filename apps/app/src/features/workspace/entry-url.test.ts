@@ -210,12 +210,13 @@ test("workspace preserves bot and message requests while routing native decision
   const workspaceModule = load(resolve(clientRoot, "workspace/context.tsx"))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
+  let appForeground = true
   const platform = {
     secure: { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` },
     transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
     storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
-    onForeground: () => () => {}, foreground: () => true,
+    onForeground: () => () => {}, foreground: () => appForeground,
   }
   const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, avatar: null, avatar_version: null, event_hash: "bot-event", last_message: null, busy: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", resolved: { provider: "codex", model: null }, summary: "", outcome: null, result_text: "", failure_reason: null }
@@ -229,6 +230,9 @@ test("workspace preserves bot and message requests while routing native decision
     return { promise, resolve, reject }
   }
   let conversationHold: ReturnType<typeof deferred> | null = null, messageHold: ReturnType<typeof deferred> | null = null
+  const conversationGates = new Map<string, ReturnType<typeof deferred>>()
+  const ackGates = new Map<string, ReturnType<typeof deferred>>()
+  const conversationReads: string[] = []
   const acknowledgements: string[] = []
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
@@ -259,8 +263,22 @@ test("workspace preserves bot and message requests while routing native decision
         questionRows = questionRows.filter((row) => row.question_id !== body.question_id)
         return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
       }
-      if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
-      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
+      if (method === "ack") {
+        const id = String(body.notification_id)
+        acknowledgements.push(id)
+        const gate = ackGates.get(id)
+        if (gate) await gate.promise
+        unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id)
+        return {}
+      }
+      if (method === "conversation") {
+        const id = String(body.conversation_id)
+        conversationReads.push(id)
+        const gate = conversationGates.get(id)
+        if (gate) return gate.promise
+        if (conversationHold) return conversationHold.promise
+        return { ...context, conversation: { ...context.conversation, conversation_id: id }, scheduler, messages: conversationMessages?.[id] ?? transcript, works: [work] }
+      }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
@@ -448,6 +466,130 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().pendingBot, null)
     assert.equal(render().selectedBot?.name, "corrected project")
     assert.equal(messages.length, 2)
+
+    await t.test("slow reads, retries and unread acknowledgements follow the current visible chat", async () => {
+      const botA = { ...bot, name: "Bot A" }
+      const botB = { ...bot, bot_id: "bot-b", conversation_id: "chat-b", name: "Bot B" }
+      knownBots = [botA, botB]
+      conversationMessages = {
+        chat: [{ message_id: "a1", event_hash: "ea", role: "assistant", text: "A 历史", created_at_ms: 1 }],
+        "chat-b": [{ message_id: "b1", event_hash: "eb", role: "assistant", text: "B 历史", created_at_ms: 1 }],
+      }
+      const payload = (id: string) => ({ ...context, conversation: { ...context.conversation, conversation_id: id }, scheduler: null, messages: conversationMessages?.[id] ?? [] })
+      const operations: Promise<unknown>[] = []
+      const track = <T,>(operation: Promise<T>) => { operations.push(operation); void operation.catch(() => {}); return operation }
+      try {
+        render().setView("other")
+        await render().selectBot(botA)
+        for (const outcome of ["success", "failure"]) {
+          const staleA = deferred(), currentB = deferred()
+          conversationGates.set("chat", staleA)
+          const background = track(render().refresh())
+          await new Promise(setImmediate)
+          conversationGates.set("chat-b", currentB)
+          let opened = false
+          const opening = track(render().selectBot(botB).then(() => { opened = true }))
+          await new Promise(setImmediate)
+          assert.equal(render().data, null, "another Bot's transcript is never shown as B")
+          currentB.resolve(payload("chat-b")); conversationGates.delete("chat-b")
+          await new Promise(setImmediate)
+          assert.equal(opened, true, "B opens without waiting for an unrelated A refresh")
+          await opening
+          assert.equal(render().data?.messages[0]?.text, "B 历史")
+          assert.equal(render().writable, true)
+          if (outcome === "success") staleA.resolve(payload("chat"))
+          else staleA.reject(new Error("old A read failed"))
+          conversationGates.delete("chat")
+          await background
+          assert.equal(render().conversationId, "chat-b")
+          assert.equal(render().data?.messages[0]?.text, "B 历史")
+          assert.equal(render().synced, true)
+          assert.equal(render().writable, true, "an obsolete refresh cannot invalidate B")
+          assert.equal(render().error, null)
+          await render().selectBot(botA)
+        }
+        await render().selectBot(botB)
+        const retryGate = deferred(), readsBefore = conversationReads.length
+        conversationGates.set("chat-b", retryGate)
+        const reopening = track(render().selectBot(botB))
+        await new Promise(setImmediate)
+        assert.equal(render().data?.messages[0]?.text, "B 历史", "a same-ID reread keeps loaded history")
+        retryGate.reject(new Error("current read unavailable")); conversationGates.delete("chat-b")
+        await assert.rejects(reopening, /current read unavailable/)
+        assert.equal(render().data?.messages[0]?.text, "B 历史")
+        assert.equal(render().writable, false)
+        await render().selectBot(botB)
+        assert.equal(conversationReads.length, readsBefore + 2, "retry rereads the same selected Bot")
+        assert.equal(render().writable, true)
+
+        unreadNotifications = [
+          { notification_id: "read-b1", kind: "manager_response", text: "B 未读一", conversation_id: "chat-b" },
+          { notification_id: "read-b2", kind: "manager_response", text: "B 未读二", conversation_id: "chat-b" },
+        ]
+        await render().refresh()
+        const ackBefore = acknowledgements.length, firstAck = deferred()
+        ackGates.set("read-b1", firstAck)
+        render().setView("chat")
+        const acknowledging = track(render().refresh())
+        await new Promise(setImmediate)
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"])
+        render().setView("other")
+        const switchingAway = track(render().selectBot(botA))
+        await new Promise(setImmediate)
+        firstAck.resolve({}); ackGates.clear()
+        await Promise.all([acknowledging, switchingAway])
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"], "switching away stops the remaining unread acknowledgements")
+        assert.equal(render().notifications.some((item) => item.notification_id === "read-b2"), true)
+        assert.equal(render().conversationId, "chat")
+        assert.equal(render().data?.messages[0]?.text, "A 历史")
+
+        appForeground = false
+        await render().selectBot(botB)
+        render().setView("chat")
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ["read-b1"], "background refresh never consumes unread")
+      } finally {
+        for (const [id, gate] of conversationGates) gate.resolve(payload(id))
+        conversationGates.clear()
+        for (const gate of ackGates.values()) gate.resolve({})
+        ackGates.clear()
+        await Promise.allSettled(operations)
+        appForeground = true
+        unreadNotifications = []
+        knownBots = [bot]
+        conversationMessages = null
+        render().setView("other")
+        await render().selectBot(bot)
+        render().setView("chat")
+      }
+    })
+
+    await t.test("a lightweight chat read cannot bypass the new entry's write-state read", async () => {
+      const previous = activeConnection, writeState = deferred()
+      const next: ReadyConnection = { ...connection, generation: previous.generation + 1, isCurrent: () => activeConnection === next,
+        request: async (method) => { assert.equal(method, "write_state"); return writeState.promise },
+      }
+      let opening: Promise<void> | undefined
+      try {
+        activeConnection = next; render()
+        await new Promise(setImmediate)
+        opening = render().selectBot(bot)
+        void opening.catch(() => {})
+        await new Promise(setImmediate)
+        assert.equal(render().writable, false)
+        writeState.resolve({ state: "read_only", conflicts: [] })
+        await opening
+        assert.equal(render().data?.conversation?.conversation_id, "chat")
+        assert.equal(render().writeState.state, "read_only")
+        assert.equal(render().writable, false, "reading a chat never bypasses the entry's read-only state")
+      } finally {
+        writeState.resolve({ state: "read_only", conflicts: [] })
+        if (opening) await opening.catch(() => {})
+        activeConnection = previous; render()
+        await new Promise(setImmediate)
+        await render().refresh()
+      }
+    })
 
     await t.test("new connections wait for their own complete read and retain unknown writes without replay", async () => {
       knownBots = [bot]
