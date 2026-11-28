@@ -4,7 +4,7 @@ import * as DocumentPicker from 'expo-document-picker'
 import * as Notifications from 'expo-notifications'
 import * as SecureStore from 'expo-secure-store'
 import * as Sharing from 'expo-sharing'
-import { createMMKV } from 'react-native-mmkv'
+import { storage, store } from './storage'
 import { lan as nativeLan, secure, type NativeIdentity } from '@vibeface/secure-native'
 import { mobileOutbox } from './outbox'
 import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
@@ -18,8 +18,6 @@ import { privateFiles } from './files'
 import { notificationOpenings } from './notification-opens'
 import { nativeDeliveryReservations } from './delivery-reservations'
 
-const store = createMMKV({ id: 'vibeface' })
-const notificationStorage = { getItem: (key: string) => store.getString(key) ?? null, setItem: (key: string, value: string) => store.set(key, value) }
 const secretKey = 'vibeface.device-secret'
 const createdKey = 'vibeface.device-created'
 const outbox = mobileOutbox(store, secure, privateFiles)
@@ -64,7 +62,7 @@ const channelId = 'vibeface'
 const silentChannelId = 'vibeface-silent'
 void Notifications.setNotificationChannelAsync(channelId, { name: '回答与进展', importance: Notifications.AndroidImportance.HIGH, sound: 'default' }).catch(() => {})
 void Notifications.setNotificationChannelAsync(silentChannelId, { name: '回答与进展（静音）', importance: Notifications.AndroidImportance.HIGH, sound: null, enableVibrate: false }).catch(() => {})
-const openings = notificationOpenings({ getItem: key => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) })
+const openings = notificationOpenings(storage)
 const receiveOpening = (response: Notifications.NotificationResponse) => {
   const { request } = response.notification
   openings.receive(`${request.identifier}:${response.notification.date}:${response.actionIdentifier}`, request.content.data?.destination)
@@ -87,7 +85,7 @@ const notifier: Notifier = {
   },
   replayOpen() { void openings.flush() },
   async show({ title, body, tag, destination }) {
-    const settings = notificationPreferences(notificationStorage, destination.network_id).read()
+    const settings = notificationPreferences(storage, destination.network_id).read()
     await privateFiles.run(async (current) => {
       if (!current()) throw new Error('应用内数据正在清除。')
       if (AppState.currentState !== 'background') return
@@ -118,7 +116,7 @@ export const mobilePlatform: Platform = {
   explicitMessageRead: true,
   secure,
   transport,
-  storage: { getItem: (key) => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) },
+  storage,
   reserveDeliveryIntent: nativeDeliveryReservations,
   outbox,
   notifier,

@@ -7073,7 +7073,7 @@ test('native system notification events keep typed destinations and clear naviga
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
     './notification-opens': { notificationOpenings }, './outbox': { mobileOutbox },
-  })
+  }, {}, '', { './storage': '../../../../../apps/mobile/src/platform/storage.ts' })
   const { mobilePlatform } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts')
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
   const opened: NotificationDestination[] = []
