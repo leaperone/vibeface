@@ -10,7 +10,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 
 import { PLATFORMS, programNames, parseReleaseVersion, npmDistTag, validateBuildInfoShape } from './release-contract.mjs';
 import { readContracts, readOwnVersion, readNpmTemplate, readRuntimeDefinitions } from './release-metadata.mjs';
-import { readSealedRuntime } from './sealed-runtime.mjs';
+import { hash, readSealedRuntime } from './sealed-runtime.mjs';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = Object.keys(PLATFORMS);
@@ -23,7 +23,6 @@ const requiredFiles = target => {
 const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
-const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 function verifyTarMetadata(compressed) {
   const bytes = gunzipSync(compressed, { maxOutputLength: 512 * 1024 * 1024 });
   const text = (header, start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '').trim();

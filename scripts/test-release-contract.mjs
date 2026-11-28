@@ -295,7 +295,7 @@ function cliFixtures(root) {
   const altered = path.join(root, 'altered'); fs.mkdirSync(altered); execFileSync('tar', ['-xzf', archive, '-C', altered], { env });
   const native = path.join(altered, 'package/vendor/x86_64-unknown-linux-gnu');
   write(native, 'web/vibeface_secure_bg.wasm', 'not-wasm'); seal(native);
-  execFileSync('tar', ['--owner=0', '--group=0', '--numeric-owner', '-czf', archive, '-C', altered, 'package'], { env });
+  execFileSync('tar', ['--format=ustar', '--owner=0', '--group=0', '--numeric-owner', '-czf', archive, '-C', altered, 'package'], { env });
   json(root, path.relative(root, `${archive}.json`), { version, source_commit: commit, filename: path.basename(archive), size: fs.statSync(archive).size,
     sha256: digest(archive), integrity: `sha512-${createHash('sha512').update(fs.readFileSync(archive)).digest('base64')}` });
   assert.match(cli('package-npm', ['--verify', archive, '--output', output, '--source-commit', commit], 1).stderr, /invalid WebAssembly/);
