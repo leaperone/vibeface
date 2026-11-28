@@ -1860,14 +1860,13 @@ fn compile_dynamic_with_limit(
                         .is_some_and(|context| context["task"]["reply_only"] == true)
                     {
                         offered.retain(|name, _| {
-                            crate::tools::Tool::parse(name)
+                            Tool::parse(name)
                                 .is_some_and(|tool| tool.effect() == crate::tools::Effect::Read)
                         });
                     }
                     if crate::scheduling::health_turn(&job.trigger) {
                         offered.retain(|name, _| {
-                            crate::tools::Tool::parse(name)
-                                .is_some_and(crate::runtime::health_turn_tool)
+                            Tool::parse(name).is_some_and(crate::runtime::health_turn_tool)
                         });
                     }
                     tools(TriggerKind::Human)
@@ -1945,24 +1944,9 @@ fn compile_dynamic_with_limit(
     Ok((dynamic, shown))
 }
 
-/// The tools a turn of this kind is offered; see `Effect::offered`.
+/// The complete tool catalog offered to this kind of turn.
 pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
-    Tool::ALL
-        .into_iter()
-        .filter(|tool| tool.effect().offered(kind))
-        .filter_map(|tool| {
-            let (description, _, _) = tool.schema()?;
-            let input_schema = tool.input_schema()?;
-            Some((
-                tool.name().into(),
-                CustomToolConfig {
-                    description: Some(description.into()),
-                    input_schema,
-                    output_schema: None,
-                },
-            ))
-        })
-        .collect()
+    crate::tools::configs_for(kind, |_| true)
 }
 
 #[cfg(test)]

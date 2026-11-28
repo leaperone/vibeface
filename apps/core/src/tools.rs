@@ -10,6 +10,8 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use vibeface_bridge::agent::CustomToolConfig;
 
 /// Version of the Effect/offered rules, independent of per-attempt token fences.
 pub const PERMISSION_POLICY_VERSION: u64 = 1;
@@ -49,6 +51,29 @@ macro_rules! tools {
 }
 
 vibeface_control::coordination_tools!(tools);
+
+/// The tools a turn of this kind is offered; see `Effect::offered`.
+pub(crate) fn configs_for(
+    kind: TriggerKind,
+    include: impl Fn(Tool) -> bool,
+) -> BTreeMap<String, CustomToolConfig> {
+    Tool::ALL
+        .into_iter()
+        .filter(|tool| tool.effect().offered(kind) && include(*tool))
+        .filter_map(|tool| {
+            let (description, _, _) = tool.schema()?;
+            let input_schema = tool.input_schema()?;
+            Some((
+                tool.name().into(),
+                CustomToolConfig {
+                    description: Some(description.into()),
+                    input_schema,
+                    output_schema: None,
+                },
+            ))
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

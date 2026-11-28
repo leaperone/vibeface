@@ -850,15 +850,11 @@ impl Provider {
     /// The discovery entry points and essential reads. The router checks each discovered
     /// target against the current turn, including when a thread keeps this initial catalog.
     pub fn tools_for(self, kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
-        crate::scheduler::tools(match self.prompt_mode() {
+        let kind = match self.prompt_mode() {
             PromptMode::Thread => TriggerKind::Human,
             PromptMode::Turn => kind,
-        })
-        .into_iter()
-        .filter(|(name, _)| {
-            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
-        })
-        .collect()
+        };
+        crate::tools::configs_for(kind, crate::tools::Tool::initially_exposed)
     }
 
     /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
