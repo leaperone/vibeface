@@ -334,7 +334,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       >
         <InlineError error={sendError} className="basis-full" />
         {inputTarget.kind === 'routine' ? <Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main')}>改回主聊天</Button> : null}
-        {needsSetup && !starting && !botBusy && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && !starting && !activeJobs.some((job) => ['steering', 'claimed', 'running'].includes(job.state)) && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )

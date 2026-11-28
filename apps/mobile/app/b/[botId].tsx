@@ -358,8 +358,9 @@ export default function ChatScreen() {
       setSendingScope((current) => current === scope ? null : current)
     })
   }
-  // A bot replying right now has a device running it, whatever this phone's device list says.
-  const setupHint = !offline && !chat?.replying && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
+  // A turn already executing has a device running it, whatever this phone's device list says; a queued one does not.
+  const executing = jobs?.some((job) => ['steering', 'claimed', 'running'].includes(job.state))
+  const setupHint = !offline && !executing && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
