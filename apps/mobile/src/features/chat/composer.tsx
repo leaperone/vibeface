@@ -31,9 +31,11 @@ type Props<Selected extends Attachment> = {
   target?: ReactNode
   sendLabel?: string
   label?: string
+  /** Says why the bot may not reply yet, without blocking the draft. */
+  placeholder?: string
 }
 
-export function Composer<Selected extends Attachment>({ value, onChange, files, onFiles, onPickFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息' }: Props<Selected>) {
+export function Composer<Selected extends Attachment>({ value, onChange, files, onFiles, onPickFiles, attachmentScope, blocked, sending, onSend, onStop, children, target, sendLabel = '发送', label = '给 Bot 发消息', placeholder = '发消息' }: Props<Selected>) {
   const device = useDevice()
   const connectionGeneration = device.connectionGeneration()
   const ios = Platform.OS === 'ios'
@@ -129,7 +131,7 @@ export function Composer<Selected extends Attachment>({ value, onChange, files, 
       <Icon as={sending ? LoaderCircle : ArrowUp} />
     </Button>
   </View>
-  const input = <ComposerInput maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? '发消息'} multiline maxLength={100000}
+  const input = <ComposerInput maxFontSizeMultiplier={2} accessibilityLabel={label} placeholder={blocked ?? placeholder} multiline maxLength={100000}
     value={value} onChangeText={onChange} />
   const attachments = files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-2 pt-2">
     {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-60 flex-row items-center gap-2 rounded-control bg-surface-muted ps-3">

@@ -2,18 +2,18 @@ import { historySections } from '@vibeface/client/workspace/model.ts'
 import { HistoryControls } from '@/features/chat/history-controls'
 import { Link, Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { ArrowDown, Bot, ChevronRight, Crown, ListChecks, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
+import { ArrowDown, Bot, Crown, ListChecks, LoaderCircle, MessageSquareOff, Search, Settings, Star } from 'lucide-react-native'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
-import { FlatList, Modal, Platform, ScrollView, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
+import { FlatList, Platform, ScrollView, Pressable, StyleSheet, View, type NativeScrollEvent } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useCSSVariable, withUniwind } from 'uniwind'
-import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntents, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
 import { messageTimes } from '@vibeface/client/chat/timeline.ts'
-import { botRecap, recapGroups, recapPreview, routineState } from '@vibeface/client/chat/companion-recap.ts'
+import { routineState } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples, useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { canRememberMessage } from '@vibeface/client/workspace/memory.ts'
@@ -22,20 +22,17 @@ import { messageOf } from '@vibeface/client/lib/node.ts'
 import { ErrorText } from '@/components/action'
 import { botCopy, scheduleName } from '@vibeface/client/workspace/bot-settings.ts'
 import { unreachable } from '@vibeface/client/workspace/home.ts'
-import { questionOpen, questionParts } from '@vibeface/client/workspace/questions.ts'
-import { chatStatusLine } from '@vibeface/client/workspace/labels.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { OfflineBar } from '@/components/connection-pill'
-import { Details, EmptyState } from '@/components/kit'
-import { PopoverPanel } from '@/components/arc/popover'
+import { EmptyState } from '@/components/kit'
 import { privateFiles } from '@/platform/files'
 import { Button } from '@/components/arc/button'
 import { Icon } from '@/components/arc/icon'
 import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
-import { useInbox, useLive, useOpenNotificationConversation } from '@/data/live'
+import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
-import type { InputIntent, InputTarget, ManagerJob, Question } from '@vibeface/client/workspace/types.ts'
+import type { InputTarget, ManagerJob, Question } from '@vibeface/client/workspace/types.ts'
 import type { ReadAttachment } from '@/features/chat/attachments'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
@@ -46,7 +43,7 @@ import { chatMessageLocation, visibleChatMessageIds, type VisibleChatMessage } f
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatSummary, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
-import { touchRow, useWide } from '@/lib/layout'
+import { useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
 import { mobilePlatform } from '@/platform'
 
@@ -115,10 +112,9 @@ function Separator({ leadingItem }: { leadingItem: Entry }) {
 }
 
 /** The composer reads the draft itself, so typing re-renders it and not the chat above it. */
-function DraftComposer({ draft, selectedIntent, targetBusy, onChooseIntent, children, ...props }: { draft: ChatDraftOwner; selectedIntent: InputIntent | null; targetBusy: boolean; onChooseIntent: () => void } & Omit<ComponentProps<typeof Composer<Attachment>>, 'value' | 'onChange' | 'files' | 'onFiles' | 'onPickFiles' | 'sendLabel' | 'target'>) {
+function DraftComposer({ draft, targetBusy, children, ...props }: { draft: ChatDraftOwner; targetBusy: boolean } & Omit<ComponentProps<typeof Composer<Attachment>>, 'value' | 'onChange' | 'files' | 'onFiles' | 'onPickFiles' | 'sendLabel'>) {
   const { text, files, error, snapshot } = useDraftView(draft)
-  const label = inputIntentLabel(selectedIntent ?? promptIntent(text), targetBusy)
-  return <Composer {...props} sendLabel={label} target={<Button variant="ghost" size="sm" accessibilityLabel={`输入方式：${label}`} onPress={onChooseIntent}><Text className="text-sm">{label}</Text></Button>} value={text} onChange={draft.changeText} files={files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles}>
+  return <Composer {...props} sendLabel={inputIntentLabel(promptIntent(text), targetBusy)} value={text} onChange={draft.changeText} files={files} onFiles={draft.changeFiles} onPickFiles={draft.addFiles}>
     {error || snapshot.missingFiles.length ? <Text accessibilityRole="alert" className="text-sm text-danger">{error || `附件 ${snapshot.missingFiles.join('、')} 已不可用，请重新选择。`}</Text> : null}
     {children}
   </Composer>
@@ -146,8 +142,6 @@ function FirstCooperation({ draft, project, canRun, onSkip }: { draft: ChatDraft
 
 export default function ChatScreen() {
   const router = useRouter()
-  const inbox = useInbox()
-  const openRecap = useOpenNotificationConversation()
   const { botId, routine, message: targetMessage, notification } = useLocalSearchParams<{ botId: string; routine?: string; message?: string; notification?: string }>()
   const workspace = useWorkspace()
   const device = useDevice()
@@ -171,11 +165,6 @@ export default function ChatScreen() {
   const liveGeneration = live?.generation
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
-  const [intentMenu, setIntentMenu] = useState<{ key: string; version: number } | null>(null)
-  const intentMenuVersion = useRef(0)
-  const intentMenuOwner = useRef(intentMenu)
-  intentMenuOwner.current = intentMenu
-  const [selectedIntent, setSelectedIntent] = useState<InputIntent | null>(null)
   const [selectedMainTarget, setSelectedTarget] = useState('main')
   const selectedTarget = routine ? `routine:${routine}` : selectedMainTarget
   const draftScope = { networkId: workspace.networkId ?? '', deviceId: workspace.deviceId ?? '', conversationId: id ?? '', inputTarget: selectedTarget }
@@ -186,11 +175,11 @@ export default function ChatScreen() {
   const savingDrafts = useRef(new Set<string>())
   const currentScope = useRef(draftScopeKey)
   currentScope.current = draftScopeKey
-  useEffect(() => { setSelectedTarget('main'); setSelectedIntent(null); setIntentMenu(null) }, [id])
-  useEffect(() => { if (routine) setSelectedTarget('main'); setSelectedIntent(null); setIntentMenu(null) }, [routine])
+  useEffect(() => { setSelectedTarget('main') }, [id])
+  useEffect(() => { if (routine) setSelectedTarget('main') }, [routine])
   const [routeFocused, setRouteFocused] = useState(false)
   const routeActive = useRef(false)
-  useFocusEffect(useCallback(() => { routeActive.current = true; setRouteFocused(true); const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; setRouteFocused(false); intentMenuOwner.current = null; setIntentMenu(null); close?.() } }, [id, live?.generation]))
+  useFocusEffect(useCallback(() => { routeActive.current = true; setRouteFocused(true); const close = id ? latestWorkspace.current.actions.open(id) : undefined; return () => { routeActive.current = false; setRouteFocused(false); close?.() } }, [id, live?.generation]))
   const extras = useChatSummary(id ?? '')
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
@@ -316,13 +305,10 @@ export default function ChatScreen() {
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const routineTrigger = selectedTarget.startsWith('routine:') ? selectedTarget.slice(8) : null
-  const selectedWork = selectedTarget.startsWith('work:') ? live?.data?.works.find((work) => work.work_id === selectedTarget.slice(5)) : undefined
-  const currentJob = live?.data?.scheduler?.jobs.find((job) => ['running', 'claimed', 'steering'].includes(job.state))
-  const currentInput = chat?.messages.find((message) => message.message_id === currentJob?.message_id)
-  const targetOption: { label: string; target: InputTarget } = selectedTarget.startsWith('work:') ? { label: selectedWork?.title || '原工作', target: { kind: 'work', work_id: selectedTarget.slice(5) } } : routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: currentInput?.text.slice(0, 48) || `${bot.name} · 主聊天`, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
+  // Supplementing a work happens on its own page; this composer sends to the main chat, or to the routine it was opened for.
+  const targetOption: { label: string; target: InputTarget } = routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: bot.name, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
-  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : inputTarget.kind === 'work' ? Boolean(selectedWork && ['accepted', 'starting', 'running'].includes(selectedWork.state)) : Boolean(chat?.replying)
-  const intentMenuKey = JSON.stringify([draftScopeKey, liveGeneration])
+  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : Boolean(chat?.replying)
   const changeTarget = async (inputTarget: string) => {
     const scope = draftScopeKey
     const current = () => routeActive.current && currentScope.current === scope && latestLive.current?.generation === liveGeneration
@@ -346,16 +332,10 @@ export default function ChatScreen() {
       } finally { lease.release() }
     }
     if (current()) {
-      setSelectedTarget(inputTarget); setSelectedIntent(null)
+      setSelectedTarget(inputTarget)
       if (routine && inputTarget !== selectedTarget) router.setParams({ routine: undefined, notification: undefined, message: undefined })
     }
   }
-  const intentOptions = [
-    ...inputIntents.map((item) => ({ text: item.label, action: () => setSelectedIntent(item.intent) })),
-    ...(live?.data?.works.filter((work) => ['accepted', 'starting', 'running'].includes(work.state)) ?? []).map((work) => ({ text: `补充：${work.title || '工作'}`, action: () => { void changeTarget(`work:${work.work_id}`).catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) } })),
-    ...(selectedTarget !== 'main' ? [{ text: '回到主聊天', action: () => { void changeTarget('main').catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) } }] : []),
-  ]
-  const chooseIntent = () => setIntentMenu({ key: intentMenuKey, version: ++intentMenuVersion.current })
   const send = () => {
     const scope = draftScopeKey
     if (savingDrafts.current.has(scope)) return
@@ -367,9 +347,8 @@ export default function ChatScreen() {
       const snapshot = await draft.flush()
       const lease = chatDrafts.lease(snapshot)
       try {
-        await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: selectedIntent ?? promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
+        await workspace.actions.send(id, snapshot.text.trim(), lease.files, { target: targetOption.target, intent: promptIntent(snapshot.text), conversation_id: id, onSaved: (input) => {
           void draft.clear(snapshot).then((cleared) => {
-            if (cleared && currentScope.current === scope) setSelectedIntent(null)
             if (cleared && routeActive.current && currentScope.current === scope && live?.isCurrent() && latestLive.current?.conversationId === id && (input.target.kind === 'task' || input.target.kind === 'channel_task')) router.push(`/task/${input.target.task_id}`)
           }).catch((cause) => { if (currentScope.current === scope) setSendError(messageOf(cause)) })
         } })
@@ -379,13 +358,11 @@ export default function ChatScreen() {
       setSendingScope((current) => current === scope ? null : current)
     })
   }
-  const setupHint = !offline && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
+  // A turn already executing has a device running it, whatever this phone's device list says; a queued one does not.
+  const executing = jobs?.some((job) => ['steering', 'claimed', 'running'].includes(job.state))
+  const setupHint = !offline && !executing && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
-  const statusLine = routine ? '' : chatStatusLine(extras)
-  const nextQuestion = routine ? undefined : [...chat?.before.values() ?? [], chat?.rest ?? []].flat().find((question) => questionOpen(question) && live?.answered[question.question_id] === undefined)
-  const recap = botRecap({ bot, data: live?.data ?? null, inbox, notifications: live?.notifications ?? [], ignoredNotifications: live?.ignoredNotifications ?? new Set(), workspaceState: live?.workspaceState ?? null, openWorks: live?.openWorks ?? (chat?.works ?? []).map(work => ({ ...work, conversation_id: id })), fresh: live?.fresh ?? new Set(), connected: !offline && live?.dataOrigin === 'network' })
-  const recapView = recapPreview(recap)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const title = <Link href={`/b/${bot.bot_id}/about`} asChild>
     <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')}
@@ -397,18 +374,6 @@ export default function ChatScreen() {
   </Link>
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
-    {intentMenu?.key === intentMenuKey ? <Modal transparent visible animationType="fade" onRequestClose={() => { intentMenuOwner.current = null; setIntentMenu(null) }}>
-      <View className="flex-1 justify-end bg-background/90 p-4" style={{ paddingBottom: insets.bottom + 16 }}>
-        <PopoverPanel accessibilityViewIsModal className="max-h-[75%] w-full max-w-3xl self-center gap-2">
-          <Text role="heading" numberOfLines={2} className="px-2 py-2 font-medium">{targetOption.label}</Text>
-          <ScrollView>{intentOptions.map((option) => <Button key={option.text} variant="ghost" className="justify-start" onPress={() => {
-            if (!routeActive.current || currentScope.current !== draftScopeKey || latestLive.current?.generation !== liveGeneration || intentMenuOwner.current !== intentMenu) return
-            intentMenuOwner.current = null; setIntentMenu(null); option.action()
-          }}><Text className="min-w-0 shrink">{option.text}</Text></Button>)}</ScrollView>
-          <Button variant="secondary" onPress={() => { intentMenuOwner.current = null; setIntentMenu(null) }}><Text>取消</Text></Button>
-        </PopoverPanel>
-      </View>
-    </Modal> : null}
     <Stack.Screen options={{
       title: bot.name,
       headerRight: () => <View className="flex-row"><Link href={`/b/${bot.bot_id}/activity`} asChild><Button variant="ghost" iconOnly accessibilityLabel={extras.attention ? `动态，${extras.attention} 项要处理` : '动态'}><Icon as={ListChecks} className="size-5" />{extras.attention ? <View pointerEvents="none" className="absolute right-2 top-2 size-2 rounded-pill bg-warning" /> : null}</Button></Link><Link href={{ pathname: '/search', params: { bot: bot.bot_id } }} asChild><Button variant="ghost" iconOnly accessibilityLabel="搜索聊天记录"><Icon as={Search} className="size-5" /></Button></Link><Link href={`/b/${bot.bot_id}/about`} asChild><Button variant="ghost" iconOnly accessibilityLabel={`${bot.name} 设置`}><Icon as={Settings} className="size-5" /></Button></Link></View>,
@@ -487,36 +452,17 @@ export default function ChatScreen() {
           <Button variant="secondary" iconOnly className="rounded-pill bg-surface" accessibilityLabel="回到底部" onPress={toLatest}><Icon as={ArrowDown} /></Button>
         </View> : null}
         {location.kind !== 'found' ? <View role="status" className="w-full max-w-3xl gap-2 self-center px-4 py-2"><Text className="text-sm text-muted">{location.text}</Text>{location.kind === 'failed' ? <Button variant="secondary" onPress={location.retry}><Text>重新定位原记录</Text></Button> : null}</View> : null}
-        {nextQuestion && !recap.some(item => item.focus === `question:${nextQuestion.question_id}`) ? <View className="px-4"><Button variant="secondary" accessibilityLabel={`现在处理：${questionParts(nextQuestion.text).ask}`} onPress={() => {
-          const index = rows.findIndex((row) => row.key === `q:${nextQuestion.question_id}`)
-          if (index >= 0) toUnread(index)
-        }}><Text numberOfLines={2} className="min-w-0 shrink">{offline ? '最近记录 · ' : ''}{questionParts(nextQuestion.text).ask}</Text><Icon as={ArrowDown} /></Button></View> : null}
-        {!routine && recapView ? <View accessibilityLabel="回来接着办" className="w-full max-w-3xl gap-1 self-center px-4 py-2"><Button variant={recapView.primary.group === 'decision' ? 'secondary' : 'ghost'} className="justify-start" onPress={() => openRecap(id, recapView.primary.target, recapView.primary.focus, recapView.primary.notificationId)}><Text numberOfLines={2} className="min-w-0 flex-1 text-left text-sm">{offline || live?.dataOrigin !== 'network' ? '最近记录 · ' : ''}{recapView.primary.state} · {recapView.primary.text}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Button>{recapView.more.length ? <Details key={id} label={`其余更新与进行中 · ${recapView.more.length}`}><ScrollView className="max-h-48" contentContainerClassName="gap-3" keyboardShouldPersistTaps="handled">{recapGroups.map(({ group, label }) => {
-          const items = recapView.more.filter(item => item.group === group)
-          return items.length ? <View key={group} className="gap-1"><Text role="heading" className="text-sm font-medium">{label} · {items.length}</Text>{items.map(item => <Button key={item.key} variant="ghost" className="justify-start" onPress={() => openRecap(id, item.target, item.focus, item.notificationId)}><Text numberOfLines={2} className="min-w-0 flex-1 text-left text-sm">{item.state} · {item.text}</Text><Icon as={ChevronRight} className="size-4 text-muted" /></Button>)}</View> : null
-        })}</ScrollView></Details> : null}</View> : null}
-        {statusLine ? <View className="bg-background px-2"><Link href={`/b/${bot.bot_id}/activity`} asChild>
-          <Pressable accessibilityRole="link" accessibilityHint="打开动态" className={`${touchRow} w-full max-w-3xl flex-row items-center gap-1.5 self-center rounded-control px-2 active:bg-surface-muted`}>
-            <Icon as={ListChecks} className={extras.attention ? 'size-4 text-warning' : 'size-4 text-muted'} />
-            <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{statusLine}</Text>
-            <Icon as={ChevronRight} className="size-4 text-muted" />
-          </Pressable>
-        </Link></View> : null}
         <DraftComposer draft={draft} attachmentScope={JSON.stringify([workspace.networkId, id, inputTargetKey(inputTarget)])}
           blocked={blocked} sending={sendingScope === draftScopeKey} onSend={send} onStop={live?.writable && (inputTarget.kind === 'bot_main' ? chat?.stoppable : targetBusy) ? () => void live.stopInputTarget({ target: targetOption.target }).catch((cause) => setSendError(messageOf(cause))) : undefined}
-          selectedIntent={selectedIntent} targetBusy={targetBusy} onChooseIntent={chooseIntent}
+          targetBusy={targetBusy} placeholder={setupHint || undefined}
+          target={setupHint && (reach === 'offline' || canSetUp) ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link> : undefined}
         >
-        <Text numberOfLines={1} className="text-sm text-muted">{targetOption.label}</Text>
         {live?.conversationError ? <View className="gap-1"><ErrorText error={live.conversationError} /><Button variant="ghost" size="sm" onPress={() => void live.refreshConversation().catch((cause) => setSendError(messageOf(cause)))}><Text>重新读取聊天</Text></Button></View> : null}
-        {offline || setupHint || sendError || inputTarget.kind !== 'bot_main' ? <>
-          {offline ? <OfflineBar chat className="self-center" /> : setupHint ? <View role="status" className="flex-row flex-wrap items-center gap-x-2 px-2">
-            <Text className="text-sm text-muted">{setupHint}</Text>
-            {reach === 'offline' || canSetUp ? <Link href={setupHref} asChild><Button variant="ghost" size="sm"><Text>{reach === 'offline' ? '查看设备' : '去设置'}</Text></Button></Link>
-              : <Text className="text-sm text-muted">{setUpOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))}</Text>}
-          </View> : null}
+        {offline || sendError || inputTarget.kind !== 'bot_main' ? <>
+          {offline ? <OfflineBar chat className="self-center" /> : null}
           {sendError ? <ErrorText error={sendError} /> : null}
           {inputTarget.kind !== "bot_main" ? <View className="flex-row items-center gap-2 px-2">
-            <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetBusy ? '补充给' : '发送给'} · {targetOption.label}</Text>
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-sm text-muted">{targetOption.label}</Text>
             <Button variant="ghost" size="sm" onPress={() => { void changeTarget('main').catch((cause) => { if (currentScope.current === draftScopeKey) setSendError(messageOf(cause)) }) }}><Text>改回主聊天</Text></Button>
           </View> : null}
         </> : null}

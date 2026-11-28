@@ -72,7 +72,7 @@ export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }):
   if (!input.loaded) return '稍等'
   return ''
 }
-/** A typed task prefix is a convenience; the composer's explicit choice takes precedence. */
+/** The composer has no intent menu: a typed task prefix starts a new task, anything else continues the current work. */
 export function promptIntent(text: string): InputIntent {
   return /^\s*(新任务(?:$|[\s：:，,])|new\s+task(?:$|[:：,，]))/i.test(text) ? 'new_task' : 'continue'
 }
