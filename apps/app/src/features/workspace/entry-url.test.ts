@@ -3989,8 +3989,8 @@ test('the retained conversation only mounts task history on its exact chat route
     '@vibeface/client/workspace/home.ts': { backTo: () => undefined }, '@/lib/glossary': { terms: Object.fromEntries(['inbox', 'task', 'myDevices', 'settings'].map((key) => [key, { label: key, icon: key }])) },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle' }, '@vibeface/client/avatar/mood.ts': { moodLabel: { idle: '待命' } },
-  }, {}, 'WorkspaceLayout')
-  const active = () => app.render('WorkspaceLayout', { children: null, landing: false }).find(({ type }) => type === 'ConversationScreen')?.props.active
+  })
+  const active = () => app.render('WorkspaceShell', { children: null, conversation: 'ConversationScreen' }).find(({ type }) => type === 'ConversationScreen')?.props.active
   try {
     assert.equal(active(), true)
     for (const route of ['/b/bot/work/work', '/devices', '/tasks', '/b/missing']) { pathname = route; assert.equal(active(), false, route) }
@@ -6808,7 +6808,7 @@ test('only the matching invitation auto-starts and a failed comparison can be st
       '@vibeface/client/workspace/inbox.ts': { openJoins }, '@vibeface/client/workspace/labels.ts': taskLabels,
       '@/lib/glossary': { terms: { admin: { label: '管理设备' } } },
       '@/lib/use-run': { useRun: () => ({ busy, error, run }) },
-      './devices': { deviceIcon: () => 'Icon' }, './device-icon': { deviceIcon: () => 'Icon' },
+      './device-icon': { deviceIcon: () => 'Icon' },
       '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy, error, run }) }, { get: (target, name) => name === 'useAction' ? target.useAction : String(name) }),
     }
     const globals = { setInterval: () => 0, clearInterval: () => {} }
@@ -7073,7 +7073,7 @@ test('native system notification events keep typed destinations and clear naviga
     '@vibeface/client/identity/copy.ts': { lostKeyText: () => '' },
     './files': { privateFiles },
     './notification-opens': { notificationOpenings }, './outbox': { mobileOutbox },
-  })
+  }, {}, '', { './storage': '../../../../../apps/mobile/src/platform/storage.ts' })
   const { mobilePlatform } = app.module as typeof import('../../../../../apps/mobile/src/platform/index.ts')
   const destination: NotificationDestination = { network_id: 'network-fixture', device_id: 'device-fixture', notification_id: 'notification-fixture', conversation_id: 'conversation-fixture' }
   const opened: NotificationDestination[] = []

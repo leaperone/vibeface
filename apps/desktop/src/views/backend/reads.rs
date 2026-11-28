@@ -1,6 +1,7 @@
 //! Bounded read workers. Only this actor applies their results; writes keep their own outbox.
 use super::*;
 use crate::views::history::{ApplyResult, PageTicket, SnapshotTicket};
+use vibeface_protocol::WriteState;
 use vibeface_protocol::workspace::WorkspaceState;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -711,7 +712,7 @@ impl Backend {
             .as_str()
             .context("写入状态缺失")?
             .into();
-        next.writable = client.can_write() && next.write_state == "writable";
+        next.writable = client.can_write() && next.write_state == WriteState::Writable.as_str();
         next.can_control = client.can_control();
         next.can_save_locally = client.can_save_locally();
         next.projection_valid = true;
@@ -773,7 +774,7 @@ impl Backend {
         next.cached = false;
         next.cached_at_ms = None;
         next.cache_omitted = 0;
-        next.synced = next.write_state != "aligning";
+        next.synced = next.write_state != WriteState::Aligning.as_str();
         next.status = if next.local_session {
             "本机会话只读。加入个人网络后才能发送签名输入。".into()
         } else if next.writable {

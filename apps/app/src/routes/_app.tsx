@@ -1,3 +1,4 @@
+import { ConversationScreen } from '@/features/chat/conversation-screen'
 import { useOnboarding } from '@/features/identity/onboarding-flag'
 import { ShellSkeleton,WorkspaceShell } from '@/features/workspace/workspace-shell'
 import { webPlatform } from '@/lib/platform'
@@ -37,6 +38,6 @@ function AppLayout() {
     else if (target?.kind === 'channel_member') void navigate({ to: '/channels/$channelId', params: { channelId: target.channel_id }, search: focus ? { message: focus } : {} })
     else void navigate({ to: '/', search: { conversation: id, ...(focus ? { message: focus } : {}), ...(notificationId ? { notification: notificationId } : {}), ...(target?.kind === 'work' ? { work: target.work_id } : target?.kind === 'routine' ? { routine: target.trigger } : {}) } })
   }}>
-    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding networkId={ready.principal.network_id} step={onboarding} /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
+    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding networkId={ready.principal.network_id} step={onboarding} /></Suspense> : <WorkspaceShell conversation={ConversationScreen} landing={onboarded}><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

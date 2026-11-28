@@ -53,30 +53,7 @@ pub(crate) mod workspace;
 const INITIAL_SCHEMA: &str = include_str!("../migrations/1_initial.sql");
 pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
 
-/// Whether this Node may append to its own log (design 5.7 and 5.8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteState {
-    /// Started from a database file it never wrote from, with other member Nodes; waits for
-    /// them to confirm it holds nothing newer of ours.
-    Aligning,
-    /// No other member Node answered; writable once the user confirms no backup was restored.
-    ReadOnly,
-    Writable,
-    /// Another copy of this device's log wrote different events at the same sequence.
-    Forked,
-}
-
-impl WriteState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Aligning => "aligning",
-            Self::ReadOnly => "read_only",
-            Self::Writable => "writable",
-            Self::Forked => "forked",
-        }
-    }
-}
+pub use vibeface_protocol::WriteState;
 
 /// One ingested batch: each envelope's status, the events it stored on their authors' main
 /// chains (an event that waited for an ancestor is stored with that ancestor), and whether it

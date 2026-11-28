@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use vibeface_bridge::agent::{CURSOR_AUTH_OVERRIDES, CustomToolConfig, is_cursor_sdk_bridge};
+use vibeface_bridge::platform::privatefs;
 
 mod login;
 pub use login::AuthenticationSource;
@@ -680,13 +681,7 @@ impl Provider {
 
     /// How config, events, the CLI and peers name the provider; serde and clap agree.
     pub fn name(self) -> &'static str {
-        match self {
-            Provider::Codex => "codex",
-            Provider::Cursor => "cursor",
-            Provider::Claude => "claude",
-            Provider::Pi => "pi",
-            Provider::Opencode => "opencode",
-        }
+        vibeface_control::provider::Provider::from(self).name()
     }
 
     /// How the owner reads the provider's name.
@@ -855,15 +850,11 @@ impl Provider {
     /// The discovery entry points and essential reads. The router checks each discovered
     /// target against the current turn, including when a thread keeps this initial catalog.
     pub fn tools_for(self, kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
-        crate::scheduler::tools(match self.prompt_mode() {
+        let kind = match self.prompt_mode() {
             PromptMode::Thread => TriggerKind::Human,
             PromptMode::Turn => kind,
-        })
-        .into_iter()
-        .filter(|(name, _)| {
-            crate::tools::Tool::parse(name).is_some_and(crate::tools::Tool::initially_exposed)
-        })
-        .collect()
+        };
+        crate::tools::configs_for(kind, crate::tools::Tool::initially_exposed)
     }
 
     /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
@@ -1339,11 +1330,11 @@ impl ProviderRoots {
 
     pub fn publish_codex_config(&self, source: &str) -> Result<bool> {
         let target = self.codex_home.join("config.toml");
-        crate::config::private_dir(&self.codex_home)?;
+        privatefs::create_dir(&self.codex_home)?;
         let temp = self
             .codex_home
             .join(format!(".config-{}.toml", uuid::Uuid::new_v4()));
-        crate::config::private_write(&temp, source.as_bytes())
+        privatefs::write_atomic(&temp, source.as_bytes())
             .map_err(|_| anyhow::anyhow!("could not prepare private Codex configuration"))?;
         // A hard link publishes complete contents without replacing a concurrent creator.
         let created = match std::fs::hard_link(&temp, &target) {
@@ -1529,8 +1520,8 @@ mod tests {
             } else {
                 provider.default_bin().into()
             });
-            crate::config::private_dir(&dir)?;
-            crate::config::private_write(&executable, b"#!/bin/sh\nexit 0\n")?;
+            privatefs::create_dir(&dir)?;
+            privatefs::write_atomic(&executable, b"#!/bin/sh\nexit 0\n")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1538,8 +1529,8 @@ mod tests {
             }
             local.bins.insert(provider, executable);
             assert!(!roots.prepare_login(provider, &local, &host)?);
-            crate::config::private_dir(source.parent().unwrap())?;
-            crate::config::private_write(&source, &serde_json::to_vec(&credential)?)?;
+            privatefs::create_dir(source.parent().unwrap())?;
+            privatefs::write_atomic(&source, &serde_json::to_vec(&credential)?)?;
             std::fs::write(source.with_file_name("sessions"), "personal-session")?;
             assert!(roots.prepare_login(provider, &local, &host)?);
             assert!(vibeface_bridge::platform::privatefs::is_private(&target)?);
@@ -1568,7 +1559,7 @@ mod tests {
                     json!(vibeface_protocol::now_ms() + 3_600_000);
             }
             let original = serde_json::to_vec(&refreshed)?;
-            crate::config::private_write(&source, &original)?;
+            privatefs::write_atomic(&source, &original)?;
             assert!(roots.prepare_login(provider, &local, &host)?);
             assert!(!roots.prepare_login(provider, &local, &host)?);
             assert_eq!(
@@ -1610,7 +1601,7 @@ mod tests {
             } else {
                 target.clone()
             };
-            crate::config::private_write(&private_target, b"private-refreshed-login")?;
+            privatefs::write_atomic(&private_target, b"private-refreshed-login")?;
             assert!(!roots.prepare_login(provider, &local, &host)?);
             assert_eq!(std::fs::read(&private_target)?, b"private-refreshed-login");
             assert_eq!(
@@ -1635,7 +1626,7 @@ mod tests {
             local
                 .env
                 .apply(provider, BTreeMap::from([(name.into(), None)]))?;
-            crate::config::private_write(&source, b"synthetic-secret-invalid-json")?;
+            privatefs::write_atomic(&source, b"synthetic-secret-invalid-json")?;
             let error = roots.prepare_login(provider, &local, &host).unwrap_err();
             assert!(error.is::<crate::discovery::LocalSourceError>());
             assert!(!format!("{error:#}").contains("synthetic-secret"));
@@ -1753,7 +1744,7 @@ mod tests {
     fn variables_are_validated_and_stay_with_their_provider() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-provider-env-{}", uuid::Uuid::new_v4()));
-        crate::config::private_dir(&dir)?;
+        privatefs::create_dir(&dir)?;
         let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
@@ -1814,7 +1805,7 @@ mod tests {
         for name in CURSOR_AUTH_OVERRIDES {
             historical["provider_env"]["cursor"][name] = json!("synthetic-unused-auth");
         }
-        crate::config::private_write(&dir.join("config.json"), &serde_json::to_vec(&historical)?)?;
+        privatefs::write_atomic(&dir.join("config.json"), &serde_json::to_vec(&historical)?)?;
         let loaded = crate::config::Config::load(&dir)?.provider_env;
         let local = Local {
             switches: Providers::default(),
@@ -2064,8 +2055,8 @@ mod tests {
             std::env::temp_dir().join(format!("vibeface-codex-config-{}", uuid::Uuid::new_v4()));
         let source = dir.join("global");
         let fallback = dir.join("home/.codex");
-        crate::config::private_dir(&source)?;
-        crate::config::private_dir(&fallback)?;
+        privatefs::create_dir(&source)?;
+        privatefs::create_dir(&fallback)?;
         std::fs::write(fallback.join("config.toml"), "model='wrong-source'")?;
         std::fs::write(
             source.join("config.toml"),
@@ -2208,7 +2199,7 @@ requires_openai_auth = false
         let dir =
             std::env::temp_dir().join(format!("vibeface-codex-enable-{}", uuid::Uuid::new_v4()));
         let source = dir.join("global");
-        crate::config::private_dir(&source)?;
+        privatefs::create_dir(&source)?;
         let host = crate::discovery::Host {
             codex_home: Some(source.clone()),
             ..Default::default()
@@ -2270,7 +2261,7 @@ requires_openai_auth = false
     fn runtime_root_environment_can_be_saved_and_loaded_without_losing_auth() -> Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vibeface-provider-roots-{}", uuid::Uuid::new_v4()));
-        crate::config::private_dir(&dir)?;
+        privatefs::create_dir(&dir)?;
         let roots = ProviderRoots::new(&dir);
         let mut local = Local {
             switches: Providers::default(),

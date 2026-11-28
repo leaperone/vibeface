@@ -929,7 +929,7 @@ async fn status(options: Access) -> Result<()> {
             }
         );
         if let Some(state) = inspected.write_state {
-            println!("Writes: {}", state.label());
+            println!("Writes: {}", state.as_str());
         }
         if let Some(mesh) = terminal::mesh_summary(&inspected.mesh) {
             println!("Mesh: {mesh}");

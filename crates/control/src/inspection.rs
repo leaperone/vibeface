@@ -25,14 +25,7 @@ pub enum NodeStatus {
     Stopped,
     Unavailable,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteState {
-    Aligning,
-    ReadOnly,
-    Writable,
-    Forked,
-}
+pub use vibeface_protocol::WriteState;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerPath {

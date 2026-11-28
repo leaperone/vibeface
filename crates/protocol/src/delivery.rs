@@ -1,16 +1,7 @@
 //! Delivery requests shared by the Node and native client.
 
+use crate::empty_operation;
 use serde::{Deserialize, Serialize};
-
-// Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
-fn empty_operation<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<(), D::Error> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Empty {}
-    Empty::deserialize(deserializer).map(|_| ())
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]

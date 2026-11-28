@@ -506,7 +506,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             id(message_id)?;
-            crate::store::workspace::validate_target(target)?;
+            crate::workspace::validation::validate_target(target)?;
             ensure!(
                 *sequence > 0 && *sequence <= i64::MAX as u64,
                 "invalid input sequence"
@@ -523,7 +523,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 report_results.is_some(),
                 "an input carries its reporting choice"
             );
-            crate::store::workspace::validate_attachments(attachments)?;
+            crate::workspace::validation::validate_attachments(attachments)?;
             ensure!(
                 attachments
                     .iter()
@@ -555,7 +555,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 !(attestation.is_some() && cause.is_some()),
                 "a command has one authority"
             );
-            crate::store::workspace::validate_command(command)?;
+            crate::workspace::validation::validate_command(command)?;
             if let Some(cause) = cause {
                 id(&cause.conversation_id)?;
                 id(&cause.message_id)?;
@@ -766,7 +766,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             question_id(question)?;
             if let Some(target) = target {
-                crate::store::workspace::validate_target(target)?;
+                crate::workspace::validation::validate_target(target)?;
             }
             ensure!(
                 !text.trim().is_empty() && text.len() <= 1024,

@@ -2,8 +2,8 @@
 use super::{
     graph::Graph,
     query::{bot_scope, read_graph},
-    validation::{overlap, valid_roots},
 };
+use crate::workspace::validation::{overlap, valid_roots};
 use crate::{
     model::{BotProject, WorkKind, WorkProjection, WorkStatus},
     scheduling::SessionScope,

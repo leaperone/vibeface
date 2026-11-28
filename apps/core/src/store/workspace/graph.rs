@@ -1,5 +1,5 @@
 //! In-memory reduction of signed workspace history.
-use super::validation::{overlap, validate_command};
+use crate::workspace::validation::{overlap, validate_command};
 use crate::{
     crypto::request_key,
     model::{Attachment, Cause, Event, EventBody, VersionVector},

@@ -1,4 +1,3 @@
-import { writeBody } from './write-request.ts'
 import { array, boolean, record, text } from '../lib/node.ts'
 import { enqueue, type OutboxItem, type OutboxStore } from '../lib/outbox.ts'
 import type { MemoryBase, MemoryControlResult, MemoryEntry, MemoryMetadata, MemoryState, MemoryStateResult, MemorySyncConflicts } from './types.ts'
@@ -109,6 +108,10 @@ function request(item: OutboxItem) {
   return parseMemoryRequest(item.params)
 }
 
+export function memoryControlBody({ memory_id, base, after }: { memory_id: string; base: MemoryBase; after: string | null }) {
+  return { type: 'memory_controlled', memory_id, base, after }
+}
+
 export function memoryController(options: {
   outbox: OutboxStore
   key(conversationId: string, memoryId: string): string
@@ -159,9 +162,10 @@ export function memoryController(options: {
       if (JSON.stringify(original.base) !== JSON.stringify(parsedBase) || original.after !== parsedAfter) throw new Error(result.state === 'conflict' ? '原操作的结果仍未确认。草稿已保留，等待设备同步后再试。' : '之前的操作已有结果，当前草稿尚未提交。草稿已保留，请查看最新版本后再保存。')
       return result
     }
-    const signed = await options.sign(conversationId, writeBody({ method: 'control_memory', params: { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter, operation_id: '' } }, ''))
+    const params = { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter }
+    const signed = await options.sign(conversationId, memoryControlBody(params))
     check()
-    const item = await enqueue(options.outbox, { key, method: 'control_memory', scope_id: conversationId, params: { conversation_id: conversationId, memory_id: memoryId, base: parsedBase, after: parsedAfter, ...signed }, created_at_ms: Date.now() })
+    const item = await enqueue(options.outbox, { key, method: 'control_memory', scope_id: conversationId, params: { ...params, ...signed }, created_at_ms: Date.now() })
     return submit(item, false, check)
   }
   return { controlMemory, reconcile }

@@ -20,16 +20,7 @@ pub use vibeface_protocol::delivery::{
     DeliveryAcceptance, DeliveryAction, DeliveryBudgetFlush, DeliveryFlushIntent, DeliveryMode,
     DeliveryPrepare, DeliveryRead, DeliveryWireAction,
 };
-
-// Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
-fn empty_operation<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<(), D::Error> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Empty {}
-    Empty::deserialize(deserializer).map(|_| ())
-}
+use vibeface_protocol::empty_operation;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -156,6 +147,7 @@ pub enum OfflineBlockReason {
     NotMember,
     NodeRemoved,
 }
+/// Keep the native SDK variant order: index-based serializers observe it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {

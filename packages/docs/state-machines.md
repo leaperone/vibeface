@@ -36,6 +36,20 @@ description: 定位执行、输入、连接和恢复的状态模型与安全边�
 如果权限或成员检查需要等待，等待之后必须重新核对当前任务。
 同发起者、同邀请的请求只读取原任务进度。不同发起者不得取消仍在进行的任务。
 
+## 从调用方找到规则的所有者
+
+| 修改的内容 | 从哪里开始 | 哪些调用方需要核对 |
+| --- | --- | --- |
+| Node 和客户端交换的字段、命令或结果 | `crates/protocol` 的 Rust 契约 | Core 的 API、Rust 客户端及 `packages/client` 的对应解码与投影。 |
+| 外部 Agent 的请求与结果 | `crates/bridge` 的产品适配；运行中进程归 `apps/core/src/runtime` 管理 | 通过原生会话恢复执行的路径。共享历史只能恢复业务上下文。 |
+| 持久化与副作用 | 在上表定位对应的 `apps/core/src/store` 规则，再追到调用它的 runtime 或 API | 实时接收、进程重启和历史导入三条入口。不能让导入复用会派发新工作的入口。 |
+| Web 和 Mobile 对同一记录的解释 | `packages/client/src/workspace` 的共享投影 | `apps/app` 和 `apps/mobile` 负责渲染与平台交互。平台存储或锁的约束见下文。 |
+| 同一控件的外观及原生实现 | [Arc 来源及移植规则](design/uiarc-migration.md) | Web 与 Mobile 使用各自的控件实现；修改共同基础值后重新生成两端 token。 |
+
+Rust 包的直接依赖见各包的 `Cargo.toml`；JavaScript 工作区依赖见各包的 `package.json`。
+依赖声明只能说明某个包可被使用。修改业务规则前，仍须从入口追踪到实际读写该状态的位置。
+Web 检查中的 `apps/app/check-imports.mjs` 按各自 tsconfig 解析 `packages/client` 和 `apps/app` 的包内静态运行时导入，拒绝循环。纯类型引用和延迟加载不构成该检查的静态边。
+
 ## 同设备输入保存
 
 分配序号、签名完成和进入耐久发件箱是不同状态。序号已分配但尚未保存的输入，对发件箱发送者还不可见。

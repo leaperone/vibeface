@@ -32,17 +32,6 @@ impl Label for RunState {
     }
 }
 
-impl Label for WriteState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Aligning => "aligning",
-            Self::ReadOnly => "read_only",
-            Self::Writable => "writable",
-            Self::Forked => "forked",
-        }
-    }
-}
-
 impl Label for PeerPath {
     fn label(self) -> &'static str {
         match self {
@@ -115,7 +104,7 @@ impl NodeStatus {
     }
 
     pub fn writes(&self) -> &'static str {
-        self.write_state.map_or("unavailable", WriteState::label)
+        self.write_state.map_or("unavailable", WriteState::as_str)
     }
 
     pub fn peer_summary(&self) -> String {

@@ -2,8 +2,8 @@
 use super::{
     graph::{Graph, InputControlState, direct_parent},
     query::{bot_scope, read_graph},
-    validation::{valid_id, validate_target},
 };
+use crate::workspace::validation::{valid_id, validate_target};
 use crate::{
     crypto::{LocalIdentity, request_key},
     model::{Attachment, Attestation, Event, EventBody, SignedEvent},

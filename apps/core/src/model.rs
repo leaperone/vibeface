@@ -2,6 +2,7 @@ use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub use vibeface_bridge::failure::FailureKind;
+use vibeface_protocol::workspace::{InputIntent, InputTarget, WorkspaceCommand};
 pub use vibeface_protocol::workspace::{SubagentProgress, WorkSubagent};
 
 pub type NetworkId = String;
@@ -733,54 +734,7 @@ pub fn validate_memory(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Obvious credentials: private key blocks, bearer tokens, secret assignments, well-known key
-/// prefixes and long unbroken runs that mix cases and digits as keys do.
-pub fn looks_secret(text: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "-----begin",
-        "bearer ",
-        "password=",
-        "password:",
-        "passwd=",
-        "secret=",
-        "api_key=",
-        "apikey=",
-        "token=",
-    ];
-    const PREFIXES: &[&str] = &[
-        "sk-",
-        "sk_",
-        "ghp_",
-        "gho_",
-        "ghs_",
-        "ghu_",
-        "github_pat_",
-        "xoxb-",
-        "xoxp-",
-        "xapp-",
-        "akia",
-        "aiza",
-        "glpat-",
-        "hf_",
-        "npm_",
-    ];
-    let lower = text.to_lowercase();
-    if MARKERS.iter().any(|marker| lower.contains(marker)) {
-        return true;
-    }
-    text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
-        .any(|word| {
-            let lower = word.to_ascii_lowercase();
-            (word.len() >= 20 && PREFIXES.iter().any(|prefix| lower.starts_with(prefix)))
-                || (word.len() >= 32
-                    && word
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
-                    && word.chars().any(|c| c.is_ascii_digit())
-                    && word.chars().any(|c| c.is_ascii_uppercase())
-                    && word.chars().any(|c| c.is_ascii_lowercase()))
-        })
-}
+pub use vibeface_bridge::looks_secret;
 
 impl BotChange {
     /// Every change sets something new; a removal needs something to remove.
@@ -948,8 +902,8 @@ pub enum EventBody {
     },
     InputPosted {
         message_id: String,
-        target: crate::workspace::InputTarget,
-        intent: crate::workspace::InputIntent,
+        target: InputTarget,
+        intent: InputIntent,
         sequence: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_revision: Option<u64>,
@@ -963,7 +917,7 @@ pub enum EventBody {
     },
     WorkspaceCommanded {
         command_id: String,
-        command: crate::workspace::WorkspaceCommand,
+        command: WorkspaceCommand,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acting_assignment: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1033,7 +987,7 @@ pub enum EventBody {
     QuestionAsked {
         question_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<crate::workspace::InputTarget>,
+        target: Option<InputTarget>,
         attention: AttentionRequest,
         severity: Severity,
         text: String,
@@ -1391,7 +1345,7 @@ pub struct Conversation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub message_id: String,
-    pub target: Option<crate::workspace::InputTarget>,
+    pub target: Option<InputTarget>,
     pub role: Role,
     pub text: String,
     pub event_hash: EventHash,
@@ -1415,7 +1369,7 @@ pub struct Notification {
     pub notification_id: String,
     pub conversation_id: ScopeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<crate::workspace::InputTarget>,
+    pub target: Option<InputTarget>,
     /// The original message or `question:<id>` within its target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,

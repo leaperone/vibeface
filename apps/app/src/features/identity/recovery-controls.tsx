@@ -1,5 +1,5 @@
 import { ActionCard,BusyIcon,claimFocus,Details,FilePicker,InlineError,Panel,PasswordInput,SettingsDisclosure,SettingsRow,toast,WaitingDot } from '@/components/arc/product-kit'
-import { deviceIcon } from '@/features/devices/devices'
+import { deviceIcon } from '@/features/devices/device-icon'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useClipboard } from '@/lib/use-clipboard'
 import { cn } from '@/lib/utils'

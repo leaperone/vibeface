@@ -7,8 +7,8 @@ use super::{
     overview,
     query::{bot_scope, graph_at, owner_at, read_graph},
     resources::{ResourceQuery, resource_conflicts_from},
-    validation::valid_roots,
 };
+use crate::workspace::validation::valid_roots;
 use crate::{
     crypto::LocalIdentity,
     model::{

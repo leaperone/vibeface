@@ -1506,7 +1506,7 @@ pub async fn find_through(
 /// `url` answers `/api/info` as `device`, over HTTPS to an address checked to be public unless
 /// `allow_private`.
 async fn verify_gateway(url: &str, device: &str, allow_private: bool) -> Result<()> {
-    let url = crate::config::http_origin(url)?;
+    let url = super::http_origin(url)?;
     ensure!(url.scheme() == "https", "a gateway is an HTTPS origin");
     let host = url.host_str().context("the gateway has no host")?;
     let port = url

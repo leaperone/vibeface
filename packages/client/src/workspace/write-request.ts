@@ -4,7 +4,7 @@ import type { Avatar } from '../avatar/face.ts'
 import type { BotProject, CreateBotRequest, MemoryBase, ScheduleAction, WorkspaceCommand } from './types.ts'
 import { record, text } from '../lib/node.ts'
 import { parseCreateBot, parseMessageRequest, parseWorkspaceCommand, avatar } from './model.ts'
-import { parseMemoryRequest } from './memory.ts'
+import { memoryControlBody, parseMemoryRequest } from './memory.ts'
 import { inputEventBody } from '../chat/protocol.ts'
 import { answerBody, questionInboxKey } from './questions.ts'
 
@@ -81,7 +81,7 @@ export function writeBody(operation: WriteOperation, clientId: string): Record<s
   switch (operation.method) {
     case 'message': return inputEventBody(operation.params)
     case 'workspace_command': return { type: 'workspace_commanded', command_id: operation.params.command_id, command: operation.params.command }
-    case 'control_memory': return { type: 'memory_controlled', memory_id: operation.params.memory_id, base: operation.params.base, after: operation.params.after }
+    case 'control_memory': return memoryControlBody(operation.params)
     case 'ack': return { type: 'notification_acked', notification_id: operation.params.notification_id, client_id: clientId }
     case 'create_bot': { const p = operation.params; return { type: 'bot_created', bot_id: p.bot_id, name: p.name, instructions: p.instructions, ...(p.project ? { project: p.project } : {}) } }
     case 'delete_bot': return { type: 'bot_deleted' }

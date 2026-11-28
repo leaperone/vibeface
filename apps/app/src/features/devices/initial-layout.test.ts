@@ -16,6 +16,7 @@ function component(file: string, dependencies: Record<string, unknown>) {
   const jsx = (type: unknown, props: Element['props']) => ({ type, props })
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
   const load = moduleLoader(createContext({ window: { addEventListener() {}, removeEventListener() {} }, setTimeout, clearTimeout }), (specifier) => {
+    if (specifier === './device-icon') return load(fileURLToPath(new URL('./device-icon.ts', import.meta.url)))
     if (specifier === 'react') return hooks.react
     if (specifier === 'react/jsx-runtime') return { jsx, jsxs: jsx }
     if (specifier === '@vibeface/client/workspace/use-node-checks.ts') return { useNodeChecks: () => ({ fresh: false, checking: false }) }

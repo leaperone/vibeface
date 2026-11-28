@@ -235,17 +235,17 @@ impl ProviderRoots {
             crate::logging::add_credential(value);
         }
         if provider == Provider::Claude {
-            crate::config::private_dir(target_root).map_err(|_| LocalSourceError)?;
+            privatefs::create_dir(target_root).map_err(|_| LocalSourceError)?;
             let changed = login_cache(&target_root.join(ACCESS_SNAPSHOT))?
                 .is_none_or(|current| *current != *bytes);
             if changed {
-                crate::config::private_write(&target_root.join(ACCESS_SNAPSHOT), &bytes)
+                privatefs::write_atomic(&target_root.join(ACCESS_SNAPSHOT), &bytes)
                     .map_err(|_| LocalSourceError)?;
             }
             let marker = ImportedLogin {
                 credential_digest: crate::crypto::digest(&bytes),
             };
-            crate::config::private_write(
+            privatefs::write_atomic(
                 &target_root.join(IMPORT_MARKER),
                 &serde_json::to_vec(&marker).map_err(|_| LocalSourceError)?,
             )
@@ -269,9 +269,9 @@ impl ProviderRoots {
         if published {
             // Only this Node writes this snapshot. An existing CLI credential is never
             // replaced, including when a person signs in concurrently from their terminal.
-            crate::config::private_write(&target_root.join(ACCESS_SNAPSHOT), &bytes)
+            privatefs::write_atomic(&target_root.join(ACCESS_SNAPSHOT), &bytes)
                 .map_err(|_| LocalSourceError)?;
-            crate::config::private_write(
+            privatefs::write_atomic(
                 &target_root.join(IMPORT_MARKER),
                 &serde_json::to_vec(&marker).map_err(|_| LocalSourceError)?,
             )
@@ -459,9 +459,9 @@ fn login_cache(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
 
 fn publish_login(target: &Path, bytes: &[u8]) -> Result<bool> {
     let root = target.parent().ok_or(LocalSourceError)?;
-    crate::config::private_dir(root).map_err(|_| LocalSourceError)?;
+    privatefs::create_dir(root).map_err(|_| LocalSourceError)?;
     let staging = root.join(format!(".login-{}", uuid::Uuid::new_v4()));
-    crate::config::private_write(&staging, bytes).map_err(|_| LocalSourceError)?;
+    privatefs::write_atomic(&staging, bytes).map_err(|_| LocalSourceError)?;
     let published = match std::fs::hard_link(&staging, target) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),

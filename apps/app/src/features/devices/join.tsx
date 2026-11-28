@@ -9,7 +9,7 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Checkbox } from "@vibeface/uiarc/checkbox/checkbox.tsx"
 import { CircleX } from "lucide-react"
 import { useEffect,useLayoutEffect,useRef,useState } from "react"
-import { deviceIcon } from "./devices"
+import { deviceIcon } from "./device-icon"
 
 /** Requests an admin can still act on. */
 export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())

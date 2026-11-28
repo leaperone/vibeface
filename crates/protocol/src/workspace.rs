@@ -1,4 +1,5 @@
 //! Pure workspace wire values shared by Node and native clients.
+use crate::empty_operation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 type DeviceId = String;
@@ -190,9 +191,9 @@ pub enum AssignmentState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputControl {
-    #[serde(deserialize_with = "empty_input_control")]
+    #[serde(deserialize_with = "empty_operation")]
     Release,
-    #[serde(deserialize_with = "empty_input_control")]
+    #[serde(deserialize_with = "empty_operation")]
     Cancel,
     Edit {
         text: String,
@@ -202,13 +203,6 @@ pub enum InputControl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_message_id: Option<String>,
     },
-}
-
-fn empty_input_control<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Empty {}
-    Empty::deserialize(deserializer).map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

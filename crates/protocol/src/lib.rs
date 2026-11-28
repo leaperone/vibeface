@@ -5,11 +5,54 @@ pub mod delivery;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whether this Node may append to its own log (design 5.7 and 5.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteState {
+    /// Started from a database file it never wrote from, with other member Nodes; waits for
+    /// them to confirm it holds nothing newer of ours.
+    Aligning,
+    /// No other member Node answered; writable once the user confirms no backup was restored.
+    ReadOnly,
+    Writable,
+    /// Another copy of this device's log wrote different events at the same sequence.
+    Forked,
+}
+
+impl WriteState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aligning => "aligning",
+            Self::ReadOnly => "read_only",
+            Self::Writable => "writable",
+            Self::Forked => "forked",
+        }
+    }
+}
+
+impl std::str::FromStr for WriteState {
+    type Err = serde::de::value::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::deserialize(serde::de::value::StrDeserializer::new(value))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum RpcId {
     Number(i64),
     String(String),
+}
+
+/// Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
+pub fn empty_operation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    Empty::deserialize(deserializer).map(|_| ())
 }
 
 pub fn valid_business_id(id: &str) -> bool {
@@ -45,6 +88,21 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn node_write_states_keep_their_wire_and_storage_names() {
+        for (state, name) in [
+            (WriteState::Aligning, "aligning"),
+            (WriteState::ReadOnly, "read_only"),
+            (WriteState::Writable, "writable"),
+            (WriteState::Forked, "forked"),
+        ] {
+            assert_eq!(state.as_str(), name);
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(name));
+            assert_eq!(name.parse(), Ok(state));
+        }
+        assert!("unknown".parse::<WriteState>().is_err());
+    }
 
     #[test]
     fn business_ids_allow_colons_without_widening_protocol_ids() {

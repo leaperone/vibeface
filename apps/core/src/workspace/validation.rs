@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::collections::BTreeSet;
 
-pub(super) fn valid_id(value: &str) -> Result<()> {
+pub(crate) fn valid_id(value: &str) -> Result<()> {
     vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg)
 }
 fn valid_hash(value: &str) -> Result<()> {
@@ -153,7 +153,7 @@ fn valid_unc_anchor(part: &str) -> bool {
         && !part.ends_with(['.', ' '])
 }
 
-pub(super) fn valid_roots(roots: &[String]) -> Result<()> {
+pub(crate) fn valid_roots(roots: &[String]) -> Result<()> {
     ensure!(roots.len() <= 16, "too many workspace roots");
     for root in roots {
         ensure!(
@@ -167,7 +167,7 @@ pub(super) fn valid_roots(roots: &[String]) -> Result<()> {
     );
     Ok(())
 }
-pub(super) fn overlap(left: &str, right: &str) -> bool {
+pub(crate) fn overlap(left: &str, right: &str) -> bool {
     let (Some(left), Some(right)) = (lexical_root(left), lexical_root(right)) else {
         return false;
     };
@@ -429,4 +429,88 @@ pub(crate) fn validate_attachments(attachments: &[Attachment]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod root_path_tests {
+    use super::{overlap, valid_roots};
+
+    #[test]
+    fn accepts_normalized_absolute_paths_for_each_platform() {
+        for path in [
+            "/srv/work",
+            "/srv/项目",
+            "C:\\Users\\dev\\work",
+            "C:\\资料\\项目",
+            "D:/work",
+            "\\\\server\\share\\work",
+            "\\\\?\\C:\\work",
+            "\\\\?\\C:\\work.",
+            "\\\\?\\C:\\work ",
+            "\\\\?\\UNC\\server\\share\\work",
+        ] {
+            assert!(valid_roots(&[path.to_owned()]).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_relative_and_noncanonical_paths_for_each_platform() {
+        for path in [
+            "relative/work",
+            "/srv/./work",
+            "/srv/../work",
+            "/srv//work",
+            "/srv/work/",
+            "C:work",
+            "C:\\work\\..\\other",
+            "C:\\work/../other",
+            "C:/work\\..\\other",
+            "C:\\work\\",
+            "C:\\work.",
+            "C:\\work ",
+            "C:/work./repo",
+            "\\\\.\\share\\work",
+            "\\\\server\\..\\work",
+            "\\\\server\\share\\..\\work",
+            "\\\\server\\share\\work\\\\x",
+            "\\\\server\\share\\work.",
+            "\\\\server.\\share\\work",
+            "/srv/wo\u{7}rk",
+        ] {
+            assert!(valid_roots(&[path.to_owned()]).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_uses_portable_components() {
+        assert!(overlap("C:\\Work\\repo", "c:\\work"));
+        assert!(overlap("\\\\?\\C:\\Work\\repo", "C:/work"));
+        assert!(!overlap("\\\\?\\C:\\work.", "C:\\work"));
+        assert!(!overlap("\\\\?\\C:\\work ", "C:\\work"));
+        assert!(!overlap("C:\\Work", "D:\\Work"));
+        assert!(overlap("/srv/work", "/srv/work/repo"));
+        assert!(!overlap("/srv/work", "/srv/worker"));
+        assert!(overlap("\\\\server\\share\\work", "\\\\server\\share"));
+        assert!(overlap(
+            "\\\\?\\UNC\\server\\share\\work",
+            "\\\\server\\share"
+        ));
+        assert!(!overlap(
+            "\\\\server\\share\\work",
+            "\\\\other\\share\\work"
+        ));
+    }
+
+    #[test]
+    fn windows_unicode_case_aliases_overlap_without_normalization_or_expansion() {
+        assert!(overlap("C:\\Ä\\repo", "c:\\ä"));
+        assert!(overlap("\\\\SÉRVER\\SHÄRE\\repo", "\\\\sérver\\shäre"));
+        assert!(overlap("\\\\?\\C:\\Ä\\repo", "C:\\ä"));
+        assert!(overlap("C:\\Σ\\repo", "c:\\ς"));
+
+        assert!(!overlap("C:\\Straße", "c:\\STRASSE"));
+        assert!(!overlap("C:\\Ä", "C:\\A\u{0308}"));
+        assert!(!overlap("/srv/Ä", "/srv/ä"));
+        assert!(!overlap("C:\\ä", "C:\\ä-repo"));
+    }
 }

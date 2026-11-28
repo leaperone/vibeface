@@ -6,6 +6,23 @@ use vibeface_secure::{
 };
 
 #[test]
+fn sdk_provider_names_and_variant_indices_remain_stable() {
+    for (index, (provider, name)) in [
+        (Provider::Codex, "codex"),
+        (Provider::Claude, "claude"),
+        (Provider::Cursor, "cursor"),
+        (Provider::Opencode, "opencode"),
+        (Provider::Pi, "pi"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(serde_json::to_value(&provider).unwrap(), name);
+        assert_eq!(provider as usize, index);
+    }
+}
+
+#[test]
 fn strict_client_input_literals_use_the_public_sdk_boundary() {
     let cases: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/strict-client-input.json"

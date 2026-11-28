@@ -581,7 +581,7 @@ impl TurnAttempt {
                         config.tool_cli.as_deref(),
                         &config.custom_tools,
                         &stable.rendered,
-                        crate::runtime::health_turn(&job.trigger),
+                        crate::scheduling::health_turn(&job.trigger),
                     )
                     .len()
                         + 2
@@ -733,7 +733,7 @@ impl TurnAttempt {
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]);
             // A turn a log line started neither writes on the host nor sends into Codex threads.
-            config.restricted = crate::runtime::health_turn(&job.trigger);
+            config.restricted = crate::scheduling::health_turn(&job.trigger);
             if config.restricted {
                 config.tool_env.remove("VIBEFACE_CODEX_SOCKET");
             }
@@ -764,7 +764,7 @@ impl TurnAttempt {
         if let Err(error) = ensure_readiness(&readiness) {
             return Ok(ProviderOutcome::Failed(error));
         }
-        if crate::runtime::health_turn(&self.job.trigger)
+        if crate::scheduling::health_turn(&self.job.trigger)
             && !crate::runtime::runs_health_turns(provider)
         {
             return Ok(ProviderOutcome::Failed(
