@@ -2,12 +2,10 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
-
-const ts = createRequire(new URL('../packages/client/package.json', import.meta.url))('typescript')
+import ts from 'typescript'
 
 for (const project of ['packages/client', 'apps/app']) {
-  const root = fileURLToPath(new URL(`../${project}/`, import.meta.url))
+  const root = fileURLToPath(new URL(`../../${project}/`, import.meta.url))
   const config = ts.readConfigFile(path.join(root, 'tsconfig.json'), ts.sys.readFile)
   assert.equal(config.error, undefined)
   const { fileNames, options, errors } = ts.parseJsonConfigFileContent(config.config, ts.sys, root)
