@@ -27,7 +27,7 @@ import { chatTaskState,nodeName,staleTaskLabel,taskActive,taskCopy,taskLabel,tas
 import { botReadiness,historySections,pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { awaitsAnswer,foldAnswers,workApproval } from '@vibeface/client/workspace/questions.ts'
 import { networkKey,storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { InputTarget,ManagerJob,PendingMessage,SentBotMessage,WorkRecord } from '@vibeface/client/workspace/types.ts'
+import { inJobGroup,type InputTarget,type ManagerJob,type PendingMessage,type SentBotMessage,type WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import buttonStyles from '@vibeface/uiarc/button/button.module.css'
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
@@ -39,11 +39,9 @@ import type { ChatMessage } from './elements/message'
 import { HistoryControls } from './history-controls'
 
 const emptyList: never[] = []
-const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
-const streamingStates = [...busyStates, 'publishing']
 type ComposerDraft = { text: string; files: File[]; target: string; conversationId: string }
 
 function NoBot() {
@@ -85,19 +83,19 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const savingDrafts = useRef(new Set<ComposerDraft>())
   const jobs = data?.scheduler?.jobs ?? emptyList
   const unanswered = data?.scheduler?.unanswered ?? []
-  const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
+  const activeJobs = jobs.filter((job) => inJobGroup('unfinished', job.state))
   const checks = pendingChecks(data, workspace.nodes, conversationId)
-  const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
+  const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!inJobGroup('streaming', job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const reach = botReach(workspace.nodes), agentReady = botCanSend(reach)
   const sendDisabled = !workspace.canSaveMessages || !bot || !canSend({ ...gate, busy: false })
   const botBusy = activeJobs.length > 0
   // Supplementing a work happens on its own page; this composer sends to the main chat, or to the routine it was opened for.
   const inputTarget: InputTarget | null = bot ? selectedTarget.startsWith('routine:') ? { kind: 'routine', bot_id: bot.bot_id, trigger: selectedTarget.slice(8) } : { kind: 'bot_main', bot_id: bot.bot_id } : null
-  const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && busyStates.includes(job.state))) : botBusy
+  const targetBusy = inputTarget?.kind === 'routine' ? Boolean(data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && inJobGroup('unfinished', job.state))) : botBusy
   const intent = promptIntent(text)
   const targetLabel = inputTarget?.kind === 'routine' ? `例行任务 · ${scheduleName(inputTarget.trigger, data?.bot_settings, data?.changes)}` : bot?.name ?? 'Bot'
-  const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
+  const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && inJobGroup('stoppable', job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
   const pendingRow = (message: ChatMessage, retry?: () => Promise<void>): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message, retry, conversationId })
@@ -134,8 +132,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
-  const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
-  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
+  const replying = jobs.some((job) => inJobGroup('replying', job.state))
+  const queued = new Set(replying ? jobs.filter((job) => job.message_id && inJobGroup('held', job.state)).map((job) => job.message_id) : [])
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
@@ -334,7 +332,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       >
         <InlineError error={sendError} className="basis-full" />
         {inputTarget.kind === 'routine' ? <Button type="button" variant="ghost" size="sm" onClick={() => chooseInput('main')}>改回主聊天</Button> : null}
-        {needsSetup && !starting && !activeJobs.some((job) => ['steering', 'claimed', 'running'].includes(job.state)) && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && !starting && !activeJobs.some((job) => inJobGroup('executing', job.state)) && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )

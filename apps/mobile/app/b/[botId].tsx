@@ -32,7 +32,7 @@ import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
-import type { InputTarget, ManagerJob, Question } from '@vibeface/client/workspace/types.ts'
+import { inJobGroup, type InputTarget, type ManagerJob, type Question } from '@vibeface/client/workspace/types.ts'
 import type { ReadAttachment } from '@/features/chat/attachments'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
@@ -64,7 +64,7 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
 function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: boolean): ChatMessage {
   if (message.role !== 'user' || message.state) return message
   const own = jobs.filter((job) => job.message_id === message.message_id)
-  if (replying && own.some((job) => ['pending_delivery', 'queued', 'steering'].includes(job.state))) return { ...message, state: own.some((job) => job.state === 'steering') ? 'merging' : 'queued' }
+  if (replying && own.some((job) => inJobGroup('held', job.state))) return { ...message, state: own.some((job) => job.state === 'steering') ? 'merging' : 'queued' }
   const steered = own.find((job) => job.state === 'steered')
   return steered ? { ...message, state: 'merged', merged: steered.outcome } : message
 }
@@ -75,7 +75,7 @@ function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: 
  */
 function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean, jobs: readonly ManagerJob[]): Entry[] {
   const rows: Entry[] = []
-  const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
+  const replying = jobs.some((job) => inJobGroup('replying', job.state))
   const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
@@ -308,7 +308,7 @@ export default function ChatScreen() {
   // Supplementing a work happens on its own page; this composer sends to the main chat, or to the routine it was opened for.
   const targetOption: { label: string; target: InputTarget } = routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: bot.name, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
-  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : Boolean(chat?.replying)
+  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && inJobGroup('stoppable', job.state))) : Boolean(chat?.replying)
   const changeTarget = async (inputTarget: string) => {
     const scope = draftScopeKey
     const current = () => routeActive.current && currentScope.current === scope && latestLive.current?.generation === liveGeneration
@@ -359,7 +359,7 @@ export default function ChatScreen() {
     })
   }
   // A turn already executing has a device running it, whatever this phone's device list says; a queued one does not.
-  const executing = jobs?.some((job) => ['steering', 'claimed', 'running'].includes(job.state))
+  const executing = jobs?.some((job) => inJobGroup('executing', job.state))
   const setupHint = !offline && !executing && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)

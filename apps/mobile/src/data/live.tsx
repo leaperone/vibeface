@@ -22,11 +22,9 @@ import { remoteNotifications } from '@/platform/remote-notifications'
 import { cachedConversation, localConversations } from './cached'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
-import type { InputTarget } from '@vibeface/client/workspace/types.ts'
+import { inJobGroup, type InputTarget } from '@vibeface/client/workspace/types.ts'
 import { useRouter } from 'expo-router'
 
-const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
-const streamingStates = [...busyStates, 'publishing']
 const empty = { networkId: null, deviceId: null, bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
 
@@ -180,7 +178,7 @@ function Live({ children }: { children: ReactNode }) {
     const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
     const handedOver = streamed.some((progress) => landed(progress.text))
     const live = streamed.find((progress) => !landed(progress.text)
-      && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
+      && !jobs.some((job) => job.trigger === progress.trigger && (!inJobGroup('streaming', job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
     const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? (sending ? pending.at(-1)?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id))
     const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers) && shared.fresh.has(`question:${question.question_id}`))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
@@ -190,15 +188,15 @@ function Live({ children }: { children: ReactNode }) {
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     for (const item of pending) if (!data.messages.some((message) => message.message_id === item.message_id)) messages.push({ message_id: item.message_id, event_hash: item.message_id, role: 'user', text: item.text, created_at_ms: item.created_at_ms, state: 'sending' })
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
-    const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'steering', 'claimed', 'running'].includes(job.state))
+    const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && inJobGroup('stoppable', job.state))
     conversations[conversationId] = {
       origin: { kind: 'network' },
       messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
-      replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
-        || ['publishing', 'completed', 'failed', 'interrupted'].includes(job.state) && job.reply_message_id && job.message_id
+      replying: Boolean(live) || !handedOver && jobs.some((job) => inJobGroup('unfinished', job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
+        || inJobGroup('produced', job.state) && job.reply_message_id && job.message_id
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
