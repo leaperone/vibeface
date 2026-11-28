@@ -4,8 +4,8 @@ use super::super::{
     input::{input_from_event, resolve_with_graph, target_task, workspace_input_from},
     overview,
     query::{bot_scope, graph_at, read_graph},
-    validation::valid_roots,
 };
+use crate::workspace::validation::valid_roots;
 use crate::{
     scheduling::SessionScope,
     store::log,

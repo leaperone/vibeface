@@ -2,6 +2,7 @@ use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub use vibeface_bridge::failure::FailureKind;
+use vibeface_protocol::workspace::{InputIntent, InputTarget, WorkspaceCommand};
 pub use vibeface_protocol::workspace::{SubagentProgress, WorkSubagent};
 
 pub type NetworkId = String;
@@ -901,8 +902,8 @@ pub enum EventBody {
     },
     InputPosted {
         message_id: String,
-        target: crate::workspace::InputTarget,
-        intent: crate::workspace::InputIntent,
+        target: InputTarget,
+        intent: InputIntent,
         sequence: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_revision: Option<u64>,
@@ -916,7 +917,7 @@ pub enum EventBody {
     },
     WorkspaceCommanded {
         command_id: String,
-        command: crate::workspace::WorkspaceCommand,
+        command: WorkspaceCommand,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acting_assignment: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -986,7 +987,7 @@ pub enum EventBody {
     QuestionAsked {
         question_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<crate::workspace::InputTarget>,
+        target: Option<InputTarget>,
         attention: AttentionRequest,
         severity: Severity,
         text: String,
@@ -1344,7 +1345,7 @@ pub struct Conversation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub message_id: String,
-    pub target: Option<crate::workspace::InputTarget>,
+    pub target: Option<InputTarget>,
     pub role: Role,
     pub text: String,
     pub event_hash: EventHash,
@@ -1368,7 +1369,7 @@ pub struct Notification {
     pub notification_id: String,
     pub conversation_id: ScopeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<crate::workspace::InputTarget>,
+    pub target: Option<InputTarget>,
     /// The original message or `question:<id>` within its target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,

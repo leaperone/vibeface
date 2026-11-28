@@ -1,4 +1,5 @@
 //! Personal workspace commands and projections share the signed event log.
+pub(crate) mod validation;
 use crate::{
     model::{DeviceId, EventHash, ScopeId},
     scheduling::SessionScope,

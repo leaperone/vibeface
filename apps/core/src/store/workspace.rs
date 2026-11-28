@@ -8,7 +8,6 @@ mod input;
 pub(crate) mod overview;
 mod query;
 mod resources;
-mod validation;
 
 pub(crate) use assignment::{
     assignment_admission_allowed_from, assignment_work_allowed_from, assignment_work_source_from,
@@ -31,7 +30,6 @@ pub(crate) use query::{
     workspace_task_from,
 };
 pub(crate) use resources::{assignment_resources_available_from, work_resources_available_from};
-pub(crate) use validation::{validate_attachments, validate_command, validate_target};
 
 #[cfg(test)]
 thread_local! {
@@ -59,90 +57,6 @@ fn fresh_main_inputs() -> usize {
 #[cfg(test)]
 fn reset_fresh_main_inputs() {
     FRESH_MAIN_INPUTS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-mod root_path_tests {
-    use super::validation::{overlap, valid_roots};
-
-    #[test]
-    fn accepts_normalized_absolute_paths_for_each_platform() {
-        for path in [
-            "/srv/work",
-            "/srv/项目",
-            "C:\\Users\\dev\\work",
-            "C:\\资料\\项目",
-            "D:/work",
-            "\\\\server\\share\\work",
-            "\\\\?\\C:\\work",
-            "\\\\?\\C:\\work.",
-            "\\\\?\\C:\\work ",
-            "\\\\?\\UNC\\server\\share\\work",
-        ] {
-            assert!(valid_roots(&[path.to_owned()]).is_ok(), "{path}");
-        }
-    }
-
-    #[test]
-    fn rejects_relative_and_noncanonical_paths_for_each_platform() {
-        for path in [
-            "relative/work",
-            "/srv/./work",
-            "/srv/../work",
-            "/srv//work",
-            "/srv/work/",
-            "C:work",
-            "C:\\work\\..\\other",
-            "C:\\work/../other",
-            "C:/work\\..\\other",
-            "C:\\work\\",
-            "C:\\work.",
-            "C:\\work ",
-            "C:/work./repo",
-            "\\\\.\\share\\work",
-            "\\\\server\\..\\work",
-            "\\\\server\\share\\..\\work",
-            "\\\\server\\share\\work\\\\x",
-            "\\\\server\\share\\work.",
-            "\\\\server.\\share\\work",
-            "/srv/wo\u{7}rk",
-        ] {
-            assert!(valid_roots(&[path.to_owned()]).is_err(), "{path:?}");
-        }
-    }
-
-    #[test]
-    fn overlap_uses_portable_components() {
-        assert!(overlap("C:\\Work\\repo", "c:\\work"));
-        assert!(overlap("\\\\?\\C:\\Work\\repo", "C:/work"));
-        assert!(!overlap("\\\\?\\C:\\work.", "C:\\work"));
-        assert!(!overlap("\\\\?\\C:\\work ", "C:\\work"));
-        assert!(!overlap("C:\\Work", "D:\\Work"));
-        assert!(overlap("/srv/work", "/srv/work/repo"));
-        assert!(!overlap("/srv/work", "/srv/worker"));
-        assert!(overlap("\\\\server\\share\\work", "\\\\server\\share"));
-        assert!(overlap(
-            "\\\\?\\UNC\\server\\share\\work",
-            "\\\\server\\share"
-        ));
-        assert!(!overlap(
-            "\\\\server\\share\\work",
-            "\\\\other\\share\\work"
-        ));
-    }
-
-    #[test]
-    fn windows_unicode_case_aliases_overlap_without_normalization_or_expansion() {
-        assert!(overlap("C:\\Ä\\repo", "c:\\ä"));
-        assert!(overlap("\\\\SÉRVER\\SHÄRE\\repo", "\\\\sérver\\shäre"));
-        assert!(overlap("\\\\?\\C:\\Ä\\repo", "C:\\ä"));
-        assert!(overlap("C:\\Σ\\repo", "c:\\ς"));
-
-        assert!(!overlap("C:\\Straße", "c:\\STRASSE"));
-        assert!(!overlap("C:\\Ä", "C:\\A\u{0308}"));
-        assert!(!overlap("/srv/Ä", "/srv/ä"));
-        assert!(!overlap("C:\\ä", "C:\\ä-repo"));
-    }
 }
 
 #[cfg(test)]

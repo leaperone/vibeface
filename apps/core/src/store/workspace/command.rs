@@ -7,8 +7,8 @@ use super::{
     },
     query::{bot_scope, read_graph},
     resources::{ResourceQuery, resource_conflicts_from},
-    validation::valid_id,
 };
+use crate::workspace::validation::valid_id;
 use crate::{
     crypto::{LocalIdentity, request_key},
     model::{Attachment, Attestation, Cause, EventBody},

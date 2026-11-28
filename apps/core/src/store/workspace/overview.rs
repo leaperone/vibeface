@@ -8,8 +8,8 @@ use super::{
     graph::Graph,
     input::{queued_workspace_input_with_graph, resolve_input_target_with_graph},
     resources::assignment_resources_available_with_graph,
-    validation::overlap,
 };
+use crate::workspace::validation::overlap;
 use crate::{
     scheduling::{SchedulerJob, SessionScope},
     workspace::{Assignment, InputTarget, QueuedInput, ResolvedInputTarget},

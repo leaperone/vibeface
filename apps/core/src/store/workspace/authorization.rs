@@ -5,8 +5,8 @@ use super::{
     graph::{Graph, direct_parent},
     input::{resolve_with_graph, target_task, workspace_input_from},
     query::{bot_scope, graph_at, owner_at, read_graph},
-    validation::validate_target,
 };
+use crate::workspace::validation::validate_target;
 use crate::{
     crypto::request_key,
     model::{Event, EventBody, FailureKind, ReplyStatus, Role, VersionVector, WorkOutcome},

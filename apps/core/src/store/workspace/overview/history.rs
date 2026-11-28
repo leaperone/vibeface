@@ -1,6 +1,7 @@
 //! Historical task reads retain the complete influence component, then use Graph::record.
 //! The prepass reads identities and resource roots only, never event text/prompts/results.
-use super::super::{graph::Graph, query::projection_basis, validation::overlap};
+use super::super::{graph::Graph, query::projection_basis};
+use crate::workspace::validation::overlap;
 use crate::{
     model::{Event, SignedEvent},
     store::log,

@@ -1,8 +1,6 @@
 //! Scope-bound, authenticated cursors. Reads never mutate projections or replay events.
-use super::{
-    query::{history_speaker, read_graph},
-    validation::valid_id,
-};
+use super::query::{history_speaker, read_graph};
+use crate::workspace::validation::valid_id;
 use crate::{
     model::EventBody,
     store::{Store, log},
