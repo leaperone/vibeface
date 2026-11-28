@@ -25,7 +25,7 @@ export function cachedConversation(record: CachedConversation, pending: readonly
   }
   const conversation: Conversation = {
     messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden,
-    unread: null, works: [], replying: false, status: null, stoppable: false,
+    unread: null, replying: false, status: null, stoppable: false,
     blocked: '本地记录可查看，连上并同步后继续发送。', origin: { kind: 'cache', savedAt: record.savedAt },
   }
   projections.set(payload, { conversationId: record.conversationId, savedAt: record.savedAt, pending: own, conversation })

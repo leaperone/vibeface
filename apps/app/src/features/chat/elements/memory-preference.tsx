@@ -9,7 +9,7 @@ import { Textarea } from '@vibeface/uiarc/textarea/textarea.tsx'
 import { Popover,PopoverClose,PopoverContent,PopoverTrigger } from '@vibeface/uiarc/popover/popover.tsx'
 import { MoreHorizontal } from 'lucide-react'
 import { useState } from 'react'
-import type { ChatMessage } from './message'
+import type { ChatMessage } from '@vibeface/client/chat/types.ts'
 
 type Draft = { memoryId: string; base: MemoryBase; text: string; result: MemoryControlResult | null; scope: string }
 

@@ -192,6 +192,25 @@ export const jobStates = {
 } as const
 export type JobState = keyof typeof jobStates
 export function isJobState(state: string): state is JobState { return Object.hasOwn(jobStates, state) }
+const unfinishedJob = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling'] as const
+/** The groups of job states the chat reads, one per meaning, so every screen asks the same question the same way. */
+export const jobGroups = {
+  /** Not settled yet: the bot counts as busy with it. */
+  unfinished: unfinishedJob,
+  /** Still able to add text to the live stream. */
+  streaming: [...unfinishedJob, 'publishing'],
+  /** Holding a reply turn right now. */
+  replying: ['claimed', 'steering', 'running', 'cancelling'],
+  /** Executing on a device right now. */
+  executing: ['steering', 'claimed', 'running'],
+  /** Not started or running, so stopping still applies. */
+  stoppable: ['queued', 'steering', 'claimed', 'running'],
+  /** A message waiting behind the running reply, or being taken into it. */
+  held: ['pending_delivery', 'queued', 'steering'],
+  /** Done producing a reply that may not have synced to this device yet. */
+  produced: ['publishing', 'completed', 'failed', 'interrupted'],
+} as const satisfies Record<string, readonly JobState[]>
+export const inJobGroup = (group: keyof typeof jobGroups, state: string) => (jobGroups[group] as readonly string[]).includes(state)
 /** A steered input settles separately from the reply whose stream it joined. */
 export const isReplyEnded = (state: string) => isJobState(state) && jobStates[state].phase === 'ended'
 export const isTerminalJobState = (state: string) => isReplyEnded(state) || state === 'steered'

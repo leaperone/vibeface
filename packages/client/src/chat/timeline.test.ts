@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chatTimeline, chatUpdates, firstUnread, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
+import type { ManagerJob } from "../workspace/types.ts"
+import { chatTimeline, firstUnread, heldMessages, mergedOutcomes, sameReplyText, unrepliedFailures, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
 
 const minute = 60_000
 const at = (hour: number, min: number, day = 30) => new Date(2026, 9, day, hour, min, 5).getTime()
@@ -140,12 +141,25 @@ test("another bot's message counts as unread and starts 新消息", () => {
   assert.equal(firstUnread(timeline, new Set(["h-b1"]), () => false), timeline.messages[1])
 })
 
+test('a streamed reply and its stored copy are one reply whichever side is ahead; blank text never matches', () => {
+  assert.equal(sameReplyText('已完成第一步', '已完成第一步，第二步'), true)
+  assert.equal(sameReplyText('  已完成第一步，第二步', '已完成第一步 '), true)
+  assert.equal(sameReplyText('已完成', '换个说法'), false)
+  assert.equal(sameReplyText('', '任何内容'), false)
+})
 
-test('returning summary deduplicates unread results and keeps unknown execution separate', () => {
-  const completed = { ...message('done', 1, 1, 'ask'), status: 'completed' as const, text: '草稿已完成\n尚未测试' }
-  const unknown = { ...message('unknown', 2, 2, 'ask'), text: '已有进展' }
-  const read = { ...message('read', 3, 3, 'ask'), text: '旧回复' }
-  const changes = chatUpdates([completed, completed, unknown, read], [{ trigger: 'attempt', scope: { kind: 'main' }, state: 'reconciling', reply_message_id: 'unknown' }], new Set([completed.event_hash, unknown.event_hash]))
-  assert.deepEqual(changes, [{ id: 'done', text: '草稿已完成', state: '已回复' }, { id: 'unknown', text: '已有进展', state: '结果待确认' }])
-  assert.ok(changes.every((change) => !change.state.includes('测试')))
+test('a running reply holds later messages as queued or merging; nothing is held without one, and merged keeps its outcome', () => {
+  const job = (message_id: string, state: ManagerJob['state'], outcome?: ManagerJob['outcome']) => ({ message_id, state, outcome })
+  assert.deepEqual([...heldMessages([job('a', 'queued'), job('b', 'steering')])], [['a', 'queued'], ['b', 'merging']])
+  assert.deepEqual([...heldMessages([job('r', 'running'), job('a', 'queued'), job('b', 'steering'), job('c', 'pending_delivery')])], [['a', 'queued'], ['b', 'merging'], ['c', 'queued']])
+  assert.equal(heldMessages([job('r', 'running'), job('d', 'completed')]).has('d'), false)
+  assert.deepEqual([...mergedOutcomes([job('a', 'steered', 'answered'), job('b', 'completed')])], [['a', 'answered']])
+})
+
+test('a failed or rejected turn without its own reply sits after the shown message it answered', () => {
+  const job = (message_id: string | undefined, state: ManagerJob['state'], reply_message_id?: string) => ({ message_id, state, reply_message_id })
+  const messages = [{ message_id: 'ask' }, { message_id: 'replied' }, { message_id: 'answer' }]
+  const failures = unrepliedFailures([job('ask', 'failed'), job('ask', 'rejected'), job('replied', 'failed', 'answer'), job('gone', 'failed'), job(undefined, 'failed'), job('ask', 'completed')], messages)
+  assert.deepEqual([...failures.keys()], ['ask'])
+  assert.deepEqual(failures.get('ask')?.map((item) => item.state), ['failed', 'rejected'])
 })

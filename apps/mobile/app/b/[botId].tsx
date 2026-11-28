@@ -12,7 +12,7 @@ import { useCSSVariable, withUniwind } from 'uniwind'
 import { awaitsDevice, botReach, botCanSend, composerHint, inputTargetKey, inputIntentLabel, promptIntent, replyUnsettled, starterExamples, reachDevice } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
-import { messageTimes } from '@vibeface/client/chat/timeline.ts'
+import { heldMessages, mergedOutcomes, messageTimes, sameReplyText } from '@vibeface/client/chat/timeline.ts'
 import { routineState } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples, useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -32,7 +32,7 @@ import { Text } from '@/components/arc/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
-import type { InputTarget, ManagerJob, Question } from '@vibeface/client/workspace/types.ts'
+import { inJobGroup, type InputTarget, type ManagerJob, type Question } from '@vibeface/client/workspace/types.ts'
 import type { ReadAttachment } from '@/features/chat/attachments'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
@@ -64,18 +64,13 @@ function awayFromLatest(event: NativeScrollEvent, inset: Pick<NativeScrollEvent[
  * Only messages and questions: questions sit right before the first message written after them, 新消息 above what the badge counted and a
  * reply that never came as one line after its message; the newest entry is first for the inverted list. The rest is on the activity page.
  */
-/** As on the web: a message sent while the bot replies waits behind it, or is taken into the running turn; a merged one keeps the outcome. */
-function delivered(message: ChatMessage, jobs: readonly ManagerJob[], replying: boolean): ChatMessage {
-  if (message.role !== 'user' || message.state) return message
-  const own = jobs.filter((job) => job.message_id === message.message_id)
-  if (replying && own.some((job) => ['pending_delivery', 'queued', 'steering'].includes(job.state))) return { ...message, state: own.some((job) => job.state === 'steering') ? 'merging' : 'queued' }
-  const steered = own.find((job) => job.state === 'steered')
-  return steered ? { ...message, state: 'merged', merged: steered.outcome } : message
-}
-
 function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: FaceBot, offline: boolean, jobs: readonly ManagerJob[]): Entry[] {
   const rows: Entry[] = []
-  const replying = jobs.some((job) => ['claimed', 'steering', 'running', 'cancelling'].includes(job.state))
+  // As on the web: a message sent while the bot replies waits behind it, or is taken into the running turn; a merged one keeps the outcome.
+  const held = heldMessages(jobs), merged = mergedOutcomes(jobs)
+  const delivered = (message: ChatMessage): ChatMessage => message.role !== 'user' || message.state ? message
+    : held.has(message.message_id) ? { ...message, state: held.get(message.message_id) }
+    : merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message
   const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
@@ -85,15 +80,14 @@ function entries(chat: Conversation, failures: ReadonlyMap<string, Row[]>, bot: 
     return `turn:${message.in_reply_to}`
   }
   // A streamed reply whose final text is already in the history is the same reply: draw it once, whichever side is behind.
-  const same = (a: string, b: string) => a.trim() !== '' && b.trim() !== '' && (a.trim().startsWith(b.trim()) || b.trim().startsWith(a.trim()))
   const messages = chat.messages.filter((message) => message.state !== 'streaming' || !message.in_reply_to || !chat.messages.some((other) => other.role === 'assistant'
-    && other.state !== 'streaming' && other.in_reply_to === message.in_reply_to && same(other.text, message.text)))
+    && other.state !== 'streaming' && other.in_reply_to === message.in_reply_to && sameReplyText(other.text, message.text)))
   const times = messageTimes(messages.filter((message) => !message.state && !chat.hidden.has(message.message_id)), Date.now())
   for (const message of messages) {
     rows.push(...(chat.before.get(message.message_id) ?? []).map(question))
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.time && previous.message.role === message.role
-    if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message: delivered(message, jobs, replying), time: times.get(message.message_id), grouped })
+    if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message: delivered(message), time: times.get(message.message_id), grouped })
     rows.push(...(failures.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   }
   rows.push(...chat.rest.map(question))
@@ -308,7 +302,7 @@ export default function ChatScreen() {
   // Supplementing a work happens on its own page; this composer sends to the main chat, or to the routine it was opened for.
   const targetOption: { label: string; target: InputTarget } = routineTrigger ? { label: `例行任务 · ${scheduleName(routineTrigger, live?.data?.bot_settings, live?.data?.changes)}`, target: { kind: 'routine' as const, bot_id: bot.bot_id, trigger: routineTrigger } } : { label: bot.name, target: { kind: 'bot_main' as const, bot_id: bot.bot_id } }
   const inputTarget = targetOption.target
-  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && ['queued', 'steering', 'claimed', 'running'].includes(job.state))) : Boolean(chat?.replying)
+  const targetBusy = inputTarget.kind === 'routine' ? Boolean(live?.data?.scopeJobs.some((job) => job.trigger === inputTarget.trigger && inJobGroup('stoppable', job.state))) : Boolean(chat?.replying)
   const changeTarget = async (inputTarget: string) => {
     const scope = draftScopeKey
     const current = () => routeActive.current && currentScope.current === scope && latestLive.current?.generation === liveGeneration
@@ -359,7 +353,7 @@ export default function ChatScreen() {
     })
   }
   // A turn already executing has a device running it, whatever this phone's device list says; a queued one does not.
-  const executing = jobs?.some((job) => ['steering', 'claimed', 'running'].includes(job.state))
+  const executing = jobs?.some((job) => inJobGroup('executing', job.state))
   const setupHint = !offline && !executing && rows.length && (reach === 'needs_setup' || reach === 'none' || reach === 'offline') ? composerHint({ hasConversation: true, loaded: Boolean(chat), bot: reach }) : ''
   unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)

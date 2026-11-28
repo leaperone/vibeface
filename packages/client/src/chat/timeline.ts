@@ -1,25 +1,35 @@
 import { placeByTime } from "../workspace/questions.ts"
-import type { ManagerJob, NotificationRecord, WorkRecord } from "../workspace/types.ts"
+import { inJobGroup, type ManagerJob, type NotificationRecord, type WorkRecord } from "../workspace/types.ts"
 import { scheduleTrigger } from "../workspace/bot-settings.ts"
-import { replyStatusLabel } from "./protocol.ts"
 import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
 
-/** Only actual unread replies; completion is separate from any verification stated inside them. */
-export function chatUpdates(messages: readonly TranscriptMessage[], jobs: readonly ManagerJob[], fresh: ReadonlySet<string>) {
-  if (!fresh.size) return []
-  const seen = new Set<string>()
-  return messages.filter((message) => {
-    if (message.role !== 'assistant' || !fresh.has(message.event_hash) || seen.has(message.event_hash)) return false
-    seen.add(message.event_hash)
-    return true
-  }).map((message) => ({
-    id: message.message_id,
-    text: message.text.trim().split('\n')[0]?.slice(0, 160) || '查看原回复',
-    state: jobs.some((job) => job.reply_message_id === message.message_id && (job.pending_check || job.state === 'reconciling')) ? '结果待确认'
-      : message.status === 'completed' ? '已回复' : replyStatusLabel(message.status) || '新回复',
-  }))
+/** A streamed reply and a stored one are the same reply when either is the start of the other; either side may be a few characters ahead. */
+export function sameReplyText(a: string, b: string) {
+  const left = a.trim(), right = b.trim()
+  return left !== '' && right !== '' && (left.startsWith(right) || right.startsWith(left))
+}
+
+/** The outcome each message got when it was taken into a running reply. */
+export function mergedOutcomes(jobs: readonly Pick<ManagerJob, "message_id" | "state" | "outcome">[]) {
+  return new Map(jobs.flatMap((job) => job.state === 'steered' && job.message_id ? [[job.message_id, job.outcome] as const] : []))
+}
+
+/** Reply turns that failed or were rejected without a reply of their own in the history, by the shown message they answered. */
+export function unrepliedFailures<J extends Pick<ManagerJob, "message_id" | "reply_message_id" | "state">>(jobs: readonly J[], messages: readonly { message_id: string }[]) {
+  const shown = new Set(messages.map((message) => message.message_id))
+  const failures = new Map<string, J[]>()
+  for (const job of jobs) if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) failures.set(job.message_id, [...failures.get(job.message_id) ?? [], job])
+  return failures
+}
+
+/** The person's messages a running reply holds: waiting behind it, or being taken into it. None while no reply runs. */
+export function heldMessages(jobs: readonly Pick<ManagerJob, "message_id" | "state">[]) {
+  const held = new Map<string, 'queued' | 'merging'>()
+  if (!jobs.some((job) => inJobGroup('replying', job.state))) return held
+  for (const job of jobs) if (job.message_id && inJobGroup('held', job.state)) held.set(job.message_id, job.state === 'steering' || held.get(job.message_id) === 'merging' ? 'merging' : 'queued')
+  return held
 }
 
 /** The Node's order, the same on every device; a message without a rank yet keeps its place after the ranked ones. */

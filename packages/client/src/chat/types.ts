@@ -1,5 +1,5 @@
 import type { FailureKind } from "../lib/errors.ts"
-import type { InputIntent, InputReceipt, InputTarget } from "../workspace/types.ts"
+import type { InputIntent, InputReceipt, InputTarget, SteerOutcome } from "../workspace/types.ts"
 import type { OutboxRecord } from "../lib/outbox.ts"
 
 export type ReplyStatus = "completed" | "stopped" | "interrupted" | "failed"
@@ -26,6 +26,11 @@ export type TranscriptMessage = {
   sender?: { conversation_id: string; name: string }
   target?: InputTarget
 }
+/**
+ * A transcript message as a chat draws it, or one shown before the network holds it: `sending`, `streaming` or `interrupted`,
+ * or a message waiting behind the running reply (`queued`), being taken into it (`merging`), or `merged` with `merged` as the outcome.
+ */
+export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 export type PendingMessage = {
   message_id: string
   conversation_id: string

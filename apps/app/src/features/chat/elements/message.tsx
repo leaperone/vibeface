@@ -3,17 +3,15 @@ import { Markdown,PlainText } from '@/components/app/markdown'
 import styles from "@/components/arc/conversation.module.css"
 import { ActionButton } from '@/features/workspace/present'
 import { deliveryMark as markOf,messageKey,replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
-import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
+import type { ChatMessage } from '@vibeface/client/chat/types.ts'
 import { failureText,replyFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import type { SteerOutcome } from '@vibeface/client/workspace/types.ts'
 import { Button } from '@vibeface/uiarc/button/button.tsx'
 import { Bot,CalendarClock,ChevronDown,ChevronUp,CirclePause,CircleQuestionMark,CircleX,Clock,LoaderCircle,Merge,RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { Artifact } from './artifact'
 import { MemoryPreference } from './memory-preference'
 
-export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
 function deliveryMark(message: ChatMessage) {
   const mark = markOf(message.state, message.merged)

@@ -1,7 +1,7 @@
 import type { OwnedPickedFile } from '../platform/files'
-import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
+import type { ChatMessage as TranscriptChatMessage } from '@vibeface/client/chat/types.ts'
 import type { useDevice } from '@vibeface/client/identity/context.tsx'
-import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question, SteerOutcome, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AnswerResult, BotReadiness, BotRecord, InputOptions, Question } from '@vibeface/client/workspace/types.ts'
 
 export type { Question }
 
@@ -17,11 +17,8 @@ export type Session =
   | { phase: 'joining'; code: string | null; admin?: string }
   | { phase: 'ready' }
 
-/**
- * A transcript message, or one this phone shows before the network holds it. `detail`: a failed reply's original error from the device.
- * `queued`/`merging`/`merged`: as on the web, a message waiting behind the running reply, taken into it, or merged with `merged` as the outcome.
- */
-export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome; detail?: string }
+/** The shared chat message; `detail`: a failed reply's original error from the device. */
+export type ChatMessage = TranscriptChatMessage & { detail?: string }
 
 /**
  * One bot's chat as the screen draws it. `status`: the live progress word while a reply runs.
@@ -38,7 +35,6 @@ export type Conversation = {
   hidden: ReadonlySet<string>
   /** The row 新消息 sits above: what this chat's badge counted, from its first in the order shown. */
   unread: string | null
-  works: WorkRecord[]
   replying: boolean
   status: string | null
   stoppable: boolean

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { mergeOwnerJobs, parseHistoryPage } from './model.ts'
+import { inJobGroup, jobGroups, isJobState } from './types.ts'
 
 function managerJob(value: unknown) {
   const page = parseHistoryPage({ conversation_id: 'chat', history_authority: 'owner', section: 'jobs',
@@ -56,4 +60,24 @@ test('manager and scoped jobs accept the declared observation states and reject 
     assert.throws(() => managerJob({ ...job, state }))
     assert.throws(() => readScoped(state))
   }
+})
+
+test('job state groups name real states, and chat screens use the shared chat helpers instead of their own copies', () => {
+  for (const [group, states] of Object.entries(jobGroups)) for (const state of states) assert.ok(isJobState(state), `${group} lists ${state}`)
+  assert.equal(inJobGroup('replying', 'running'), true)
+  assert.equal(inJobGroup('replying', 'queued'), false)
+  const root = fileURLToPath(new URL('../../../../', import.meta.url))
+  const chatSources = ['apps/mobile/app/b/[botId].tsx', 'apps/mobile/src/data/live.tsx', 'apps/mobile/src/data/cached.ts', 'apps/mobile/src/features/chat', 'apps/app/src/features/chat', 'apps/app/src/components/arc/conversation-thread.tsx']
+  const files = (path: string): string[] => statSync(join(root, path)).isDirectory() ? readdirSync(join(root, path)).flatMap((name) => files(join(path, name))) : /\.tsx?$/.test(path) && !path.endsWith('.test.ts') ? [path] : []
+  const canonical = [
+    { rule: 'job state lists come from jobGroups', pattern: /\[[^\]]*['"][a-z_]+['"][^\]]*\]\s*\.includes\(\s*job\.state\s*\)|\b(busyStates|streamingStates)\b/ },
+    { rule: 'streamed and stored replies are compared by sameReplyText', pattern: /\.trim\(\)\.startsWith\([^)]*\.trim\(\)/ },
+    { rule: 'merged and held messages come from mergedOutcomes and heldMessages', pattern: /state === ['"]steered['"]/ },
+    { rule: 'failure rows come from unrepliedFailures', pattern: /state [!=]== ['"]failed['"] [&|]{2} job\.state [!=]== ['"]rejected['"]/ },
+  ]
+  const offenders = chatSources.flatMap(files).flatMap((path) => {
+    const source = readFileSync(join(root, path), 'utf8')
+    return canonical.filter(({ pattern }) => pattern.test(source)).map(({ rule }) => `${path}: ${rule}`)
+  })
+  assert.deepEqual(offenders, [], 'chat screens use the client chat helpers instead of their own copies')
 })
