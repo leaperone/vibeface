@@ -53,7 +53,8 @@ impl Runtime {
             let signed: crate::model::SignedEvent = serde_json::from_str(&envelope)?;
             let event = crate::crypto::check_event(&network, &signed)?;
             crate::crypto::verify_event_signature(&signed, local)?;
-            if event.author == local && event.scope_id == record.conversation
+            if event.author == local
+                && event.scope_id == record.conversation
                 && matches!(&event.body, crate::model::EventBody::WorkDispatched { work_id, kind, .. }
                     if work_id == &record.work_id && kind == &record.kind)
             {
@@ -64,7 +65,10 @@ impl Runtime {
     }
 
     /// Only local stop intent is stored here. Shared events are forbidden after a fork.
-    pub(super) fn hold_execution_fence_stops(store: &mut crate::store::Store, local: &str) -> Result<()> {
+    pub(super) fn hold_execution_fence_stops(
+        store: &mut crate::store::Store,
+        local: &str,
+    ) -> Result<()> {
         let at = now_ms();
         let mut stops: BTreeSet<_> = store
             .stop_requests()?
@@ -90,21 +94,27 @@ impl Runtime {
     /// Provider waits never hold Store, manager controls, or input admission locks.
     pub(super) async fn reconcile_execution_fence(&self) -> Result<()> {
         let local = self.identity.device_id()?;
-        let records = self.store.call("execution_fence", move |store| {
-            if let Err(error) = Self::hold_execution_fence_stops(store, &local) {
-                tracing::warn!(%error, "execution fence could not retain local stop intent");
-            }
-            Self::execution_fence_works(store, &local)
-        }).await?;
+        let records = self
+            .store
+            .call("execution_fence", move |store| {
+                if let Err(error) = Self::hold_execution_fence_stops(store, &local) {
+                    tracing::warn!(%error, "execution fence could not retain local stop intent");
+                }
+                Self::execution_fence_works(store, &local)
+            })
+            .await?;
         futures_util::stream::iter(records)
-        .for_each_concurrent(8, |record| async move {
-            if let Err(error) = self.stop_fenced_work(record).await {
-                tracing::debug!(%error, "execution fence stop awaits provider confirmation");
-            }
-        })
-        .await;
+            .for_each_concurrent(8, |record| async move {
+                if let Err(error) = self.stop_fenced_work(record).await {
+                    tracing::debug!(%error, "execution fence stop awaits provider confirmation");
+                }
+            })
+            .await;
         // Receipts remain queryable, but cannot become queued inputs on this copy.
-        let jobs = self.store.call("fenced_steering_jobs", |store| store.steering_jobs()).await?;
+        let jobs = self
+            .store
+            .call("fenced_steering_jobs", |store| store.steering_jobs())
+            .await?;
         for job in jobs {
             if let JobState::Steering { into, .. } = &job.state {
                 let _ = tokio::time::timeout(
@@ -203,79 +213,83 @@ impl Runtime {
             }
         }
         let identity = self.identity.clone();
-        let changes = self.store.call("fence_revoked_permissions", move |store| {
-        let Some(network) = store.network()? else {
-            return Ok(None);
-        };
-        let mut changed_jobs = Vec::new();
-        let mut changed_works = Vec::new();
-        if management_revoked {
-            for job in store.scheduler_jobs_all()? {
-                if matches!(
-                    job.state,
-                    JobState::Claimed { .. } | JobState::Running { .. }
-                ) {
-                    store.request_manager_cancel(
-                        &identity,
-                        &network,
-                        &job.conversation_id,
-                        &job.trigger,
-                    )?;
-                    changed_jobs.push((job.conversation_id, job.trigger));
+        let changes = self
+            .store
+            .call("fence_revoked_permissions", move |store| {
+                let Some(network) = store.network()? else {
+                    return Ok(None);
+                };
+                let mut changed_jobs = Vec::new();
+                let mut changed_works = Vec::new();
+                if management_revoked {
+                    for job in store.scheduler_jobs_all()? {
+                        if matches!(
+                            job.state,
+                            JobState::Claimed { .. } | JobState::Running { .. }
+                        ) {
+                            store.request_manager_cancel(
+                                &identity,
+                                &network,
+                                &job.conversation_id,
+                                &job.trigger,
+                            )?;
+                            changed_jobs.push((job.conversation_id, job.trigger));
+                        }
+                    }
                 }
-            }
-        }
-        let local = identity.device_id()?;
-        let at = now_ms();
-        let mut stops: BTreeSet<_> = store
-            .stop_requests()?
-            .into_iter()
-            .map(|request| request.work_id)
-            .collect();
-        for record in store.work_records()? {
-            if record.state.finished() {
-                continue;
-            }
-            let work = store
-                .work(&network, &record.work_id)?
-                .context("active work permission scope missing")?;
-            let cwd = Path::new(&work.cwd).canonicalize();
-            // An inaccessible cwd cannot prove that its directory grant was retained.
-            let removed_root = roots_narrowed
-                && cwd.as_ref().map_or(true, |cwd| {
-                    previous_roots.iter().any(|root| cwd.starts_with(root))
-                        && !next_roots.iter().any(|root| cwd.starts_with(root))
-                });
-            match record.kind {
-                WorkKind::Task if manager_disabled || removed_root => {
-                    let trigger = task_trigger(&record.work_id);
-                    store.request_manager_cancel(
-                        &identity,
-                        &network,
-                        &record.conversation,
-                        &trigger,
-                    )?;
-                    changed_jobs.push((record.conversation.clone(), trigger));
+                let local = identity.device_id()?;
+                let at = now_ms();
+                let mut stops: BTreeSet<_> = store
+                    .stop_requests()?
+                    .into_iter()
+                    .map(|request| request.work_id)
+                    .collect();
+                for record in store.work_records()? {
+                    if record.state.finished() {
+                        continue;
+                    }
+                    let work = store
+                        .work(&network, &record.work_id)?
+                        .context("active work permission scope missing")?;
+                    let cwd = Path::new(&work.cwd).canonicalize();
+                    // An inaccessible cwd cannot prove that its directory grant was retained.
+                    let removed_root = roots_narrowed
+                        && cwd.as_ref().map_or(true, |cwd| {
+                            previous_roots.iter().any(|root| cwd.starts_with(root))
+                                && !next_roots.iter().any(|root| cwd.starts_with(root))
+                        });
+                    match record.kind {
+                        WorkKind::Task if manager_disabled || removed_root => {
+                            let trigger = task_trigger(&record.work_id);
+                            store.request_manager_cancel(
+                                &identity,
+                                &network,
+                                &record.conversation,
+                                &trigger,
+                            )?;
+                            changed_jobs.push((record.conversation.clone(), trigger));
+                        }
+                        WorkKind::Agent(provider)
+                            if (removed_root || execution.contains(&provider))
+                                && stops.insert(record.work_id.clone()) =>
+                        {
+                            store.save_stop_request(&StopRequest {
+                                work_id: record.work_id.clone(),
+                                conversation: record.conversation.clone(),
+                                target: local.clone(),
+                                requested_at_ms: at,
+                                deadline_ms: at
+                                    + super::work::STOP_DELIVERY_TIMEOUT.as_millis() as i64,
+                                timed_out: false,
+                            })?;
+                        }
+                        _ => continue,
+                    }
+                    changed_works.push((record.conversation, record.work_id));
                 }
-                WorkKind::Agent(provider)
-                    if (removed_root || execution.contains(&provider))
-                        && stops.insert(record.work_id.clone()) =>
-                {
-                    store.save_stop_request(&StopRequest {
-                        work_id: record.work_id.clone(),
-                        conversation: record.conversation.clone(),
-                        target: local.clone(),
-                        requested_at_ms: at,
-                        deadline_ms: at + super::work::STOP_DELIVERY_TIMEOUT.as_millis() as i64,
-                        timed_out: false,
-                    })?;
-                }
-                _ => continue,
-            }
-            changed_works.push((record.conversation, record.work_id));
-        }
-        Ok(Some((network, changed_jobs, changed_works)))
-        }).await?;
+                Ok(Some((network, changed_jobs, changed_works)))
+            })
+            .await?;
         if let Some((network, jobs, works)) = changes {
             for (scope, trigger) in jobs {
                 self.publish_changed(&network, &scope, Changed::Job(&trigger));
@@ -363,7 +377,11 @@ mod tests {
                 .insert(Provider::Pi, PathBuf::from("/fixture/pi"));
         }
         bot(node, admin, "c", "Ops", &[]).await?;
-        let network = node.store.call("fixture_network", |store| store.network()).await?.context("network")?;
+        let network = node
+            .store
+            .call("fixture_network", |store| store.network())
+            .await?
+            .context("network")?;
         let (trigger, attempt) = start_reply(node, admin, "m1").await?;
         let cancel = node
             .register_manager_attempt_fixture(
@@ -420,78 +438,138 @@ mod tests {
         let identity = node.identity.clone();
         let network = network.to_owned();
         let work_id = work_id.to_owned();
-        let actual_cwd = cwd.canonicalize()?.to_str().context("fixture cwd")?.to_owned();
+        let actual_cwd = cwd
+            .canonicalize()?
+            .to_str()
+            .context("fixture cwd")?
+            .to_owned();
         let fixture_target = target.clone();
         let epoch = node.codex.epoch();
-        node.store.call("fixture_running_work", move |store| {
-        store.accept_work_fixture(&identity, &network, spec.clone(), now_ms())?;
-        store.reserve_work_native_submission(&network, &spec, &actual_cwd, None)?;
-        store.begin_reserved_work_native_input(&network, &spec, &fixture_target.thread_id, &actual_cwd)?;
-        store.apply_work_signal(
-            &identity,
-            &network,
-            &work_id,
-            Signal::TurnStarted {
-                turn_id: fixture_target.turn_id.clone(),
-                epoch,
-            },
-            now_ms(),
-        )?;
-            Ok(())
-        }).await?;
+        node.store
+            .call("fixture_running_work", move |store| {
+                store.accept_work_fixture(&identity, &network, spec.clone(), now_ms())?;
+                store.reserve_work_native_submission(&network, &spec, &actual_cwd, None)?;
+                store.begin_reserved_work_native_input(
+                    &network,
+                    &spec,
+                    &fixture_target.thread_id,
+                    &actual_cwd,
+                )?;
+                store.apply_work_signal(
+                    &identity,
+                    &network,
+                    &work_id,
+                    Signal::TurnStarted {
+                        turn_id: fixture_target.turn_id.clone(),
+                        epoch,
+                    },
+                    now_ms(),
+                )?;
+                Ok(())
+            })
+            .await?;
         Ok(target)
     }
 
     #[tokio::test]
-    async fn lost_write_authority_cancels_managers_and_refuses_existing_and_new_inputs() -> Result<()> {
-        for state in [crate::store::WriteState::Forked, crate::store::WriteState::ReadOnly] {
+    async fn lost_write_authority_cancels_managers_and_refuses_existing_and_new_inputs()
+    -> Result<()> {
+        for state in [
+            crate::store::WriteState::Forked,
+            crate::store::WriteState::ReadOnly,
+        ] {
             let (node, admin, directory) = node().await?;
             let (trigger, attempt, access, cancel) = active_turn(&node, &admin, &directory).await?;
             let network = &access.network_id;
-            let target = running_work(&node, network, &directory, "running", Provider::Codex).await?;
+            let target =
+                running_work(&node, network, &directory, "running", Provider::Codex).await?;
             native_directories(&node, &[("thread-running", &directory)]).await?;
             let held_manager = node.manager_input_lease(&attempt, Provider::Codex).await?;
             let held_work = node.work_input_lease(network, "c", &target).await?;
             let queued = WorkSpec {
-                work_id: "queued".into(), call_ref: "queued".into(),
-                ..provider_work(Provider::Codex, &node.identity.device_id()?, &directory, "queued")
+                work_id: "queued".into(),
+                call_ref: "queued".into(),
+                ..provider_work(
+                    Provider::Codex,
+                    &node.identity.device_id()?,
+                    &directory,
+                    "queued",
+                )
             };
             let before = {
-                let identity = node.identity.clone(); let network = network.clone(); let queued = queued.clone();
-                node.store.call("fixture_queued_work", move |store| {
-                    store.accept_work_fixture(&identity, &network, queued, now_ms())?;
-                    store.version_vector(&network)
-                }).await?
+                let identity = node.identity.clone();
+                let network = network.clone();
+                let queued = queued.clone();
+                node.store
+                    .call("fixture_queued_work", move |store| {
+                        store.accept_work_fixture(&identity, &network, queued, now_ms())?;
+                        store.version_vector(&network)
+                    })
+                    .await?
             };
-            assert!(tokio::time::timeout(Duration::from_secs(1),
-                node.set_write_state(network, &[crate::store::WriteState::Writable], state)).await?);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    node.set_write_state(network, &[crate::store::WriteState::Writable], state)
+                )
+                .await?
+            );
             assert!(*cancel.borrow());
-            assert!(node.manager_input_lease(&attempt, Provider::Codex).await.is_err());
+            assert!(
+                node.manager_input_lease(&attempt, Provider::Codex)
+                    .await
+                    .is_err()
+            );
             assert!(node.manager_tool_lease(&access).await.is_err());
             assert!(node.work_input_lease(network, "c", &target).await.is_err());
             assert!(node.work_start_lease(network, &queued, None).await.is_err());
-            assert!(node.work_first_input_lease(network, &queued, "queued-thread").await.is_err());
-            assert!(node.register_manager_attempt_fixture("late".into(), access.clone(),
-                &attempt, &trigger, Provider::Codex).await.is_err());
+            assert!(
+                node.work_first_input_lease(network, &queued, "queued-thread")
+                    .await
+                    .is_err()
+            );
+            assert!(
+                node.register_manager_attempt_fixture(
+                    "late".into(),
+                    access.clone(),
+                    &attempt,
+                    &trigger,
+                    Provider::Codex
+                )
+                .await
+                .is_err()
+            );
             {
-                let network = network.clone(); let trigger = trigger.clone();
-                node.store.call("fixture_fenced_state", move |store| {
-                assert_eq!(store.version_vector(&network)?, before);
-                assert!(matches!(store.scheduler_job("c", &trigger)?.context("job")?.state,
-                    JobState::Running { .. }));
-                assert!(matches!(store.work_record("queued")?.context("queued work")?.state,
-                    WorkState::Accepted));
-                assert_eq!(store.stop_requests()?.len(), 2);
-                Ok(())
-                }).await?;
+                let network = network.clone();
+                let trigger = trigger.clone();
+                node.store
+                    .call("fixture_fenced_state", move |store| {
+                        assert_eq!(store.version_vector(&network)?, before);
+                        assert!(matches!(
+                            store.scheduler_job("c", &trigger)?.context("job")?.state,
+                            JobState::Running { .. }
+                        ));
+                        assert!(matches!(
+                            store.work_record("queued")?.context("queued work")?.state,
+                            WorkState::Accepted
+                        ));
+                        assert_eq!(store.stop_requests()?.len(), 2);
+                        Ok(())
+                    })
+                    .await?;
             }
             drop(held_work);
             drop(held_manager);
             if state == crate::store::WriteState::ReadOnly {
-                assert!(node.set_write_state(network, &[state], crate::store::WriteState::Writable).await);
+                assert!(
+                    node.set_write_state(network, &[state], crate::store::WriteState::Writable)
+                        .await
+                );
                 assert!(node.manager_tool_lease(&access).await.is_err());
-                assert!(node.work_start_lease(network, &queued, None).await.is_err(),
-                    "restoring write authority cannot replay fenced work");
+                assert!(
+                    node.work_start_lease(network, &queued, None).await.is_err(),
+                    "restoring write authority cannot replay fenced work"
+                );
             }
             drop(node);
             std::fs::remove_dir_all(directory)?;
@@ -503,12 +581,26 @@ mod tests {
     async fn write_authority_loss_at_maximum_epoch_cannot_restore_old_permissions() -> Result<()> {
         let (node, admin, directory) = node().await?;
         let (_, _, access, cancel) = active_turn(&node, &admin, &directory).await?;
-        node.local_permission_epoch.store(u64::MAX, Ordering::Release);
-        assert!(node.set_write_state(&access.network_id, &[crate::store::WriteState::Writable],
-            crate::store::WriteState::ReadOnly).await);
+        node.local_permission_epoch
+            .store(u64::MAX, Ordering::Release);
+        assert!(
+            node.set_write_state(
+                &access.network_id,
+                &[crate::store::WriteState::Writable],
+                crate::store::WriteState::ReadOnly
+            )
+            .await
+        );
         assert!(*cancel.borrow());
-        assert!(!node.set_write_state(&access.network_id, &[crate::store::WriteState::ReadOnly],
-            crate::store::WriteState::Writable).await);
+        assert!(
+            !node
+                .set_write_state(
+                    &access.network_id,
+                    &[crate::store::WriteState::ReadOnly],
+                    crate::store::WriteState::Writable
+                )
+                .await
+        );
         assert!(!node.writable());
         assert!(node.manager_tool_lease(&access).await.is_err());
         drop(node);
@@ -528,55 +620,80 @@ mod tests {
         let (release, waiting) = std::sync::mpsc::channel();
         let held_node = node.clone();
         let holding = tokio::spawn(async move {
-            held_node.store.call("fixture_hold_writer", move |_| {
-                let _ = entered.send(()); waiting.recv()?; Ok(())
-            }).await
+            held_node
+                .store
+                .call("fixture_hold_writer", move |_| {
+                    let _ = entered.send(());
+                    waiting.recv()?;
+                    Ok(())
+                })
+                .await
         });
         held.await?;
         let task_node = node.clone();
         let task = tokio::spawn(async move {
             let controls = task_node.manager_controls.lock().await;
-            task_node.fence_revoked_permissions(&controls, &previous, &next,
-                &providers, &providers).await
+            task_node
+                .fence_revoked_permissions(&controls, &previous, &next, &providers, &providers)
+                .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !*cancel.borrow() { tokio::task::yield_now().await; }
-        }).await?;
+            while !*cancel.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         task.abort();
         assert!(task.await.expect_err("cancelled revocation").is_cancelled());
         release.send(())?;
         holding.await??;
         assert!(node.manager_tool_lease(&access).await.is_err());
-        assert!(node.manager_input_lease(&attempt, Provider::Codex).await.is_err());
+        assert!(
+            node.manager_input_lease(&attempt, Provider::Codex)
+                .await
+                .is_err()
+        );
         drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn fork_before_dispatch_removes_projection_but_stops_owned_turn_without_replay() -> Result<()> {
+    async fn fork_before_dispatch_removes_projection_but_stops_owned_turn_without_replay()
+    -> Result<()> {
         let (node, admin, directory) = node().await?;
         let (_, _, access, cancel) = active_turn(&node, &admin, &directory).await?;
         let network = &access.network_id;
         let identity = node.identity.clone();
         let fixture_network = network.clone();
-        let fork = node.store.call("fixture_pre_dispatch_fork", move |store| {
-            let local = identity.device_id()?;
-            let (_, hash) = store.heads(&fixture_network)?.remove(&local).context("local head")?;
-            let original = store.event(&fixture_network, &hash)?.context("pre-dispatch event")?;
-            let mut event = crate::crypto::check_event(&fixture_network, &original)?;
-            event.created_at_ms += 1;
-            identity.sign_event(event)
-        }).await?;
+        let fork = node
+            .store
+            .call("fixture_pre_dispatch_fork", move |store| {
+                let local = identity.device_id()?;
+                let (_, hash) = store
+                    .heads(&fixture_network)?
+                    .remove(&local)
+                    .context("local head")?;
+                let original = store
+                    .event(&fixture_network, &hash)?
+                    .context("pre-dispatch event")?;
+                let mut event = crate::crypto::check_event(&fixture_network, &original)?;
+                event.created_at_ms += 1;
+                identity.sign_event(event)
+            })
+            .await?;
         running_work(&node, network, &directory, "owned", Provider::Codex).await?;
         let remote = LocalIdentity::generate();
         let mut membership = node.membership_state().await?;
         membership.append(crate::identity::GovernanceEvent::grant(
-            &admin, &membership.project()?, crate::identity::Member::node(&remote, "remote")?,
+            &admin,
+            &membership.project()?,
+            crate::identity::Member::node(&remote, "remote")?,
         )?)?;
         node.install_membership(membership).await?;
         let remote_spec = WorkSpec {
-            work_id: "remote".into(), call_ref: "remote".into(),
+            work_id: "remote".into(),
+            call_ref: "remote".into(),
             thread: Some("thread-remote".into()),
             ..provider_work(Provider::Codex, &remote.device_id()?, &directory, "remote")
         };
@@ -618,29 +735,44 @@ mod tests {
                     json!({"result":{}})
                 }
                 _ => {
-                    assert!(!method.starts_with("turn/"), "a fork cannot submit or replay input");
+                    assert!(
+                        !method.starts_with("turn/"),
+                        "a fork cannot submit or replay input"
+                    );
                     json!({"result":{}})
                 }
             }
-        }).await?;
+        })
+        .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             while node.codex.status().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await?;
+        })
+        .await?;
         let fixture_network = network.clone();
-        let before = node.store.call("fixture_ingest_pre_dispatch_fork", move |store| {
-            assert!(store.work(&fixture_network, "owned")?.is_some());
-            let ingested = store.ingest_events(&fixture_network, &[fork])?;
-            store.settle_local_works(&fixture_network)?;
-            assert_eq!(ingested.statuses, vec![crate::model::IngestStatus::Conflict]);
-            assert!(store.work(&fixture_network, "owned")?.is_none(),
-                "fork reduction must remove the later shared dispatch before fencing");
-            assert!(matches!(store.work_record("owned")?.context("local journal")?.state,
-                WorkState::Running { .. }));
-            assert!(store.work_native_submission_reserved("owned")?);
-            store.version_vector(&fixture_network)
-        }).await?;
+        let before = node
+            .store
+            .call("fixture_ingest_pre_dispatch_fork", move |store| {
+                assert!(store.work(&fixture_network, "owned")?.is_some());
+                let ingested = store.ingest_events(&fixture_network, &[fork])?;
+                store.settle_local_works(&fixture_network)?;
+                assert_eq!(
+                    ingested.statuses,
+                    vec![crate::model::IngestStatus::Conflict]
+                );
+                assert!(
+                    store.work(&fixture_network, "owned")?.is_none(),
+                    "fork reduction must remove the later shared dispatch before fencing"
+                );
+                assert!(matches!(
+                    store.work_record("owned")?.context("local journal")?.state,
+                    WorkState::Running { .. }
+                ));
+                assert!(store.work_native_submission_reserved("owned")?);
+                store.version_vector(&fixture_network)
+            })
+            .await?;
         assert!(!node.align_on_start().await?);
         assert_eq!(*node.write_state.borrow(), crate::store::WriteState::Forked);
         assert!(*cancel.borrow());
@@ -648,20 +780,46 @@ mod tests {
         assert!(stopped.load(Ordering::Acquire));
         node.stop_retries.lock().unwrap().clear();
         node.schedule_tick().await?;
-        assert_eq!(*requests.lock().unwrap(), vec!["thread/read", "turn/interrupt", "thread/read"]);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec!["thread/read", "turn/interrupt", "thread/read"]
+        );
         let query_network = network.clone();
-        node.store.call("fixture_forked_state", move |store| {
-        assert_eq!(store.version_vector(&query_network)?, before);
-        assert!(matches!(store.work_record("owned")?.context("work")?.state, WorkState::Running { .. }),
-            "readback must not fabricate a shared completion after writes close");
-        assert_eq!(store.stop_requests()?.iter().map(|stop| stop.work_id.as_str())
-            .collect::<Vec<_>>(), vec!["owned"]);
-        assert!(matches!(store.work_record("remote")?.context("remote journal")?.state,
-            WorkState::Starting { .. }));
-        assert!(matches!(store.work_record("unowned")?.context("unowned journal")?.state,
-            WorkState::Running { .. }));
-        Ok(())
-        }).await?;
+        node.store
+            .call("fixture_forked_state", move |store| {
+                assert_eq!(store.version_vector(&query_network)?, before);
+                assert!(
+                    matches!(
+                        store.work_record("owned")?.context("work")?.state,
+                        WorkState::Running { .. }
+                    ),
+                    "readback must not fabricate a shared completion after writes close"
+                );
+                assert_eq!(
+                    store
+                        .stop_requests()?
+                        .iter()
+                        .map(|stop| stop.work_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["owned"]
+                );
+                assert!(matches!(
+                    store
+                        .work_record("remote")?
+                        .context("remote journal")?
+                        .state,
+                    WorkState::Starting { .. }
+                ));
+                assert!(matches!(
+                    store
+                        .work_record("unowned")?
+                        .context("unowned journal")?
+                        .state,
+                    WorkState::Running { .. }
+                ));
+                Ok(())
+            })
+            .await?;
         drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())
@@ -750,10 +908,16 @@ mod tests {
         );
         drop(node.manager_tool_lease(&access).await?);
         assert!(matches!(
-            { let trigger = trigger.clone();
-                node.store.call("fixture_scheduler_job", move |store| store.scheduler_job("c", &trigger)).await? }
-                .context("job")?
-                .state,
+            {
+                let trigger = trigger.clone();
+                node.store
+                    .call("fixture_scheduler_job", move |store| {
+                        store.scheduler_job("c", &trigger)
+                    })
+                    .await?
+            }
+            .context("job")?
+            .state,
             JobState::Running { .. }
         ));
         drop(node);
@@ -807,20 +971,22 @@ mod tests {
         drop(node.work_input_lease(network, "c", &kept).await?);
         {
             let trigger = trigger.clone();
-            node.store.call("fixture_revoked_state", move |store| {
-            assert!(matches!(
-                store.scheduler_job("c", &trigger)?.context("job")?.state,
-                JobState::Cancelling { .. }
-            ));
-            let stops = store.stop_requests()?;
-            assert_eq!(stops.len(), 1);
-            assert_eq!(stops[0].work_id, "removed");
-            assert!(matches!(
-                store.work_record("removed")?.context("work")?.state,
-                WorkState::Running { .. }
-            ));
-            Ok(())
-            }).await?;
+            node.store
+                .call("fixture_revoked_state", move |store| {
+                    assert!(matches!(
+                        store.scheduler_job("c", &trigger)?.context("job")?.state,
+                        JobState::Cancelling { .. }
+                    ));
+                    let stops = store.stop_requests()?;
+                    assert_eq!(stops.len(), 1);
+                    assert_eq!(stops[0].work_id, "removed");
+                    assert!(matches!(
+                        store.work_record("removed")?.context("work")?.state,
+                        WorkState::Running { .. }
+                    ));
+                    Ok(())
+                })
+                .await?;
         }
         let mut restored = node.settings_snapshot();
         restored.roots = vec![directory.canonicalize()?];
@@ -890,25 +1056,27 @@ mod tests {
         drop(save);
         assert!(*cancel.borrow());
         assert!(node.manager_tool_lease(&access).await.is_err());
-        node.store.call("fixture_revoked_provider", move |store| {
-        assert!(matches!(
-            store.scheduler_job("c", &trigger)?.context("job")?.state,
-            JobState::Cancelling { .. }
-        ));
-        assert!(matches!(
-            store.work_record("codex-work")?.context("work")?.state,
-            WorkState::Running { .. }
-        ));
-        assert_eq!(
-            store
-                .stop_requests()?
-                .iter()
-                .map(|stop| stop.work_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["codex-work"]
-        );
-        Ok(())
-        }).await?;
+        node.store
+            .call("fixture_revoked_provider", move |store| {
+                assert!(matches!(
+                    store.scheduler_job("c", &trigger)?.context("job")?.state,
+                    JobState::Cancelling { .. }
+                ));
+                assert!(matches!(
+                    store.work_record("codex-work")?.context("work")?.state,
+                    WorkState::Running { .. }
+                ));
+                assert_eq!(
+                    store
+                        .stop_requests()?
+                        .iter()
+                        .map(|stop| stop.work_id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["codex-work"]
+                );
+                Ok(())
+            })
+            .await?;
         drop(node);
         std::fs::remove_dir_all(directory)?;
         Ok(())

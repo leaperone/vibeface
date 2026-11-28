@@ -7,8 +7,8 @@
 
 use crate::connection::Connection;
 mod plan;
-pub use plan::{IdentityPlan, IdentityOperationState};
 use anyhow::{Context, Result, bail, ensure};
+pub use plan::{IdentityOperationState, IdentityPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -635,14 +635,18 @@ struct RecoveryMaterial {
     events: Vec<GovernanceEvent>,
 }
 
-fn recovery_file_bytes(material:&RecoveryMaterial,password:&str)->Result<Vec<u8>> {
-    let payload=Zeroizing::new(serde_json::to_vec(material)?);
-    let envelope=recovery_seal(&payload,password)?;
-    Ok(serde_json::to_vec_pretty(&RecoveryFile {version:1,network_id:material.network_id.clone(),envelope:serde_json::from_slice(&envelope)?})?)
+fn recovery_file_bytes(material: &RecoveryMaterial, password: &str) -> Result<Vec<u8>> {
+    let payload = Zeroizing::new(serde_json::to_vec(material)?);
+    let envelope = recovery_seal(&payload, password)?;
+    Ok(serde_json::to_vec_pretty(&RecoveryFile {
+        version: 1,
+        network_id: material.network_id.clone(),
+        envelope: serde_json::from_slice(&envelope)?,
+    })?)
 }
 #[cfg(test)]
-fn write_recovery_file(path:&Path,material:&RecoveryMaterial,password:&str)->Result<()> {
-    privatefs::create_durable(path,&recovery_file_bytes(material,password)?)
+fn write_recovery_file(path: &Path, material: &RecoveryMaterial, password: &str) -> Result<()> {
+    privatefs::create_durable(path, &recovery_file_bytes(material, password)?)
 }
 
 fn read_recovery_file(path: &Path, password: &str) -> Result<RecoveryMaterial> {
@@ -688,11 +692,23 @@ pub async fn prepare_create(
         Member::client(&session.key.identity, name, true)?,
         Member::new(&entry.node_id, IdentityKind::Node, node_name, false)?,
     )?;
-    let material=RecoveryMaterial {
-        version:1,network_id:genesis.network_id.clone(),root_secret_key:Zeroizing::new(root.secret_hex()),genesis:genesis.clone(),checkpoints:vec![],events:vec![],
+    let material = RecoveryMaterial {
+        version: 1,
+        network_id: genesis.network_id.clone(),
+        root_secret_key: Zeroizing::new(root.secret_hex()),
+        genesis: genesis.clone(),
+        checkpoints: vec![],
+        events: vec![],
     };
     drop(session);
-    IdentityPlan::prepare(key,entry,recovery_file,&material,password,json!({"genesis":genesis,"capability":capability}))
+    IdentityPlan::prepare(
+        key,
+        entry,
+        recovery_file,
+        &material,
+        password,
+        json!({"genesis":genesis,"capability":capability}),
+    )
 }
 
 /// Starts a recovery with `recovery_file`: every current member stays, this client joins as a
@@ -775,13 +791,21 @@ pub async fn prepare_recovery(
     state.clone().recover_at(checkpoint.clone(), now)?;
     let mut checkpoints = state.checkpoints.clone();
     checkpoints.push(checkpoint);
-    let backup=RecoveryMaterial {
-        version:1,network_id:material.network_id.clone(),root_secret_key:Zeroizing::new(next.secret_hex()),genesis:state.genesis.clone(),checkpoints:checkpoints.clone(),events:state.events.clone(),
+    let backup = RecoveryMaterial {
+        version: 1,
+        network_id: material.network_id.clone(),
+        root_secret_key: Zeroizing::new(next.secret_hex()),
+        genesis: state.genesis.clone(),
+        checkpoints: checkpoints.clone(),
+        events: state.events.clone(),
     };
-    let mut params=json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
-    if fresh {params["capability"]=json!(capability.context("an empty Node needs its capability")?);}
+    let mut params =
+        json!({"genesis":state.genesis,"checkpoints":checkpoints,"events":state.events});
+    if fresh {
+        params["capability"] = json!(capability.context("an empty Node needs its capability")?);
+    }
     drop(session);
-    IdentityPlan::prepare(key,entry,new_file,&backup,password,params)
+    IdentityPlan::prepare(key, entry, new_file, &backup, password, params)
 }
 
 fn text<'v>(value: &'v Value, key: &str) -> Result<&'v str> {

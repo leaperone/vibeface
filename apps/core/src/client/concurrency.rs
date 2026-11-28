@@ -34,9 +34,18 @@ impl Authority {
         let local = if let (Some(cookie), Some(state)) = (&session.cookie, state) {
             let view = state.project()?;
             let generation = *local_changes.borrow();
-            match node.local_access.session(cookie, &node.identity.device_id()?, &view.network_id) {
-                Ok(local) if local.device_id == session.device_id && *local_changes.borrow() == generation => {
-                    Some(LocalAuthority { generation, session: local })
+            match node
+                .local_access
+                .session(cookie, &node.identity.device_id()?, &view.network_id)
+            {
+                Ok(local)
+                    if local.device_id == session.device_id
+                        && *local_changes.borrow() == generation =>
+                {
+                    Some(LocalAuthority {
+                        generation,
+                        session: local,
+                    })
                 }
                 Ok(_) if view.client(&session.device_id).is_ok() => None,
                 Ok(_) => bail!("local browser cookie is bound to another device or was revoked"),
@@ -46,18 +55,26 @@ impl Authority {
         } else {
             None
         };
-        Ok(Self { local, local_changes })
+        Ok(Self {
+            local,
+            local_changes,
+        })
     }
 
     pub(super) fn principal(&self, node: &Runtime, session: &Session) -> Result<Principal> {
         let (generation, state) = node.client_membership();
-        let view = state.context("personal network is not initialized")?.project()?;
+        let view = state
+            .context("personal network is not initialized")?
+            .project()?;
         let node_id = node.identity.device_id()?;
         let principal = if let Some(member) = member_principal(&view, &node_id, session)? {
             member
         } else {
             view.node(&node_id)?;
-            let local = self.local.as_ref().context("this device is not a member of the personal network")?;
+            let local = self
+                .local
+                .as_ref()
+                .context("this device is not a member of the personal network")?;
             ensure!(
                 *self.local_changes.borrow() == local.generation
                     && local.session.expires_at_ms() > crate::runtime::now_ms()
@@ -73,15 +90,26 @@ impl Authority {
                 can_manage: false,
             }
         };
-        ensure!(node.client_membership().0 == generation, "membership changed during client authorization");
+        ensure!(
+            node.client_membership().0 == generation,
+            "membership changed during client authorization"
+        );
         if principal.source == "local_session" {
-            ensure!(self.local.as_ref().is_some_and(|local| *self.local_changes.borrow() == local.generation), "local browser access was revoked");
+            ensure!(
+                self.local
+                    .as_ref()
+                    .is_some_and(|local| *self.local_changes.borrow() == local.generation),
+                "local browser access was revoked"
+            );
         }
         Ok(principal)
     }
 
     fn check(&self, node: &Runtime, session: &Session, was: &Principal) -> Result<()> {
-        ensure!(self.principal(node, session)? == *was, "this device's permission changed during a client request");
+        ensure!(
+            self.principal(node, session)? == *was,
+            "this device's permission changed during a client request"
+        );
         Ok(())
     }
 }
@@ -114,14 +142,20 @@ impl Pushes {
         self.tasks.spawn(async move {
             let session = snapshot.session();
             let authority = principal(&node, &session).await?;
-            ensure!(authority == expected, "this device's permission changed before a push");
+            ensure!(
+                authority == expected,
+                "this device's permission changed before a push"
+            );
             let payload = pushed(&node, &authority.network_id, &session.device_id, payload).await;
             Ok(PreparedPush { authority, payload })
         });
     }
 
     pub(super) async fn next(&mut self) -> Result<PreparedPush> {
-        self.tasks.join_next().await.context("client push task missing")?
+        self.tasks
+            .join_next()
+            .await
+            .context("client push task missing")?
             .context("client push task failed")?
     }
 
@@ -148,17 +182,33 @@ enum Lane {
 impl Lane {
     fn for_request(request: &Request) -> Self {
         match request.method.as_str() {
-            "provider_probe" | "provider_models" | "test_codex_app_server" | "test_webhook"
-            | "logs" | "diagnostics" => Self::Long,
+            "provider_probe"
+            | "provider_models"
+            | "test_codex_app_server"
+            | "test_webhook"
+            | "logs"
+            | "diagnostics" => Self::Long,
             "info" | "directory" | "write_state" | "node_settings" | "triage_settings"
             | "relay_settings" | "share_link" | "entrances" => Self::Read,
             "rpc" => match request.params["method"].as_str() {
                 Some("interrupt_work" | "cancel_manager") => Self::Control,
                 Some(
-                    "nodes" | "conversations" | "open_works" | "work_detail"
-                    | "workspace_overview" | "workspace_state" | "workspace_history" | "workspace_command_receipt" | "signed_receipt"
-                    | "input_receipt" | "scope_context" | "read_artifact" | "bots"
-                    | "questions" | "memory_state" | "notifications",
+                    "nodes"
+                    | "conversations"
+                    | "open_works"
+                    | "work_detail"
+                    | "workspace_overview"
+                    | "workspace_state"
+                    | "workspace_history"
+                    | "workspace_command_receipt"
+                    | "signed_receipt"
+                    | "input_receipt"
+                    | "scope_context"
+                    | "read_artifact"
+                    | "bots"
+                    | "questions"
+                    | "memory_state"
+                    | "notifications",
                 ) => Self::Read,
                 // Conversation reads replace the observation lease. Unrecognized operations
                 // and writes retain arrival order; they are never retried by this scheduler.
@@ -242,7 +292,10 @@ impl Calls {
     }
 
     fn count(&self, lane: Lane) -> usize {
-        self.active.values().filter(|call| call.lane == lane).count()
+        self.active
+            .values()
+            .filter(|call| call.lane == lane)
+            .count()
     }
 
     pub(super) fn accept(
@@ -306,8 +359,15 @@ impl Calls {
         let guest_method = GUEST_METHODS.contains(&request.method.as_str());
         let fenced = lane != Lane::Ordered
             || (!guest_method && !SIGNED_METHODS.contains(&request.method.as_str()));
-        self.active
-            .insert(request.id.clone(), Active { lane, authority: fenced.then(|| authority.principal(node, session).ok()).flatten() });
+        self.active.insert(
+            request.id.clone(),
+            Active {
+                lane,
+                authority: fenced
+                    .then(|| authority.principal(node, session).ok())
+                    .flatten(),
+            },
+        );
         let snapshot = Snapshot::from(session);
         let node = node.clone();
         self.tasks.spawn(async move {
@@ -324,13 +384,9 @@ impl Calls {
             let observing = request.method == "rpc" && request.params["method"] == "conversation";
             let result = match denied {
                 Some(error) => Err(error),
-                None => dispatch(
-                    &node,
-                    &mut request_session,
-                    &request.method,
-                    request.params,
-                )
-                .await,
+                None => {
+                    dispatch(&node, &mut request_session, &request.method, request.params).await
+                }
             };
             let effect = match request.method.as_str() {
                 "subscribe" => Some(Effect::Subscribe(request_session.subscribed)),
@@ -384,7 +440,10 @@ impl Calls {
     ) -> Result<Response> {
         // Check even if membership/local-access notifications have not won select yet. A
         // completed task must not leak its old result after a revocation raced its completion.
-        let active = self.active.remove(&completed.id).context("unknown client result")?;
+        let active = self
+            .active
+            .remove(&completed.id)
+            .context("unknown client result")?;
         if let Some(was) = active.authority {
             ensure!(
                 authority.principal(node, session)? == was,
@@ -396,14 +455,21 @@ impl Calls {
         }
         if let Ok(result) = &completed.result {
             if completed.method == "info" && result["network_id"].is_string() {
-                ensure!(result["network_id"] == authority.principal(node, session)?.network_id,
-                    "this device's permission changed before client information was delivered");
+                ensure!(
+                    result["network_id"] == authority.principal(node, session)?.network_id,
+                    "this device's permission changed before client information was delivered"
+                );
             }
-            if matches!(completed.method.as_str(), "authenticate" | "recover" | "revoke" | "grant" | "veto")
-                && result["principal"].is_object()
+            if matches!(
+                completed.method.as_str(),
+                "authenticate" | "recover" | "revoke" | "grant" | "veto"
+            ) && result["principal"].is_object()
             {
-                ensure!(result["principal"] == serde_json::to_value(authority.principal(node, session)?)?,
-                    "this device's permission changed before authentication was delivered");
+                ensure!(
+                    result["principal"]
+                        == serde_json::to_value(authority.principal(node, session)?)?,
+                    "this device's permission changed before authentication was delivered"
+                );
             }
         }
         match completed.effect {

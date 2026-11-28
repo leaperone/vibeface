@@ -1730,7 +1730,9 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
 fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
     let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
     if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
-        return Ok(json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}));
+        return Ok(
+            json!({"status":"waiting","checkpoint_hash":pending.checkpoint,"effective_at_ms":pending.effective_at_ms}),
+        );
     }
     for checkpoint in &state.checkpoints {
         if checkpoint
