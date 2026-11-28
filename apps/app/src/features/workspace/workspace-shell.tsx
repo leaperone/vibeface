@@ -3,7 +3,6 @@
 import { BotFace,botMood } from "@/components/app/bot-face"
 import { claimFocus,CountBadge,Dot,EmptyState,PageActionsSlot,PrimaryMark,Skeleton,toast,Wordmark } from "@/components/arc/product-kit"
 import layout from "@/components/arc/workspace-layout.module.css"
-import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
@@ -25,13 +24,12 @@ import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Drawer,DrawerContent } from "@vibeface/uiarc/drawer/drawer.tsx"
 import { Popover,PopoverContent,PopoverTrigger } from "@vibeface/uiarc/popover/popover.tsx"
 import { ArrowRightLeft,ChevronLeft,CircleAlert,CircleHelp,Hand,LoaderCircle,MessageSquare,MessagesSquare,PanelLeft,Plus,RefreshCw,RotateCw,ShieldAlert,Wifi,WifiOff,type LucideIcon } from "lucide-react"
-import { createContext,useContext,useEffect,useRef,useState,useSyncExternalStore,type ReactNode } from "react"
+import { createContext,useContext,useEffect,useRef,useState,useSyncExternalStore,type ComponentType,type ReactNode } from "react"
 import { BotForm } from "./bot-form"
 import { BotPanelButton } from "./bot-panel"
 import { useInbox } from "./inbox"
 import { LocalSession } from "./local-session"
 
-const ShellNavigation = createContext({ open: true, setOpen: (_open: boolean) => {} })
 const subscribeWidth = (listener: () => void) => {
   const media = window.matchMedia("(max-width: 48rem)")
   media.addEventListener("change", listener)
@@ -53,11 +51,6 @@ export function ConnectionNotice() {
   </p>
 }
 
-export function WorkspaceShell({ children, landing = false }: { children: ReactNode; landing?: boolean }) {
-  const [open,setOpen] = useState(true)
-  return <ShellNavigation.Provider value={{ open,setOpen }}><div className={layout.shell}><WorkspaceLayout landing={landing}>{children}</WorkspaceLayout></div></ShellNavigation.Provider>
-}
-
 const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
@@ -76,7 +69,9 @@ export function MoodTag({ mood }: { mood: Mood }) {
 const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/tasks": terms.task.label, "/channels": "频道", "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
 
-function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
+export function WorkspaceShell({ children, landing = false, conversation: Conversation }: {
+  children: ReactNode; landing?: boolean; conversation: ComponentType<{ missing: boolean; active: boolean }>
+}) {
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length + workspaceTaskCounts(workspace.workspaceState?.tasks ?? []).attention
@@ -86,7 +81,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   // A browser joins on this computer's lasting page, never the temporary origin this session opened on, or it would hold a second identity.
   const lasting = device.ready?.info.connection_entry
   const home = lasting && isLoopback(entryAddress(lasting)) ? `http://localhost:${new URL(entryAddress(lasting)).port}` : undefined
-  const { open: sidebarOpen, setOpen: setSidebarOpen } = useContext(ShellNavigation)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
   const isMobile = useSyncExternalStore(subscribeWidth, () => typeof window !== "undefined" && window.matchMedia("(max-width: 48rem)").matches, () => false)
   const [openMobile,setOpenMobile] = useState(false)
   const menuTrigger = useRef<HTMLButtonElement>(null)
@@ -159,7 +154,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
     <div className={layout.footer}><AiOffHint /><SecondDeviceHint /><ConnectionCapsule /><ul className={layout.list}><NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings") || pathname.startsWith("/devices")} dot={devicesAttention} /><li><a href="https://www.vibeface.dev/docs/user-guide" target="_blank" rel="noopener noreferrer" className={layout.item}><CircleHelp aria-hidden="true" /><span>使用指南</span><span className="sr-only">，在新标签页打开</span></a></li></ul></div>
   </nav>
 
-  return <CreateBot.Provider value={openCreator}><PageActionsSlot.Provider value={actionsSlot}>
+  return <div className={layout.shell}><CreateBot.Provider value={openCreator}><PageActionsSlot.Provider value={actionsSlot}>
     <a className="skip-link" href="#main">跳到主要内容</a>
     {isMobile ? <Drawer open={openMobile} onOpenChange={setOpenMobile}><DrawerContent side="left" title="导航和会话" description="切换工作区视图或选择会话。" className={layout.mobileDrawer} onCloseAutoFocus={(event) => { event.preventDefault(); menuTrigger.current?.focus({ preventScroll: true }) }}>{navigation}</DrawerContent></Drawer> : sidebarOpen ? navigation : null}
     <main id="main" tabIndex={-1} className={layout.main}>
@@ -173,12 +168,12 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
       {workspace.joined ? null : <LocalSession onJoin={() => { if (home && home !== window.location.origin) window.location.assign(`${home}/join`); else void navigate({ to: "/join" }) }} />}
       {pathname === "/tasks" ? null : <RecoveryAlert />}
       {workspace.data && workspace.incomplete ? <p role="status" className="flex shrink-0 items-center gap-2 px-4 py-2 text-sm text-secondary"><LoaderCircle aria-hidden="true" className="size-4 animate-spin motion-reduce:animate-none" />同步中</p> : null}
-      <div className={cn(layout.chat,!chatRoute && layout.chatHidden)} inert={!chatRoute} aria-hidden={!chatRoute || undefined}><div className="conversation-view"><ConversationScreen missing={missingBot} active={/^\/b\/[^/]+\/?$/.test(pathname) && !missingBot} /></div>{chatRoute ? children : null}</div>
+      <div className={cn(layout.chat,!chatRoute && layout.chatHidden)} inert={!chatRoute} aria-hidden={!chatRoute || undefined}><div className="conversation-view"><Conversation missing={missingBot} active={/^\/b\/[^/]+\/?$/.test(pathname) && !missingBot} /></div>{chatRoute ? children : null}</div>
       {chatRoute ? null : <div className={scopedChat ? 'flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden' : layout.page}>{children}</div>}
       {phoneTab ? <TabBar pathname={pathname} waiting={waiting} recovering={recovering} attention={devicesAttention} /> : null}
     </main>
     <BotForm open={creatingBot} onOpenChange={setCreatingBot} restoreFocus={() => { const target = creatorTrigger.current; if (target?.isConnected && target.getClientRects().length) target.focus(); else document.getElementById("main")?.focus() }} />
-  </PageActionsSlot.Provider></CreateBot.Provider>
+  </PageActionsSlot.Provider></CreateBot.Provider></div>
 }
 
 const tabItems = [

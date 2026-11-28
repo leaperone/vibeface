@@ -3989,8 +3989,8 @@ test('the retained conversation only mounts task history on its exact chat route
     '@vibeface/client/workspace/home.ts': { backTo: () => undefined }, '@/lib/glossary': { terms: Object.fromEntries(['inbox', 'task', 'myDevices', 'settings'].map((key) => [key, { label: key, icon: key }])) },
     '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
     '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle' }, '@vibeface/client/avatar/mood.ts': { moodLabel: { idle: '待命' } },
-  }, {}, 'WorkspaceLayout')
-  const active = () => app.render('WorkspaceLayout', { children: null, landing: false }).find(({ type }) => type === 'ConversationScreen')?.props.active
+  })
+  const active = () => app.render('WorkspaceShell', { children: null, conversation: 'ConversationScreen' }).find(({ type }) => type === 'ConversationScreen')?.props.active
   try {
     assert.equal(active(), true)
     for (const route of ['/b/bot/work/work', '/devices', '/tasks', '/b/missing']) { pathname = route; assert.equal(active(), false, route) }
