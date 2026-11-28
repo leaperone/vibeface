@@ -26,6 +26,7 @@ import * as nodeSettings from "@vibeface/client/lib/node.ts"
 import type { OutboxItem, OutboxRecord } from '@vibeface/client/lib/outbox.ts'
 import type { JoinRequest, NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import * as workspaceTypes from "@vibeface/client/workspace/types.ts"
+import * as chatTimelineModule from "@vibeface/client/chat/timeline.ts"
 import type { HistorySection, InputReceipt, InputOptions, InputTarget, ManagerJob, PendingMessage, WorkRecord, WorkspaceChannel, WorkspaceCommand, WorkspaceDomainState, WorkspaceFilter } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
@@ -2183,6 +2184,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
     }
     if (specifier === '@vibeface/client/workspace/history.ts') return workspaceHistory
     if (specifier === '@vibeface/client/workspace/types.ts') return { ...workspaceTypes, ...dependencies[specifier] as object }
+    if (specifier === '@vibeface/client/chat/timeline.ts') return { ...chatTimelineModule, ...dependencies[specifier] as object }
     if (specifier === '@vibeface/client/workspace/memory.ts') return preferenceMemory
     if (specifier === '@vibeface/client/workspace/feedback.ts') return resultFeedback
     if (specifier === '@vibeface/client/chat/protocol.ts') return { promptIntent, deliveryMark, sameTarget, ...dependencies[specifier] as object }

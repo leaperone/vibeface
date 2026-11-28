@@ -2,7 +2,7 @@ import type { DisplayScope } from '@vibeface/client/identity/context.tsx'
 import { decodeLastSeen, displayLastSeen, projectLastSeen } from './last-seen'
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as Notifications from 'expo-notifications'
-import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline, firstUnread, mergedOutcomes, sameReplyText } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress, messageOf } from '@vibeface/client/lib/node.ts'
@@ -159,9 +159,8 @@ function Live({ children }: { children: ReactNode }) {
   // Live progress re-renders this far more often than the conversation itself changes.
   const shown = useMemo(() => {
     if (!data || shared.dataOrigin !== 'network') return null
-    const steered = new Set((data.scheduler?.jobs ?? []).filter((job) => job.state === 'steered').map((job) => job.message_id))
     // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
-    return { timeline: chatTimeline(data.messages, data.questions, steered), folded: foldAnswers(data.messages, data.questions) }
+    return { timeline: chatTimeline(data.messages, data.questions, mergedOutcomes(data.scheduler?.jobs ?? [])), folded: foldAnswers(data.messages, data.questions) }
   }, [data, shared.dataOrigin])
   if (data && conversationId && shown) {
     const { timeline, folded } = shown
@@ -173,8 +172,7 @@ function Live({ children }: { children: ReactNode }) {
     // A message still on its way means the newest in the history is the last turn's reply, not this one's.
     const pending = shared.pendingMessages.filter((item) => item.conversation_id === conversationId && item.target.kind === 'bot_main')
     const sending = pending.some((item) => !data.messages.some((message) => message.message_id === item.message_id))
-    const landed = (text: string) => !sending && newest?.role === 'assistant' && newest.text.trim() !== '' && text.trim() !== ''
-      && (newest.text.trim().startsWith(text.trim()) || text.trim().startsWith(newest.text.trim()))
+    const landed = (text: string) => !sending && newest?.role === 'assistant' && sameReplyText(newest.text, text)
     const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
     const handedOver = streamed.some((progress) => landed(progress.text))
     const live = streamed.find((progress) => !landed(progress.text)

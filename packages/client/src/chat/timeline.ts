@@ -1,9 +1,28 @@
 import { placeByTime } from "../workspace/questions.ts"
-import type { ManagerJob, NotificationRecord, WorkRecord } from "../workspace/types.ts"
+import { inJobGroup, type ManagerJob, type NotificationRecord, type WorkRecord } from "../workspace/types.ts"
 import { scheduleTrigger } from "../workspace/bot-settings.ts"
 import type { TranscriptMessage } from "./types.ts"
 
 type Ordered = Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms" | "rank">
+
+/** A streamed reply and a stored one are the same reply when either is the start of the other; either side may be a few characters ahead. */
+export function sameReplyText(a: string, b: string) {
+  const left = a.trim(), right = b.trim()
+  return left !== '' && right !== '' && (left.startsWith(right) || right.startsWith(left))
+}
+
+/** The outcome each message got when it was taken into a running reply. */
+export function mergedOutcomes(jobs: readonly Pick<ManagerJob, "message_id" | "state" | "outcome">[]) {
+  return new Map(jobs.flatMap((job) => job.state === 'steered' && job.message_id ? [[job.message_id, job.outcome] as const] : []))
+}
+
+/** The person's messages a running reply holds: waiting behind it, or being taken into it. None while no reply runs. */
+export function heldMessages(jobs: readonly Pick<ManagerJob, "message_id" | "state">[]) {
+  const held = new Map<string, 'queued' | 'merging'>()
+  if (!jobs.some((job) => inJobGroup('replying', job.state))) return held
+  for (const job of jobs) if (job.message_id && inJobGroup('held', job.state)) held.set(job.message_id, job.state === 'steering' || held.get(job.message_id) === 'merging' ? 'merging' : 'queued')
+  return held
+}
 
 /** The Node's order, the same on every device; a message without a rank yet keeps its place after the ranked ones. */
 export function byRank<T extends Pick<TranscriptMessage, "rank">>(messages: readonly T[]): T[] {

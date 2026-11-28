@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { chatTimeline, firstUnread, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
+import type { ManagerJob } from "../workspace/types.ts"
+import { chatTimeline, firstUnread, heldMessages, mergedOutcomes, sameReplyText, messageTime, messageTimes, taskMessage, threadReplies, unreadCounts } from "./timeline.ts"
 
 const minute = 60_000
 const at = (hour: number, min: number, day = 30) => new Date(2026, 9, day, hour, min, 5).getTime()
@@ -138,4 +139,19 @@ test("another bot's message counts as unread and starts 新消息", () => {
   assert.deepEqual(counts, { chat: 1 })
   const timeline = chatTimeline(rows)
   assert.equal(firstUnread(timeline, new Set(["h-b1"]), () => false), timeline.messages[1])
+})
+
+test('a streamed reply and its stored copy are one reply whichever side is ahead; blank text never matches', () => {
+  assert.equal(sameReplyText('已完成第一步', '已完成第一步，第二步'), true)
+  assert.equal(sameReplyText('  已完成第一步，第二步', '已完成第一步 '), true)
+  assert.equal(sameReplyText('已完成', '换个说法'), false)
+  assert.equal(sameReplyText('', '任何内容'), false)
+})
+
+test('a running reply holds later messages as queued or merging; nothing is held without one, and merged keeps its outcome', () => {
+  const job = (message_id: string, state: ManagerJob['state'], outcome?: ManagerJob['outcome']) => ({ message_id, state, outcome })
+  assert.deepEqual([...heldMessages([job('a', 'queued'), job('b', 'steering')])], [['a', 'queued'], ['b', 'merging']])
+  assert.deepEqual([...heldMessages([job('r', 'running'), job('a', 'queued'), job('b', 'steering'), job('c', 'pending_delivery')])], [['a', 'queued'], ['b', 'merging'], ['c', 'queued']])
+  assert.equal(heldMessages([job('r', 'running'), job('d', 'completed')]).has('d'), false)
+  assert.deepEqual([...mergedOutcomes([job('a', 'steered', 'answered'), job('b', 'completed')])], [['a', 'answered']])
 })

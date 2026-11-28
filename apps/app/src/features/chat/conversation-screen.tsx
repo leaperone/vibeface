@@ -15,7 +15,7 @@ import { Link,useNavigate,useRouterState } from '@tanstack/react-router'
 import { awaitsDevice,botCanSend,botReach,canRetryJob,canSend,composerHint,inputIntentLabel,promptIntent,reachDevice,replyUnsettled,runtimeLabel,starterExamples } from '@vibeface/client/chat/protocol.ts'
 import { useNotificationRecord } from '@vibeface/client/chat/use-notification-record.ts'
 import { useHistoryLocation } from '@vibeface/client/chat/use-history-location.ts'
-import { chatTimeline,firstUnread } from '@vibeface/client/chat/timeline.ts'
+import { chatTimeline,firstUnread,heldMessages,mergedOutcomes } from '@vibeface/client/chat/timeline.ts'
 import { routineState } from '@vibeface/client/chat/companion-recap.ts'
 import { cooperationExamples,useFirstCooperation } from '@vibeface/client/chat/first-cooperation.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -119,7 +119,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   // Questions sit where they were asked; an answer shows inside its question.
   const questions = data?.questions ?? emptyList
   const folded = useMemo(() => foldAnswers(data?.messages ?? [], questions), [data?.messages, questions])
-  const merged = useMemo(() => new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome])), [jobs])
+  const merged = useMemo(() => mergedOutcomes(jobs), [jobs])
   const timeline = useMemo(() => chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
   ], merged), [data?.messages, questions, workspace.answered, folded, merged])
@@ -132,9 +132,7 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
   const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
-  const replying = jobs.some((job) => inJobGroup('replying', job.state))
-  const queued = new Set(replying ? jobs.filter((job) => job.message_id && inJobGroup('held', job.state)).map((job) => job.message_id) : [])
-  const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
+  const held = heldMessages(jobs)
   const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
   // The newest reply failed with no 重试, or the newest supplement's outcome is unknown: it can only be read again.
@@ -158,7 +156,8 @@ export function ConversationScreen({ missing = false, active }: { missing?: bool
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} refresh={() => workspace.refresh()} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply), message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined))
-    if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
+    const hold = held.get(message.message_id)
+    if (hold) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: hold } } : entry))
   }
   entries.push(...timeline.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
