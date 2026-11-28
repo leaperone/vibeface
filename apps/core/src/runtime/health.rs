@@ -5,6 +5,7 @@
 //! restarts a process or sends a write again.
 use super::*;
 use crate::logging::{Filter, Level, Source};
+use crate::scheduling::health_turn;
 use crate::store::bot_settings::PrimaryReminder;
 use crate::work::WorkState;
 use std::collections::VecDeque;
@@ -764,13 +765,6 @@ fn handoff_key(problem: &Problem, device: &str, now: i64) -> String {
             .as_bytes(),
     );
     format!("health-{}-{}", &subject[..16], now / HOUR_MS)
-}
-
-/// Whether a health reminder started the turn of `trigger`; such a turn dispatches no work.
-pub(crate) fn health_turn(trigger: &str) -> bool {
-    matches!(crate::scheduling::Trigger::decode(trigger),
-        Ok(crate::scheduling::Trigger::Schedule { id, .. })
-            if id.starts_with(crate::store::bot_settings::HEALTH_SCHEDULE_PREFIX))
 }
 
 /// Whether `provider` may run a health reminder's turn. Log text reaches that turn, so only the

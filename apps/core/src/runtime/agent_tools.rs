@@ -186,7 +186,7 @@ impl Runtime {
         let mut kind = job.as_ref().map(|job| job.tool_kind());
         let health_turn = job
             .as_ref()
-            .is_some_and(|job| super::health::health_turn(&job.trigger));
+            .is_some_and(|job| crate::scheduling::health_turn(&job.trigger));
         if let Some(kind) = kind {
             ensure!(
                 tool.effect().offered(kind),

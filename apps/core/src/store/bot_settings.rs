@@ -1,4 +1,5 @@
 use super::{Store, bots::bot_for_conversation_from, log, message_from};
+use crate::scheduling::HEALTH_SCHEDULE_PREFIX;
 use crate::{
     crypto::digest,
     model::*,
@@ -21,9 +22,6 @@ pub(crate) fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -
 pub fn change_id(conversation: &str, trigger: &str, call_ref: &str) -> String {
     format!("change-{}", change_digest(conversation, trigger, call_ref))
 }
-
-/// The schedule IDs of the Node's health reminders; a bot's own schedules start `schedule-`.
-pub const HEALTH_SCHEDULE_PREFIX: &str = "health-";
 
 /// What `remind_primary_bot` did.
 #[derive(Debug, PartialEq)]

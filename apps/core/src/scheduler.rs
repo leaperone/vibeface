@@ -1864,7 +1864,7 @@ fn compile_dynamic_with_limit(
                                 .is_some_and(|tool| tool.effect() == crate::tools::Effect::Read)
                         });
                     }
-                    if crate::runtime::health_turn(&job.trigger) {
+                    if crate::scheduling::health_turn(&job.trigger) {
                         offered.retain(|name, _| {
                             crate::tools::Tool::parse(name)
                                 .is_some_and(crate::runtime::health_turn_tool)

@@ -331,6 +331,16 @@ pub fn bot_message_trigger(message_id: &str) -> String {
     Trigger::BotMessage(message_id).to_string()
 }
 
+/// The schedule IDs of the Node's health reminders; a bot's own schedules start `schedule-`.
+pub(crate) const HEALTH_SCHEDULE_PREFIX: &str = "health-";
+
+/// Whether a health reminder started the turn of `trigger`; such a turn dispatches no work.
+pub(crate) fn health_turn(trigger: &str) -> bool {
+    matches!(Trigger::decode(trigger),
+        Ok(Trigger::Schedule { id, .. })
+            if id.starts_with(HEALTH_SCHEDULE_PREFIX))
+}
+
 /// One due time of a schedule. It also keys the job and is the reply's `in_reply_to`.
 pub fn schedule_trigger(schedule_id: &str, slot_ms: i64) -> String {
     Trigger::Schedule {
