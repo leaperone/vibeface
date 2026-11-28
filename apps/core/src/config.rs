@@ -335,26 +335,11 @@ impl Config {
     }
 }
 
-pub fn http_origin(value: &str) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(value)?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.path() == "/",
-        "URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
-    );
-    Ok(url)
-}
-pub fn private_dir(path: &Path) -> Result<()> {
-    privatefs::create_dir(path)
-}
-pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    privatefs::write_atomic(path, bytes)
-}
+pub use crate::net::http_origin;
+pub use vibeface_bridge::platform::privatefs::{
+    create_dir as private_dir, write_atomic as private_write,
+};
+
 pub fn identity(dir: &Path) -> Result<LocalIdentity> {
     let bytes = Zeroizing::new(
         std::fs::read(dir.join("identity.json")).context("run vibeface init first")?,

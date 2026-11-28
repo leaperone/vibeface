@@ -347,7 +347,7 @@ async fn access(data_dir: &Path) -> Result<Value> {
     };
     if initialized && configuration.local_auto_access {
         let launcher = Launcher::read(data_dir)?;
-        let mut url = config::http_origin(&launcher.origin)?;
+        let mut url = net::http_origin(&launcher.origin)?;
         ensure!(
             launcher.node_id == device_id,
             "local launcher does not match this node"
@@ -378,9 +378,9 @@ async fn access(data_dir: &Path) -> Result<Value> {
         return Ok(json!({"url":url.to_string(),"device_id":launcher.node_id,"local":true}));
     }
     let mut url = if capability.is_some() {
-        config::http_origin(&format!("http://{}", configuration.local_listen))?
+        net::http_origin(&format!("http://{}", configuration.local_listen))?
     } else {
-        config::http_origin(&configuration.public_url)?
+        net::http_origin(&configuration.public_url)?
     };
     if url.scheme() == "http" && !is_loopback(&url) {
         ensure!(
@@ -392,7 +392,7 @@ async fn access(data_dir: &Path) -> Result<Value> {
         } else {
             "127.0.0.1"
         };
-        url = config::http_origin(&format!("http://{host}:{}", configuration.listen.port()))?;
+        url = net::http_origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
     let entry = json!({"url":url.origin().ascii_serialization(),"device_id":device_id,"capability":capability});
     if capability.is_some() {
@@ -603,7 +603,7 @@ fn initialize_from_options(options: InitOptions) -> Result<Value> {
     forwarding.per_ip = options.forward_per_ip;
     forwarding.trusted_proxies = options.trusted_proxies;
     if let Some(url) = options.public_url {
-        configuration.public_url = config::http_origin(&url)?
+        configuration.public_url = net::http_origin(&url)?
             .to_string()
             .trim_end_matches('/')
             .to_owned();

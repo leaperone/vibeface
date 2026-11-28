@@ -23,6 +23,20 @@ use std::{
 
 use vibeface_secure::link::{Host, NodeLink};
 
+pub fn http_origin(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value)?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/",
+        "URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
+    );
+    Ok(url)
+}
 mod lan;
 pub mod mesh;
 pub mod relay;
@@ -342,7 +356,7 @@ impl SignedAddress {
             "address record names another endpoint"
         );
         if let Some(url) = &record.gateway_url {
-            crate::config::http_origin(url)?;
+            http_origin(url)?;
         }
         vibeface_secure::verify(
             &record.device_id,
