@@ -1,7 +1,5 @@
 //! Core-owned one-shot operations used by the sibling CLI.
-use vibeface_control::inspection::{
-    Inspection, MeshStatus, NodeStatus, PeerPath, PeerStatus, WriteState,
-};
+use vibeface_control::inspection::{Inspection, MeshStatus, NodeStatus, PeerPath, PeerStatus};
 
 use crate::{
     config::{self, Config, ManagerSettings},
@@ -263,16 +261,7 @@ pub async fn inspect(data_dir: &Path) -> Result<Inspection> {
             .map_or(configuration.web_enabled, |health| health.web_enabled),
         http_enabled: health.as_ref().is_ok_and(|health| health.http_enabled),
         version: health.as_ref().ok().map(|health| health.version.clone()),
-        write_state: health
-            .as_ref()
-            .ok()
-            .and_then(|health| health.write_state)
-            .map(|state| match state {
-                crate::store::WriteState::Aligning => WriteState::Aligning,
-                crate::store::WriteState::ReadOnly => WriteState::ReadOnly,
-                crate::store::WriteState::Writable => WriteState::Writable,
-                crate::store::WriteState::Forked => WriteState::Forked,
-            }),
+        write_state: health.as_ref().ok().and_then(|health| health.write_state),
         mesh: MeshStatus {
             enabled: configuration.network.mesh.enabled,
             network: configuration.network.mesh.network,

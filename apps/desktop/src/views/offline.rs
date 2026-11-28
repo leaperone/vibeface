@@ -3,6 +3,7 @@ use crate::ui::*;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
+use vibeface_protocol::WriteState;
 use vibeface_protocol::workspace::Assignment;
 pub const MAX_CACHE_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,7 +200,7 @@ pub fn decode(bytes: &[u8], scope: &CacheScope) -> Result<OfflineProjection> {
         );
     }
     ensure!(
-        ["writable", "read_only", "aligning", "forked"].contains(&cache.write_state.as_str()),
+        cache.write_state.parse::<WriteState>().is_ok(),
         "离线写入状态无效"
     );
     Ok(cache)
@@ -209,7 +210,7 @@ impl OfflineProjection {
         self.conversation_id.as_deref()
     }
     pub fn into_snapshot(self, generation: u64, can_save: bool) -> Snapshot {
-        let can_save_locally = can_save && self.write_state != "forked";
+        let can_save_locally = can_save && self.write_state != WriteState::Forked.as_str();
         Snapshot {
             generation,
             online: false,

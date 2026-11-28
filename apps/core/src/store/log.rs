@@ -1038,13 +1038,17 @@ pub(crate) fn append_from(
 ) -> Result<SignedEvent> {
     let gate: String =
         connection.query_row("SELECT state FROM temp.write_gate", [], |r| r.get(0))?;
-    match gate.as_str() {
-        "writable" => {}
-        "forked" => bail!("this Node's log has forked and it no longer writes"),
-        "read_only" => {
+    match gate.parse::<super::WriteState>() {
+        Ok(super::WriteState::Writable) => {}
+        Ok(super::WriteState::Forked) => {
+            bail!("this Node's log has forked and it no longer writes")
+        }
+        Ok(super::WriteState::ReadOnly) => {
             bail!("this Node is read-only until you confirm it was not restored from a backup")
         }
-        _ => bail!("this Node is aligning with other Nodes; try again shortly"),
+        Ok(super::WriteState::Aligning) | Err(_) => {
+            bail!("this Node is aligning with other Nodes; try again shortly")
+        }
     }
     let author = identity.device_id()?;
     let view = super::membership_from(connection, network)?;

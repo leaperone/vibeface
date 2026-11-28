@@ -31,11 +31,16 @@ impl WriteGate {
     }
 
     pub(crate) fn from_response(value: &Value) -> Result<Self> {
-        match value.get("state").and_then(Value::as_str) {
-            Some("writable") => Ok(Self::Writable),
-            Some("forked") => Ok(Self::Forked),
-            Some("read_only" | "aligning") => Ok(Self::Restricted),
-            _ => bail!("invalid Node write state"),
+        use vibeface_protocol::WriteState;
+        match value
+            .get("state")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok())
+        {
+            Some(WriteState::Writable) => Ok(Self::Writable),
+            Some(WriteState::Forked) => Ok(Self::Forked),
+            Some(WriteState::ReadOnly | WriteState::Aligning) => Ok(Self::Restricted),
+            None => bail!("invalid Node write state"),
         }
     }
 }

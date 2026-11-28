@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=1`，Core 和 delivery 数据库的 `user_version=1`。共享结构以 `apps/core/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。同一个人网络中的所有 Node 必须使用当前格式。`data-epoch.json` 检查本机目录，未知协议字段和旧格式会被拒绝。程序不迁移或清空旧数据。
+协议版本为 `1`，数据格式 `data_epoch=1`，Core 和 delivery 数据库的 `user_version=1`。写入状态及共享工作区的传输类型见 `crates/protocol`，成员与恢复记录见 `crates/secure/src/membership.rs`，Core 的签名业务事件见 `apps/core/src/model.rs`。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。同一个人网络中的所有 Node 必须使用当前格式。`data-epoch.json` 检查本机目录，未知协议字段和旧格式会被拒绝。程序不迁移或清空旧数据。
 
 ## 身份与数据范围
 
