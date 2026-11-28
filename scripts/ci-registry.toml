@@ -6,7 +6,7 @@ exact = ["package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml"]
 patterns = ["apps/www/**", "packages/docs/**", "packages/theme/**"]
 include = ["js_workspace"]
 [paths.web_tools]
-exact = ["scripts/build-web.sh", "scripts/check-web.sh", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
+exact = ["scripts/build-web.sh", "scripts/check-web.sh", "scripts/check-client-imports.mjs", "scripts/build-web-crypto.sh", "scripts/wasm-bindgen-version.py"]
 
 [paths.rust_local_inputs]
 patterns = ["crates/delivery/**", "apps/core/src/**", "apps/cli/src/**", "crates/control/src/**", "crates/client/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/secure-ffi/**", "crates/native-transport/**", "crates/*/tests/**", "apps/core/tests/**", "crates/*/Cargo.toml", "apps/core/Cargo.toml", "apps/cli/Cargo.toml", "apps/core/build.rs", "apps/core/migrations/**", "apps/core/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]

@@ -21,7 +21,7 @@ INPUTS = {
     "crypto": ("crates/secure/", "scripts/build-web-crypto.sh", "scripts/release-rustflags.py", "scripts/wasm-bindgen-version.py",
                ".github/actions/setup-js/action.yml", ".github/actions/setup-rust/action.yml", ".github/actions/setup-web-crypto/action.yml"),
     "web": ("apps/app/", "packages/client/", "packages/theme/", "packages/uiarc/", "scripts/generate-uiarc-theme.py", "scripts/check-uiarc.py", "scripts/check-uiarc-build.mjs", "scripts/check-uiarc-native.cjs", "config/uiarc.json", "config/public-bootstrap.json", "package.json",
-            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh", "scripts/check-web.sh", ".github/actions/setup-js/action.yml"),
+            "pnpm-lock.yaml", "pnpm-workspace.yaml", "scripts/build-web.sh", "scripts/check-web.sh", "scripts/check-client-imports.mjs", ".github/actions/setup-js/action.yml"),
 }
 CACHE_POLICIES = (
     ("/", "no-store"),

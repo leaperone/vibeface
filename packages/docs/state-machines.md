@@ -48,6 +48,7 @@ description: 定位执行、输入、连接和恢复的状态模型与安全边�
 
 Rust 包的直接依赖见各包的 `Cargo.toml`；JavaScript 工作区依赖见各包的 `package.json`。
 依赖声明只能说明某个包可被使用。修改业务规则前，仍须从入口追踪到实际读写该状态的位置。
+Web 检查中的 `scripts/check-client-imports.mjs` 按各自 tsconfig 解析 `packages/client` 和 `apps/app` 的包内静态运行时导入，拒绝循环。纯类型引用和延迟加载不构成该检查的静态边。
 
 ## 同设备输入保存
 
