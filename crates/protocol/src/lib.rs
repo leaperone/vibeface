@@ -45,6 +45,16 @@ pub enum RpcId {
     String(String),
 }
 
+/// Serde's internally tagged unit decoder ignores map entries even with deny_unknown_fields.
+pub fn empty_operation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<(), D::Error> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    Empty::deserialize(deserializer).map(|_| ())
+}
+
 pub fn valid_business_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
