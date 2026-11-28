@@ -6808,7 +6808,7 @@ test('only the matching invitation auto-starts and a failed comparison can be st
       '@vibeface/client/workspace/inbox.ts': { openJoins }, '@vibeface/client/workspace/labels.ts': taskLabels,
       '@/lib/glossary': { terms: { admin: { label: '管理设备' } } },
       '@/lib/use-run': { useRun: () => ({ busy, error, run }) },
-      './devices': { deviceIcon: () => 'Icon' }, './device-icon': { deviceIcon: () => 'Icon' },
+      './device-icon': { deviceIcon: () => 'Icon' },
       '@/components/arc/product-kit': new Proxy({ useAction: () => ({ busy, error, run }) }, { get: (target, name) => name === 'useAction' ? target.useAction : String(name) }),
     }
     const globals = { setInterval: () => 0, clearInterval: () => {} }

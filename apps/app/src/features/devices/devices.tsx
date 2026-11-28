@@ -17,9 +17,10 @@ import { useNodeChecks } from "@vibeface/client/workspace/use-node-checks.ts"
 import { Button } from "@vibeface/uiarc/button/button.tsx"
 import { Input } from "@vibeface/uiarc/input/input.tsx"
 import { Switch } from "@vibeface/uiarc/switch/switch.tsx"
-import { ArrowRightLeft,Check,ChevronRight,Copy,Info,Pencil,RadioTower,ShieldAlert,Smartphone,Tablet,X,type LucideIcon } from "lucide-react"
+import { ArrowRightLeft,Check,ChevronRight,Copy,Info,Pencil,RadioTower,ShieldAlert,X } from "lucide-react"
 import { useEffect,useState,type ReactNode } from "react"
 import { AiSettings } from "./ai-settings"
+import { deviceIcon } from "./device-icon"
 import { JoinRequests } from "./join"
 import { NodeConnection,NodeStatus } from "./node-connection"
 import { RelaySettings,ShareLink,relayLabel } from "./relay-settings"
@@ -47,13 +48,6 @@ export function useDeviceRows(): DeviceRow[] {
       online: deviceOnline(kind, node, entry, connectionOnline, browser), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
-}
-
-/** One icon per kind of device; which computer this browser goes through is a tag, not another icon. */
-export function deviceIcon(row: Pick<DeviceRow, "kind" | "name">): LucideIcon {
-  if (row.kind === "node") return terms.thisComputer.icon
-  const form = deviceForm(row.kind, row.name)
-  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : terms.browser.icon
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
